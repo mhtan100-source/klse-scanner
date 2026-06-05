@@ -264,6 +264,67 @@ KLSE_STOCKS = {
     '1066.KL': 'RHB Bank',
 }
 
+
+# TradingView 股票代號對照表
+TV_SYMBOLS = {
+    '1155.KL': 'MAYBANK', '1295.KL': 'PBBANK', '1023.KL': 'CIMB',
+    '5819.KL': 'HLBANK', '1066.KL': 'RHBBANK', '5168.KL': 'HLFG',
+    '1015.KL': 'AFFIN', '1082.KL': 'AMBANK', '5258.KL': 'BIMB',
+    '1277.KL': 'ABMB', '5185.KL': 'KENANGA', '6947.KL': 'ALLIANZ',
+    '6399.KL': 'AEONCR', '5099.KL': 'BURSA', '5235.KL': 'MBSB',
+    '5115.KL': 'AFG', '7107.KL': 'ELKDESA', '6012.KL': 'MAXIS',
+    '4863.KL': 'TM', '5212.KL': 'CDB', '3037.KL': 'ASTRO',
+    '5031.KL': 'TIMECOM', '5136.KL': 'MYEG', '0082.KL': 'OCK',
+    '5183.KL': 'PETGAS', '5071.KL': 'PCHEM', '6033.KL': 'PETDAG',
+    '3816.KL': 'MISC', '5218.KL': 'DIALOG', '5285.KL': 'YINSON',
+    '5264.KL': 'HIBISCUS', '5132.KL': 'ARMADA', '5225.KL': 'SAPNRG',
+    '7084.KL': 'WAHSEONG', '0207.KL': 'UZMA', '7179.KL': 'PERDANA',
+    '7253.KL': 'COASTAL', '0172.KL': 'CARIMIN', '5020.KL': 'MHB',
+    '5347.KL': 'TENAGA', '5062.KL': 'YTLPOWR', '6888.KL': 'AXIATA',
+    '1961.KL': 'IOICORP', '2445.KL': 'SDG', '4197.KL': 'KLK',
+    '2291.KL': 'PPB', '1899.KL': 'GENP', '2038.KL': 'TSH',
+    '5029.KL': 'THP', '2220.KL': 'BPLANT', '1724.KL': 'HSPLANT',
+    '2054.KL': 'UP', '5113.KL': 'SOP', '9695.KL': 'BATUKAWAN',
+    '0146.KL': 'VITROX', '3948.KL': 'INARI', '2771.KL': 'FRONTKEN',
+    '1929.KL': 'DNONCE', '5135.KL': 'MPI', '0148.KL': 'GREATECH',
+    '4731.KL': 'DATASONIC', '5033.KL': 'GTRONIC', '4715.KL': 'PENTA',
+    '5026.KL': 'UNIMECH', '5116.KL': 'MPI', '8583.KL': 'CTOS',
+    '5011.KL': 'GHL', '0092.KL': 'SCICOM', '0078.KL': 'AEMULUS',
+    '0197.KL': 'KESM', '0196.KL': 'ELSOFT', '3182.KL': 'GENTING',
+    '4707.KL': 'NESTLE', '5242.KL': '99SMART', '3026.KL': 'BAT',
+    '7052.KL': 'PADINI', '5252.KL': 'MRDIY', '3689.KL': 'DLADY',
+    '3417.KL': 'CARLSBG', '3069.KL': 'GAB', '4316.KL': 'BERJFOOD',
+    '7668.KL': 'HWATAI', '3867.KL': 'MYNEWS', '7178.KL': 'QL',
+    '2836.KL': 'SCIENTX', '5024.KL': 'CARING', '5126.KL': 'FFB',
+    '5322.KL': 'SPRITZER', '6432.KL': 'PWROOT', '4162.KL': 'OLDTOWN',
+    '7222.KL': 'KAWAN', '5015.KL': 'PARKSON', '5014.KL': 'AEON',
+    '6556.KL': 'BJCORP', '3255.KL': 'BST', '2658.KL': 'PPB',
+    '3476.KL': 'PMETAL', '6742.KL': 'HARTA', '2267.KL': 'KOSSAN',
+    '1562.KL': 'TOPGLOVE', '7076.KL': 'SUPERMX', '0177.KL': 'CAREPLUS',
+    '5878.KL': 'RUBBEREX', '3336.KL': 'LAFARGE', '1996.KL': 'ANNJOO',
+    '3549.KL': 'PRESTAR', '1589.KL': 'CAHYA', '5211.KL': 'SSTEEL',
+    '2194.KL': 'YTLCMT', '5053.KL': 'MAGNI', '8869.KL': 'PINTARAS',
+    '5027.KL': 'GAMUDA', '7113.KL': 'IJM', '0138.KL': 'GABUNGAN',
+    '7090.KL': 'WCT', '9814.KL': 'SUNCON', '5243.KL': 'ECONPILE',
+    '3557.KL': 'KERJAYA', '5079.KL': 'MUHIBAH', '7153.KL': 'PROTASCO',
+    '9121.KL': 'HSL', '9075.KL': 'NAIM', '5081.KL': 'HUAYANG',
+    '1301.KL': 'SPSETIA', '5236.KL': 'EWINT', '5180.KL': 'SIMEPROP',
+    '5247.KL': 'IGB', '5246.KL': 'UEMS', '7028.KL': 'UOADEV',
+    '6599.KL': 'SUNWAY', '4898.KL': 'IOIPG', '3794.KL': 'MAHSING',
+    '5007.KL': 'MRCB', '1643.KL': 'MATRIX', '5269.KL': 'LBS',
+    '5275.KL': 'GLOMAC', '5106.KL': 'TAMBUN', '5119.KL': 'OSK',
+    '3786.KL': 'KLCCSS', '7212.KL': 'AXREIT', '4665.KL': 'IGBREIT',
+    '0049.KL': 'PAVREIT', '5296.KL': 'SUNREIT', '7034.KL': 'UOAREIT',
+    '9296.KL': 'IHH', '7073.KL': 'KPJ', '0097.KL': 'DUOPHARMA',
+    '0186.KL': 'PHARMA', '5227.KL': 'BERMAZ', '5124.KL': 'MBM',
+    '5216.KL': 'UMW', '5111.KL': 'POS', '3743.KL': 'DRBHCOM',
+    '4609.KL': 'TCHONG', '4635.KL': 'GENTING', '5983.KL': 'GENM',
+    '4677.KL': 'YTL', '2828.KL': 'SIME', '5073.KL': 'BSTEAD',
+    '7182.KL': 'FGV', '1619.KL': 'BJLAND', '5200.KL': 'YTLREIT',
+    '5209.KL': 'ECOWORLD', '5215.KL': 'REVENUE', '4588.KL': 'ORIENTAL',
+    '7293.KL': 'PANAMY', '5025.KL': 'SOP', '6963.KL': 'TWP',
+}
+
 # 去重，保留順序
 seen = set()
 KLSE_SYMBOLS = []
@@ -386,7 +447,7 @@ def find_c_series(df):
 # ══════════════════════════════════════════════════════════
 
 def scan_symbol(symbol):
-    row = {'symbol': symbol, 'name': KLSE_NAMES.get(symbol, '')}
+    row = {'symbol': symbol, 'name': KLSE_NAMES.get(symbol, ''), 'tv_symbol': TV_SYMBOLS.get(symbol, symbol.replace('.KL',''))}
     for tf_label, tf_cfg in TIMEFRAMES.items():
         df = fetch_ohlcv(symbol, tf_cfg, tf_label)
         if df is None: row[tf_label]='-'; continue
@@ -508,7 +569,7 @@ HTML = """
     <tbody>
       {% for row in results %}
       <tr>
-        <td class="sym"><a href="https://www.tradingview.com/chart/?symbol=KLSE:{{ row.symbol.replace('.KL','') }}" target="_blank" style="color:#79c0ff;text-decoration:none">{{ row.symbol }}</a></td>
+        <td class="sym"><a href="https://www.tradingview.com/chart/?symbol=KLSE:{{ row.tv_symbol }}" target="_blank" style="color:#79c0ff;text-decoration:none">{{ row.symbol }}</a></td>
         <td class="name">{{ row.name }}</td>
         {% for tf in ['1D','4H','1H'] %}
         <td class="{{ 'entry' if '🎯' in row.get(tf,'') else '' }}">{{ row.get(tf,'-') }}</td>
