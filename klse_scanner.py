@@ -508,7 +508,7 @@ HTML = """
     <tbody>
       {% for row in results %}
       <tr>
-        <td class="sym"><a href="https://www.tradingview.com/chart/?symbol=MYX:{{ row.symbol.replace('.KL','') }}" target="_blank" style="color:#79c0ff;text-decoration:none">{{ row.symbol }}</a></td>
+        <td class="sym"><a href="https://www.tradingview.com/chart/?symbol=KLSE:{{ row.symbol.replace('.KL','') }}" target="_blank" style="color:#79c0ff;text-decoration:none">{{ row.symbol }}</a></td>
         <td class="name">{{ row.name }}</td>
         {% for tf in ['1D','4H','1H'] %}
         <td class="{{ 'entry' if '🎯' in row.get(tf,'') else '' }}">{{ row.get(tf,'-') }}</td>
