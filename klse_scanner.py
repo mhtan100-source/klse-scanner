@@ -378,7 +378,7 @@ def get_stage(df):
     c = df['close']
     ma150 = c.rolling(150).mean()
     cur150 = ma150.iloc[-1]
-    prev150 = ma150.iloc[-10]
+    prev150 = ma150.iloc[-3]
     price = c.iloc[-1]
     up150 = cur150 > prev150
     ab150 = price > cur150
