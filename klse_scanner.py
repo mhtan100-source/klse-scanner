@@ -373,22 +373,19 @@ def fetch_ohlcv(symbol, tf_cfg, tf_label):
 # ══════════════════════════════════════════════════════════
 
 def get_stage(df):
-    if len(df) < 200:
+    if len(df) < 150:
         return '-'
     c = df['close']
-    ma50  = c.rolling(50).mean()
     ma150 = c.rolling(150).mean()
-    ma200 = c.rolling(200).mean()
-    cur50,prev50   = ma50.iloc[-1],ma50.iloc[-10]
-    cur150,prev150 = ma150.iloc[-1],ma150.iloc[-10]
-    cur200,prev200 = ma200.iloc[-1],ma200.iloc[-10]
+    cur150 = ma150.iloc[-1]
+    prev150 = ma150.iloc[-10]
     price = c.iloc[-1]
-    up50  = cur50>prev50; up150=cur150>prev150; up200=cur200>prev200
-    ab50  = price>cur50;  ab150=price>cur150;   ab200=price>cur200
-    if up50 and up150 and up200 and ab50 and ab150 and ab200: return 'S2'
-    if not up50 and not up150 and not up200 and not ab50 and not ab150 and not ab200: return 'S4'
-    if up150 and up200 and ab150 and ab200: return 'S1'
-    if not up150 and not up200 and not ab150 and not ab200: return 'S3'
+    up150 = cur150 > prev150
+    ab150 = price > cur150
+    if up150 and ab150: return 'S2'
+    if not up150 and not ab150: return 'S4'
+    if up150 and not ab150: return 'S1'
+    if not up150 and ab150: return 'S3'
     return 'S0'
 
 # ══════════════════════════════════════════════════════════
