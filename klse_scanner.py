@@ -721,7 +721,7 @@ ROWS
 
 def build_html(status='done'):
     rows = ''
-    for r in cached_results:
+    for r in (cached_results or []):
         sym = r['symbol']
         tv  = r.get('tv_symbol', sym.replace('.KL',''))
         tv_url = f"https://www.tradingview.com/chart/?symbol={tv}"
@@ -752,7 +752,11 @@ def build_html(status='done'):
 def index():
     with scan_state['lock']:
         status = scan_state['status']
-    return build_html(status)
+    try:
+        return build_html(status)
+    except Exception as e:
+        log.error(f"build_html error: {e}")
+        return f"<html><body style='background:#0d1117;color:#e6edf3;font-family:monospace;padding:40px'><h2>🇲🇾 大馬莊家思維掃描器</h2><p>⏳ 掃描中，請稍候約10分鐘後刷新頁面...</p><p style='color:#8b949e'>Error: {e}</p></body></html>", 200
 
 @app.route('/rescan', methods=['POST'])
 def rescan():
