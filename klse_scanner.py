@@ -25,50 +25,301 @@ TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
 MY_TZ = pytz.timezone('Asia/Kuala_Lumpur')
 
 SYMBOLS = [
-    # 金融
-    '1155.KL','1023.KL','1295.KL','5819.KL','1066.KL',
-    '1015.KL','5185.KL','1082.KL','6947.KL','6888.KL',
-    '5168.KL','6012.KL','1597.KL','5258.KL','6399.KL',
-    # 能源/石油
-    '5183.KL','3816.KL','5071.KL','1532.KL','6033.KL',
-    '3948.KL','5026.KL','2771.KL','5116.KL','1929.KL',
-    # 電信
-    '6888.KL','4863.KL','6012.KL','6742.KL','5053.KL',
-    # 消費
-    '2445.KL','1961.KL','2291.KL','1899.KL','2038.KL',
-    '5029.KL','2220.KL','5135.KL','1589.KL','5211.KL',
-    # 棕榈油/農業
-    '2445.KL','1961.KL','2291.KL','1899.KL','2038.KL',
-    '5029.KL','2220.KL','5033.KL','4731.KL','3182.KL',
-    '4715.KL','3336.KL','1996.KL','9679.KL',
-    # 工業
-    '3549.KL','5148.KL','8583.KL','5141.KL','1724.KL',
-    '9261.KL','2194.KL','3476.KL','2267.KL','1562.KL',
-    '7076.KL','0177.KL','5878.KL','7153.KL','5027.KL',
-    '7113.KL','0138.KL','7090.KL','7212.KL','4665.KL',
-    # 科技
-    '0049.KL','5296.KL','0078.KL','0090.KL','7034.KL',
-    '9814.KL','5243.KL','0097.KL','0196.KL','0065.KL',
-    '9296.KL','7073.KL','0050.KL','0186.KL','5216.KL',
-    '1301.KL','5236.KL','5180.KL','5111.KL','5227.KL',
-    '5124.KL','5269.KL','5020.KL','5275.KL','0146.KL',
-    # 房地產
-    '6599.KL','5247.KL','5106.KL','5109.KL','5119.KL',
-    '3786.KL','4898.KL','5008.KL','5246.KL','7028.KL',
-    # 醫療
-    '3557.KL','5079.KL','3794.KL','5007.KL','9121.KL',
-    '5136.KL','8869.KL','9075.KL','5139.KL','8230.KL',
-    # 運輸/基建
-    '4635.KL','5983.KL','1619.KL','7293.KL','4588.KL',
-    '5285.KL','5081.KL','7222.KL','4609.KL','0051.KL',
-    # 其他主板
-    '3026.KL','3867.KL','2658.KL','4162.KL','7178.KL',
-    '5242.KL','6556.KL','3255.KL','4197.KL','5347.KL',
-    '1155.KL','2488.KL','5819.KL','1066.KL','1015.KL',
-    '5185.KL','6947.KL','4863.KL','3816.KL','6033.KL',
-    '1532.KL','5168.KL','9261.KL','2194.KL','3476.KL',
-    '5053.KL','6742.KL','2267.KL','1562.KL','7076.KL',
+    '1155.KL',
+    '1295.KL',
+    '1023.KL',
+    '5819.KL',
+    '1066.KL',
+    '1015.KL',
+    '5185.KL',
+    '1082.KL',
+    '5258.KL',
+    '5099.KL',
+    '1597.KL',
+    '1277.KL',
+    '5115.KL',
+    '7107.KL',
+    '2488.KL',
+    '6399.KL',
+    '5347.KL',
+    '5183.KL',
+    '6033.KL',
+    '5026.KL',
+    '5116.KL',
+    '3816.KL',
+    '5071.KL',
+    '1532.KL',
+    '3948.KL',
+    '2771.KL',
+    '1929.KL',
+    '5209.KL',
+    '6742.KL',
+    '6888.KL',
+    '4863.KL',
+    '6012.KL',
+    '6947.KL',
+    '5168.KL',
+    '2445.KL',
+    '1961.KL',
+    '2291.KL',
+    '1899.KL',
+    '2038.KL',
+    '5029.KL',
+    '2220.KL',
+    '5135.KL',
+    '5033.KL',
+    '4731.KL',
+    '0146.KL',
+    '1589.KL',
+    '5211.KL',
+    '0148.KL',
+    '3867.KL',
+    '2658.KL',
+    '3026.KL',
+    '4588.KL',
+    '5285.KL',
+    '5081.KL',
+    '7222.KL',
+    '4609.KL',
+    '5878.KL',
+    '6556.KL',
+    '7293.KL',
+    '7178.KL',
+    '5242.KL',
+    '4162.KL',
+    '3255.KL',
+    '5822.KL',
+    '5264.KL',
+    '3182.KL',
+    '4715.KL',
+    '3336.KL',
+    '1996.KL',
+    '9679.KL',
+    '3549.KL',
+    '5148.KL',
+    '5141.KL',
+    '1724.KL',
+    '9261.KL',
+    '2194.KL',
+    '3476.KL',
+    '4197.KL',
+    '8583.KL',
+    '5983.KL',
+    '1619.KL',
+    '9814.KL',
+    '5243.KL',
+    '0051.KL',
+    '0049.KL',
+    '5296.KL',
+    '0078.KL',
+    '0090.KL',
+    '7034.KL',
+    '0097.KL',
+    '0196.KL',
+    '0065.KL',
+    '9296.KL',
+    '7073.KL',
+    '0050.KL',
+    '0186.KL',
+    '0138.KL',
+    '5053.KL',
+    '7153.KL',
+    '5027.KL',
+    '7113.KL',
+    '7090.KL',
+    '0177.KL',
+    '7212.KL',
+    '0197.KL',
+    '5250.KL',
+    '5216.KL',
+    '1301.KL',
+    '3557.KL',
+    '5079.KL',
+    '3794.KL',
+    '5007.KL',
+    '9121.KL',
+    '5136.KL',
+    '5236.KL',
+    '5180.KL',
+    '5111.KL',
+    '5227.KL',
+    '5124.KL',
+    '5269.KL',
+    '5020.KL',
+    '5275.KL',
+    '4898.KL',
+    '5008.KL',
+    '5246.KL',
+    '7028.KL',
+    '8869.KL',
+    '9075.KL',
+    '5139.KL',
+    '8230.KL',
+    '5294.KL',
+    '6599.KL',
+    '5247.KL',
+    '5106.KL',
+    '5109.KL',
+    '5119.KL',
+    '3786.KL',
+    '4635.KL',
+    '4665.KL',
+    '1562.KL',
+    '7076.KL',
+    '2267.KL',
+    '7182.KL',
+    '0023.KL',
+    '5205.KL',
+    '5879.KL',
+    '6076.KL',
+    '5299.KL',
+    '0820EA.KL',
+    '5143.KL',
+    '3689.KL',
+    '5398.KL',
+    '8532.KL',
+    '0249.KL',
+    '5134.KL',
+    '3042.KL',
+    '7084.KL',
+    '0163.KL',
+    '3417.KL',
+    '5014.KL',
+    '3239.KL',
+    '4502.KL',
 ]
+
+
+# 股票名稱對照表
+NAMES = {
+    '1155.KL': 'Maybank', '1023.KL': 'CIMB', '1295.KL': 'Public Bank',
+    '5819.KL': 'Hong Leong Bank', '1066.KL': 'RHB Bank', '1015.KL': 'AMMB',
+    '5185.KL': 'Affin Bank', '1082.KL': 'Alliance Bank', '6947.KL': 'Axiata',
+    '6888.KL': 'Maxis', '5168.KL': 'TM', '6012.KL': 'Digi/CelcomDigi',
+    '1597.KL': 'BIMB', '5258.KL': 'MBSB', '6399.KL': 'Astro',
+    '5183.KL': 'Petronas Gas', '3816.KL': 'Petronas Dagangan',
+    '5071.KL': 'Dialog', '1532.KL': 'Hibiscus', '6033.KL': 'Sapura Energy',
+    '3948.KL': 'Bumi Armada', '5026.KL': 'Velesto', '2771.KL': 'Wah Seong',
+    '5116.KL': 'Yinson', '1929.KL': 'Serba Dinamik',
+    '4863.KL': 'Telekom', '6742.KL': 'Time dotcom', '5053.KL': 'Inari',
+    '2445.KL': 'IOI Corp', '1961.KL': 'KL Kepong', '2291.KL': 'Sime Darby Plant',
+    '1899.KL': 'Genting Plant', '2038.KL': 'Boustead Plant',
+    '5029.KL': 'FGV', '2220.KL': 'Berjaya Land',
+    '5135.KL': 'Sarawak Plant', '5033.KL': 'Kulim',
+    '4731.KL': 'PPB Group', '3182.KL': 'Genting', '4715.KL': 'Genting Malaysia',
+    '3336.KL': 'IJM Corp', '1996.KL': 'Gamuda', '9679.KL': 'Sunway',
+    '3549.KL': 'YTL Corp', '5148.KL': 'YTL Power', '8583.KL': 'Parkson',
+    '5141.KL': 'Hap Seng', '1724.KL': 'Sime Darby',
+    '9261.KL': 'Berjaya Corp', '2194.KL': 'WCT Holdings',
+    '3476.KL': 'MMC Corp', '5053.KL': 'Inari', '6742.KL': 'Time dotcom',
+    '2267.KL': 'Lafarge', '1562.KL': 'Panasonic', '7076.KL': 'Poh Kong',
+    '0177.KL': 'Datasonic', '5878.KL': 'Aeon', '7153.KL': 'Top Glove',
+    '5027.KL': 'Kossan', '7113.KL': 'Supermax', '0138.KL': 'MyEG',
+    '7090.KL': 'Hartalega', '0197.KL': 'Genetec', '7212.KL': 'Karex',
+    '4665.KL': 'Pos Malaysia', '0049.KL': 'Vitrox', '5296.KL': 'Revenue Group',
+    '0078.KL': 'GHL Systems', '0090.KL': 'Globetronics', '7034.KL': 'Unisem',
+    '9814.KL': 'Pentamaster', '5243.KL': 'UWC', '0097.KL': 'Coraza',
+    '0196.KL': 'Dagang NeXchange', '0065.KL': 'Scicom', '9296.KL': 'Malaysian Pacific',
+    '7073.KL': 'Frontken', '0050.KL': 'Prestariang', '0186.KL': 'D&O Green',
+    '5216.KL': 'IHH Healthcare', '1301.KL': 'KPJ Healthcare',
+    '5236.KL': 'Sunway REIT', '5180.KL': 'KLCC REIT', '5111.KL': 'Pavilion REIT',
+    '5227.KL': 'Axis REIT', '5124.KL': 'Amanahraya REIT',
+    '5269.KL': 'IGB REIT', '5020.KL': 'Suria Capital', '5275.KL': 'Sentral REIT',
+    '6599.KL': 'Malaysia Airports', '5247.KL': 'MAS (MAB)',
+    '5106.KL': 'Westports', '5109.KL': 'Bintulu Port',
+    '5119.KL': 'Lingkaran Trans', '3786.KL': 'PLUS (Litrak)',
+    '4898.KL': 'UEM Sunrise', '5008.KL': 'SP Setia',
+    '5246.KL': 'Eco World', '7028.KL': 'Mah Sing',
+    '3557.KL': 'Pharmaniaga', '5079.KL': 'Apex Healthcare',
+    '3794.KL': 'Duopharma', '5007.KL': 'Hovid',
+    '9121.KL': 'CCK Consolidated', '5136.KL': 'Caring Pharmacy',
+    '8869.KL': 'Matrix Concepts', '9075.KL': 'Signature International',
+    '5139.KL': 'Sarawak Consolidated', '8230.KL': 'Tambun Indah',
+    '4635.KL': 'Misc', '5983.KL': 'KKB Engineering',
+    '1619.KL': 'Berjaya Land Dev', '7293.KL': 'Aeon Credit',
+    '4588.KL': 'Nestle', '5285.KL': 'QL Resources',
+    '5081.KL': 'Dutch Lady', '7222.KL': 'Fraser & Neave',
+    '4609.KL': 'Heineken', '0051.KL': 'TWL Holdings',
+    '3026.KL': 'Tradewinds Plant', '3867.KL': 'Chin Teck Plant',
+    '2658.KL': 'TH Plantation', '4162.KL': 'Scientex',
+    '7178.KL': 'Padini', '5242.KL': 'Bonia',
+    '6556.KL': 'Mr DIY', '3255.KL': 'V.S. Industry',
+    '4197.KL': 'Kerjaya Prospek', '5347.KL': 'Tenaga Nasional',
+    '2488.KL': 'KLCC Property', '5099.KL': 'Bursa Malaysia',
+    '5250.KL': 'Press Metal', '5822.KL': '99 Speed Mart',
+    '5264.KL': 'Farm Fresh', '5294.KL': 'IOI Properties',
+    '5879.KL': 'AirAsia X', '6076.KL': 'AmBank Group',
+    '7182.KL': '7-Eleven Malaysia', '0023.KL': 'Revenue Group',
+    '5209.KL': 'Eco World Dev', '5205.KL': 'Technove Global',
+    '5299.KL': 'Teladan Setia', '5143.KL': 'Malayan Flour',
+    '3689.KL': 'Batu Kawan', '5134.KL': 'Capital A',
+    '3042.KL': 'Hai-O Enterprise', '0163.KL': 'Berjaya Food',
+    '3417.KL': 'Tan Chong Motor', '5014.KL': 'Magnum',
+    '4502.KL': 'IJM Plantations', '0249.KL': 'Sentoria Group',
+    '3239.KL': 'TSM Global', '7084.KL': 'QL Resources',
+    '5398.KL': 'Genting Plant Dev', '8532.KL': 'Aeon Credit',
+    '0820EA.KL': 'Eco-Arc',
+}
+
+# 板塊分類
+SECTORS = {
+    # 金融
+    '1155.KL':'金融','1023.KL':'金融','1295.KL':'金融','5819.KL':'金融',
+    '1066.KL':'金融','1015.KL':'金融','5185.KL':'金融','1082.KL':'金融',
+    '5258.KL':'金融','5099.KL':'金融','1597.KL':'金融','1277.KL':'金融',
+    '5115.KL':'金融','7107.KL':'金融','2488.KL':'金融','6399.KL':'金融',
+    '6076.KL':'金融','8532.KL':'金融',
+    # 公用/能源
+    '5347.KL':'能源','5183.KL':'能源','6033.KL':'能源','5026.KL':'能源',
+    '5116.KL':'能源','3816.KL':'能源','5071.KL':'能源','1532.KL':'能源',
+    '3948.KL':'能源','2771.KL':'能源','1929.KL':'能源','5250.KL':'能源',
+    # 電信
+    '6888.KL':'電信','4863.KL':'電信','6012.KL':'電信','6947.KL':'電信',
+    '5168.KL':'電信','6742.KL':'電信','6399.KL':'電信',
+    # 棕榈油
+    '2445.KL':'棕榈油','1961.KL':'棕榈油','2291.KL':'棕榈油','1899.KL':'棕榈油',
+    '2038.KL':'棕榈油','5029.KL':'棕榈油','5135.KL':'棕榈油','5033.KL':'棕榈油',
+    '4731.KL':'棕榈油','0146.KL':'棕榈油','1589.KL':'棕榈油','5211.KL':'棕榈油',
+    '0148.KL':'棕榈油','3867.KL':'棕榈油','2658.KL':'棕榈油','3026.KL':'棕榈油',
+    '4502.KL':'棕榈油','5398.KL':'棕榈油',
+    # 消費/零售
+    '4588.KL':'消費','5285.KL':'消費','5081.KL':'消費','7222.KL':'消費',
+    '4609.KL':'消費','5878.KL':'消費','6556.KL':'消費','7293.KL':'消費',
+    '7178.KL':'消費','5242.KL':'消費','4162.KL':'消費','3255.KL':'消費',
+    '5822.KL':'消費','5264.KL':'消費','3042.KL':'消費','0163.KL':'消費',
+    '5014.KL':'消費','3417.KL':'消費','5143.KL':'消費',
+    # 工業/建築
+    '3182.KL':'工業','4715.KL':'工業','3336.KL':'工業','1996.KL':'工業',
+    '9679.KL':'工業','3549.KL':'工業','5148.KL':'工業','5141.KL':'工業',
+    '1724.KL':'工業','9261.KL':'工業','2194.KL':'工業','3476.KL':'工業',
+    '4197.KL':'工業','8583.KL':'工業','5983.KL':'工業','1619.KL':'工業',
+    '2220.KL':'工業','3689.KL':'工業','0249.KL':'工業','3239.KL':'工業',
+    # 科技/半導體
+    '0049.KL':'科技','5296.KL':'科技','0078.KL':'科技','0090.KL':'科技',
+    '7034.KL':'科技','9814.KL':'科技','5243.KL':'科技','0097.KL':'科技',
+    '0196.KL':'科技','0065.KL':'科技','9296.KL':'科技','7073.KL':'科技',
+    '0050.KL':'科技','0186.KL':'科技','0138.KL':'科技','5053.KL':'科技',
+    '0177.KL':'科技','7212.KL':'科技','0197.KL':'科技','5250.KL':'科技',
+    '5134.KL':'科技','5205.KL':'科技','5299.KL':'科技',
+    # 手套
+    '7153.KL':'手套','5027.KL':'手套','7113.KL':'手套','7090.KL':'手套',
+    # 醫療
+    '5216.KL':'醫療','1301.KL':'醫療','3557.KL':'醫療','5079.KL':'醫療',
+    '3794.KL':'醫療','5007.KL':'醫療','9121.KL':'醫療','5136.KL':'醫療',
+    # 房地產/REIT
+    '5236.KL':'房地產','5180.KL':'房地產','5111.KL':'房地產','5227.KL':'房地產',
+    '5124.KL':'房地產','5269.KL':'房地產','5020.KL':'房地產','5275.KL':'房地產',
+    '4898.KL':'房地產','5008.KL':'房地產','5246.KL':'房地產','7028.KL':'房地產',
+    '8869.KL':'房地產','9075.KL':'房地產','5139.KL':'房地產','8230.KL':'房地產',
+    '5294.KL':'房地產','5209.KL':'房地產',
+    # 運輸/基建
+    '6599.KL':'運輸','5247.KL':'運輸','5106.KL':'運輸','5109.KL':'運輸',
+    '5119.KL':'運輸','3786.KL':'運輸','4635.KL':'運輸','4665.KL':'運輸',
+    '5879.KL':'運輸','0820EA.KL':'運輸',
+    # 其他
+    '1562.KL':'其他','7076.KL':'其他','2267.KL':'其他','7084.KL':'其他',
+    '0023.KL':'其他','7182.KL':'其他','2488.KL':'其他',
+}
 
 TF_LABELS = ['1D', '4H', '1H']
 
@@ -346,14 +597,17 @@ function exportTxt(){
 function filterTable(){
   var q=document.getElementById('search').value.toLowerCase();
   var stage=document.getElementById('stageFilter').value;
+  var sector=document.getElementById('sectorFilter').value;
   var onlyC=document.getElementById('onlyC').checked;
   document.querySelectorAll('tbody tr').forEach(function(r){
     var text=r.innerText.toLowerCase();
     var hasC=text.includes('c1')||text.includes('c2')||text.includes('c3')||text.includes('c4')||text.includes('c5')||text.includes('c6');
     var matchQ=q===''||text.includes(q);
     var rowStage=r.getAttribute('data-stage')||'';
+    var rowSector=r.getAttribute('data-sector')||'';
     var matchStage=stage===''||rowStage===stage;
-    r.style.display=(matchQ&&matchStage&&(!onlyC||hasC))?'':'none';
+    var matchSector=sector===''||rowSector===sector;
+    r.style.display=(matchQ&&matchStage&&matchSector&&(!onlyC||hasC))?'':'none';
   });
 }
 </script>
@@ -374,6 +628,21 @@ function filterTable(){
     <option value="S3">S3</option>
     <option value="S4">S4</option>
   </select>
+  <select id="sectorFilter" onchange="filterTable()">
+    <option value="">全部板塊</option>
+    <option value="金融">金融</option>
+    <option value="能源">能源</option>
+    <option value="電信">電信</option>
+    <option value="棕榈油">棕榈油</option>
+    <option value="消費">消費</option>
+    <option value="工業">工業</option>
+    <option value="科技">科技</option>
+    <option value="手套">手套</option>
+    <option value="醫療">醫療</option>
+    <option value="房地產">房地產</option>
+    <option value="運輸">運輸</option>
+    <option value="其他">其他</option>
+  </select>
   <label class="chk-label"><input type="checkbox" id="onlyC" onchange="filterTable()"> 只顯示有C的</label>
   <button class="btn-export" onclick="exportTxt()">&#x1F4E5; Export TXT</button>
   <span class="info">共 TOTAL 只</span>
@@ -381,7 +650,7 @@ function filterTable(){
 BANNER
 <table>
 <thead><tr>
-<th>股票</th><th>1D</th><th>4H</th><th>1H</th>
+<th>股票</th><th>板塊</th><th>1D</th><th>4H</th><th>1H</th>
 </tr></thead>
 <tbody>
 ROWS
@@ -398,7 +667,10 @@ def build_html(status='done'):
         tv_url = f"https://www.tradingview.com/chart/?symbol={tv}"
         d1  = r.get('1D', '-')
         stage = d1.split(' ')[0] if d1 not in ('-', '') else '-'
-        rows += f'<tr data-stage="{stage}"><td class="sym"><a href="{tv_url}" target="_blank">{sym}</a></td>'
+        name = r.get('name', sym)
+        sector = r.get('sector', '其他')
+        rows += f'<tr data-stage="{stage}" data-sector="{sector}"><td class="sym"><a href="{tv_url}" target="_blank">{name}</a><br><span style="color:#8b949e;font-size:10px">{sym}</span></td>'
+        rows += f'<td style="color:#8b949e;font-size:12px">{sector}</td>'
         for tf in TF_LABELS:
             txt = r.get(tf, '-')
             cls = r.get(f'{tf}_cls', 'gray')
