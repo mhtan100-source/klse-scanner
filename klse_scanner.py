@@ -173,19 +173,13 @@ SYMBOLS = [
     '5879.KL',
     '6076.KL',
     '5299.KL',
-    '0820EA.KL',
     '5143.KL',
     '3689.KL',
-    '5398.KL',
-    '8532.KL',
-    '0249.KL',
     '5134.KL',
     '3042.KL',
-    '7084.KL',
     '0163.KL',
     '3417.KL',
     '5014.KL',
-    '3239.KL',
     '4502.KL',
 ]
 
@@ -327,20 +321,20 @@ TV_SYMBOLS = {
     '5819.KL': 'HLBANK', '1066.KL': 'RHBBANK', '1015.KL': 'AMBANK',
     '5185.KL': 'AFFIN', '1082.KL': 'ABMB', '5258.KL': 'MBSB',
     '5099.KL': 'BURSA', '1597.KL': 'BIMB', '1277.KL': 'HLFG',
-    '5115.KL': 'LPI', '7107.KL': 'OSK', '2488.KL': 'KLCCSS',
+    '5115.KL': 'LPI', '7107.KL': 'OSK', '2488.KL': 'KLCC',
     '6399.KL': 'ASTRO', '6076.KL': 'AMBANK',
     '5347.KL': 'TENAGA', '5183.KL': 'PETGAS', '6033.KL': 'SAPNRG',
     '5026.KL': 'VELESTO', '5116.KL': 'YINSON', '3816.KL': 'PETDAG',
     '5071.KL': 'DIALOG', '1532.KL': 'HIBISCS', '3948.KL': 'ARMADA',
     '2771.KL': 'WASEONG', '5250.KL': 'PMETAL',
     '6888.KL': 'MAXIS', '4863.KL': 'TM', '6012.KL': 'CDB',
-    '6947.KL': 'AXIATA', '5168.KL': 'TELECOM', '6742.KL': 'TIMECOM',
+    '6947.KL': 'AXIATA', '5168.KL': 'TM', '6742.KL': 'TIMECOM',
     '2445.KL': 'IOICORP', '1961.KL': 'KLK', '2291.KL': 'SDG',
     '1899.KL': 'GENP', '2038.KL': 'BPLANT', '5029.KL': 'FGV',
     '5135.KL': 'SWKPLNT', '5033.KL': 'KULIM', '4731.KL': 'PPB',
-    '0146.KL': 'TSHREIT', '1589.KL': 'CHINTEK', '5211.KL': 'UTDPLT',
+    '0146.KL': 'TSH', '1589.KL': 'CHINTEK', '5211.KL': 'UTDPLT',
     '0148.KL': 'JTIASA', '3867.KL': 'CEPAT', '2658.KL': 'THP',
-    '3026.KL': 'TWS', '4502.KL': 'IJMPLNT',
+    '3026.KL': 'TWSPLNT', '4502.KL': 'IJMPLNT',
     '4588.KL': 'NESTLE', '5285.KL': 'QL', '5081.KL': 'DLADY',
     '7222.KL': 'F&N', '4609.KL': 'HEIM', '5878.KL': 'AEON',
     '6556.KL': 'MRDIY', '7293.KL': 'AEONCR', '7178.KL': 'PADINI',
@@ -371,13 +365,13 @@ TV_SYMBOLS = {
     '5020.KL': 'SURIA', '5275.KL': 'SENTRAL', '4898.KL': 'UEMS',
     '5008.KL': 'SPSETIA', '5246.KL': 'ECOWLD', '7028.KL': 'MAHSING',
     '8869.KL': 'MATRIX', '9075.KL': 'SIGN', '5139.KL': 'SWKCORP',
-    '8230.KL': 'TAMBUN', '5294.KL': 'IOIPG', '5209.KL': 'EWINT',
+    '8230.KL': 'TAMBUN', '5294.KL': 'IOIPG', '5209.KL': 'ECOWLD',
     '6599.KL': 'AIRPORT', '5247.KL': 'MAB', '5106.KL': 'WPRTS',
     '5109.KL': 'BIPORT', '5119.KL': 'LITRAK', '3786.KL': 'LITRAK',
     '4635.KL': 'MISC', '4665.KL': 'POS', '5879.KL': 'AAX',
     '1562.KL': 'PANAMY', '7076.KL': 'POHKONG', '2267.KL': 'LAFMSIA',
     '7182.KL': '7ELEVEN', '0023.KL': 'REVENUE', '7084.KL': 'QL',
-    '3239.KL': 'TSM', '0249.KL': 'SENTORIA', '5398.KL': 'GENPLANT',
+    '3239.KL': 'TSM', '0249.KL': 'SENTORIA', '5398.KL': 'GENP',
     '8532.KL': 'AEONCR', '0820EA.KL': 'ECOARC',
 }
 
@@ -646,7 +640,7 @@ function exportTxt(){
   document.querySelectorAll('tbody tr').forEach(function(r){
     if(r.style.display==='none') return;
     var sym=r.getAttribute('data-symbol');
-    if(sym) lines.push(sym);
+    if(sym) lines.push(sym.replace('KLSE:',''));
   });
   var txt=lines.join(String.fromCharCode(10));
   var blob=new Blob([txt],{type:'text/plain'});
