@@ -729,7 +729,7 @@ def build_html(status='done'):
         stage = d1.split(' ')[0] if d1 not in ('-', '') else '-'
         name = r.get('name', sym)
         sector = r.get('sector', '其他')
-        tv_code = r.get('tv_symbol', f"KLSE:{tv_sym}")
+        tv_code = r.get('tv_symbol', 'KLSE:' + sym.replace('.KL',''))
         rows += f'<tr data-stage="{stage}" data-sector="{sector}" data-symbol="{tv_code}"><td class="sym"><a href="{tv_url}" target="_blank">{name}</a><br><span style="color:#8b949e;font-size:10px">{sym}</span></td>'
         rows += f'<td style="color:#8b949e;font-size:12px">{sector}</td>'
         for tf in TF_LABELS:
