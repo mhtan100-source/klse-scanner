@@ -514,9 +514,10 @@ def find_c_count(df):
 
 def scan_symbol(symbol):
     result = {'symbol': symbol}
-    # TV symbol for KLSE: remove .KL, use KLSE: prefix
-    tv_sym = symbol.replace('.KL', '')
-    result['tv_symbol'] = f"KLSE:{tv_sym}"
+    result['name'] = NAMES.get(symbol, symbol.replace('.KL',''))
+    result['sector'] = SECTORS.get(symbol, '其他')
+    tv_ticker = TV_SYMBOLS.get(symbol, symbol.replace('.KL',''))
+    result['tv_symbol'] = f"KLSE:{tv_ticker}"
     for tf in TF_LABELS:
         try:
             df = fetch_ohlcv(symbol, tf)
