@@ -584,8 +584,8 @@ function exportTxt(){
   var lines=[];
   document.querySelectorAll('tbody tr').forEach(function(r){
     if(r.style.display==='none') return;
-    var sym=r.querySelector('td.sym a');
-    if(sym) lines.push(sym.innerText.trim());
+    var sym=r.getAttribute('data-symbol');
+    if(sym) lines.push(sym);
   });
   var txt=lines.join(String.fromCharCode(10));
   var blob=new Blob([txt],{type:'text/plain'});
@@ -669,7 +669,8 @@ def build_html(status='done'):
         stage = d1.split(' ')[0] if d1 not in ('-', '') else '-'
         name = r.get('name', sym)
         sector = r.get('sector', '其他')
-        rows += f'<tr data-stage="{stage}" data-sector="{sector}"><td class="sym"><a href="{tv_url}" target="_blank">{name}</a><br><span style="color:#8b949e;font-size:10px">{sym}</span></td>'
+        tv_code = f"KLSE:{tv_sym}"
+        rows += f'<tr data-stage="{stage}" data-sector="{sector}" data-symbol="{tv_code}"><td class="sym"><a href="{tv_url}" target="_blank">{name}</a><br><span style="color:#8b949e;font-size:10px">{sym}</span></td>'
         rows += f'<td style="color:#8b949e;font-size:12px">{sector}</td>'
         for tf in TF_LABELS:
             txt = r.get(tf, '-')
