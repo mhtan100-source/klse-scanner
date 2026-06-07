@@ -334,7 +334,7 @@ TV_SYMBOLS = {
     '5135.KL': 'SWKPLNT', '5033.KL': 'KULIM', '4731.KL': 'PPB',
     '0146.KL': 'TSH', '1589.KL': 'CHINTEK', '5211.KL': 'UTDPLT',
     '0148.KL': 'JTIASA', '3867.KL': 'CEPAT', '2658.KL': 'THP',
-    '3026.KL': 'TWSPLNT', '4502.KL': 'IJMPLNT',
+    '3026.KL': 'TWP', '4502.KL': 'IJMPLNT',
     '4588.KL': 'NESTLE', '5285.KL': 'QL', '5081.KL': 'DLADY',
     '7222.KL': 'F&N', '4609.KL': 'HEIM', '5878.KL': 'AEON',
     '6556.KL': 'MRDIY', '7293.KL': 'AEONCR', '7178.KL': 'PADINI',
@@ -570,25 +570,32 @@ def send_telegram(results):
     now = datetime.now(MY_TZ).strftime('%Y-%m-%d %H:%M')
     lines = []
     for r in results:
-        if not any('\U0001f3af' in str(r.get(tf,'')) for tf in TF_LABELS):
+        d1 = r.get('1D', '-')
+        # 只看S2有C的
+        if not d1.startswith('S2') or '\U0001f3af' not in d1:
             continue
-        sym = r['symbol'].replace('.KL','')
-        d1  = r.get('1D', '-')
-        h4  = r.get('4H', '-')
-        h1  = r.get('1H', '-')
-        lines.append(f"{sym} | 1D:{d1} | 4H:{h4} | 1H:{h1}")
+        name   = r.get('name', r['symbol'].replace('.KL',''))
+        sector = r.get('sector', '')
+        h4 = r.get('4H', '-')
+        h1 = r.get('1H', '-')
+        lines.append(f"{name}({sector}) | 1D:{d1} | 4H:{h4} | 1H:{h1}")
     if not lines:
         return
-    header = f"\U0001f1f2\U0001f1fe 大馬莊家思維掃描\n{now}\n共{len(lines)}只有C信號\n{'─'*25}"
-    msg = header + "\n" + "\n".join(lines[:50])
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={'chat_id': TELEGRAM_CHAT_ID, 'text': msg},
-            timeout=10
-        )
-    except Exception as e:
-        log.warning(f"Telegram error: {e}")
+    # 分批發送，每批25行避免太長
+    header = f"\U0001f1f2\U0001f1fe 大馬莊家思維掃描\n{now}\n共{len(lines)}只 S2有C信號\n{'─'*20}"
+    batches = [lines[i:i+25] for i in range(0, len(lines), 25)]
+    for i, batch in enumerate(batches):
+        part = f" ({i+1}/{len(batches)})" if len(batches) > 1 else ""
+        msg = header + part + "\n" + "\n".join(batch)
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                json={'chat_id': TELEGRAM_CHAT_ID, 'text': msg},
+                timeout=10
+            )
+            time.sleep(1)
+        except Exception as e:
+            log.warning(f"Telegram error: {e}")
 
 app = Flask(__name__)
 
