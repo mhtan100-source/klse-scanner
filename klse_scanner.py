@@ -511,7 +511,7 @@ def scan_symbol(symbol):
     result['name'] = NAMES.get(symbol, symbol.replace('.KL',''))
     result['sector'] = SECTORS.get(symbol, '其他')
     tv_ticker = TV_SYMBOLS.get(symbol, symbol.replace('.KL',''))
-    result['tv_symbol'] = f"KLSE:{tv_ticker}"
+    result['tv_symbol'] = f"MYX:{tv_ticker}"
     for tf in TF_LABELS:
         try:
             df = fetch_ohlcv(symbol, tf)
