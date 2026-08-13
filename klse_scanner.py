@@ -214,7 +214,7 @@ NAMES = {
     '4665.KL': 'Pos Malaysia', '0049.KL': 'Vitrox', '5296.KL': 'Revenue Group',
     '0078.KL': 'GHL Systems', '0090.KL': 'Globetronics', '7034.KL': 'Unisem',
     '9814.KL': 'Pentamaster', '5243.KL': 'UWC', '0097.KL': 'Coraza',
-    '0196.KL': 'Dagang NeXchange', '0065.KL': 'Scicom', '9296.KL': 'Malaysian Pacific',
+    '0196.KL': 'Dagang NeXchange', '0065.KL': 'Scicom', '9296.KL': 'RCE Capital',
     '7073.KL': 'Frontken', '0050.KL': 'Prestariang', '0186.KL': 'D&O Green',
     '5216.KL': 'IHH Healthcare', '1301.KL': 'KPJ Healthcare',
     '5236.KL': 'Sunway REIT', '5180.KL': 'KLCC REIT', '5111.KL': 'Pavilion REIT',
@@ -235,7 +235,7 @@ NAMES = {
     '4588.KL': 'Nestle', '5285.KL': 'QL Resources',
     '5081.KL': 'Dutch Lady', '7222.KL': 'Fraser & Neave',
     '4609.KL': 'Heineken', '0051.KL': 'TWL Holdings',
-    '3026.KL': 'Tradewinds Plant', '3867.KL': 'Chin Teck Plant',
+    '3026.KL': 'Tradewinds Plant', '3867.KL': 'Malaysian Pacific',
     '2658.KL': 'TH Plantation', '4162.KL': 'Scientex',
     '7178.KL': 'Padini', '5242.KL': 'Bonia',
     '6556.KL': 'Mr DIY', '3255.KL': 'V.S. Industry',
@@ -275,7 +275,7 @@ SECTORS = {
     '2445.KL':'棕榈油','1961.KL':'棕榈油','2291.KL':'棕榈油','1899.KL':'棕榈油',
     '2038.KL':'棕榈油','5029.KL':'棕榈油','5135.KL':'棕榈油','5033.KL':'棕榈油',
     '4731.KL':'棕榈油','0146.KL':'棕榈油','1589.KL':'棕榈油','5211.KL':'棕榈油',
-    '0148.KL':'棕榈油','3867.KL':'棕榈油','2658.KL':'棕榈油','3026.KL':'棕榈油',
+    '0148.KL':'棕榈油','3867.KL':'科技','2658.KL':'棕榈油','3026.KL':'棕榈油',
     '4502.KL':'棕榈油','5398.KL':'棕榈油',
     # 消費/零售
     '4588.KL':'消費','5285.KL':'消費','5081.KL':'消費','7222.KL':'消費',
@@ -292,7 +292,7 @@ SECTORS = {
     # 科技/半導體
     '0049.KL':'科技','5296.KL':'科技','0078.KL':'科技','0090.KL':'科技',
     '7034.KL':'科技','9814.KL':'科技','5243.KL':'科技','0097.KL':'科技',
-    '0196.KL':'科技','0065.KL':'科技','9296.KL':'科技','7073.KL':'科技',
+    '0196.KL':'科技','0065.KL':'科技','9296.KL':'金融','7073.KL':'科技',
     '0050.KL':'科技','0186.KL':'科技','0138.KL':'科技','5053.KL':'科技',
     '0177.KL':'科技','7212.KL':'科技','0197.KL':'科技','5250.KL':'科技',
     '5134.KL':'科技','5205.KL':'科技','5299.KL':'科技',
@@ -334,7 +334,7 @@ TV_SYMBOLS = {
     '1899.KL': 'GENP', '2038.KL': 'BPLANT', '5029.KL': 'FGV',
     '5135.KL': 'SWKPLNT', '5033.KL': 'KULIM', '4731.KL': 'PPB',
     '0146.KL': 'TSH', '1589.KL': 'CHINTEK', '5211.KL': 'UTDPLT',
-    '0148.KL': 'JTIASA', '3867.KL': 'CEPAT', '2658.KL': 'THP',
+    '0148.KL': 'JTIASA', '3867.KL': 'MPI', '2658.KL': 'THP',
     '3026.KL': 'TWP', '4502.KL': 'IJMPLNT',
     '4588.KL': 'NESTLE', '5285.KL': 'QL', '5081.KL': 'DLADY',
     '7222.KL': 'F&N', '4609.KL': 'HEIM', '5878.KL': 'AEON',
@@ -352,7 +352,7 @@ TV_SYMBOLS = {
     '0049.KL': 'VITROX', '5296.KL': 'REVENUE', '0078.KL': 'GHL',
     '0090.KL': 'GTRONIC', '7034.KL': 'UNISEM', '9814.KL': 'PENTA',
     '5243.KL': 'UWC', '0097.KL': 'CORAZA', '0196.KL': 'DNEX',
-    '0065.KL': 'SCICOM', '9296.KL': 'MPI', '7073.KL': 'FRONTKN',
+    '0065.KL': 'SCICOM', '9296.KL': 'RCECAP', '7073.KL': 'FRONTKN',
     '0050.KL': 'PRESBHD', '0186.KL': 'DKSH', '0138.KL': 'MYEG',
     '5053.KL': 'INARI', '0177.KL': 'DATASONIC', '7212.KL': 'KAREX',
     '0197.KL': 'GENETEC', '5134.KL': 'CAPITALA', '5205.KL': 'TECHNOVE',
@@ -389,6 +389,57 @@ SIGNAL_CLASSES = ('bull-c', 'bull-ready', 'bear-c', 'bear-ready')
 
 cached_results = []
 scan_state = {'status': 'idle', 'last_scan': None, 'lock': threading.Lock()}
+
+# ============================================================
+# 股票代碼核對：跟Yahoo Finance官方名稱比對，找出SYMBOLS/NAMES錯置的代碼
+# （3867.KL / 9296.KL 錯置事件後新增，一次性診斷工具）
+# ============================================================
+audit_state = {'status': 'idle', 'checked': 0, 'total': 0, 'mismatches': [], 'errors': [], 'lock': threading.Lock()}
+
+def _name_matches(local_name, yahoo_name):
+    """寬鬆比對：只要任一方的關鍵字出現在另一方就算符合，避免誤報太多。"""
+    if not yahoo_name:
+        return True  # 抓不到Yahoo名稱時不算錯，避免因網路問題洗版
+    a = local_name.upper().replace('BHD', '').replace('BERHAD', '').strip()
+    b = yahoo_name.upper().replace('BHD', '').replace('BERHAD', '').strip()
+    if not a or not b:
+        return True
+    return (a in b) or (b in a) or any(w in b for w in a.split() if len(w) >= 4) or any(w in a for w in b.split() if len(w) >= 4)
+
+def run_name_audit():
+    global audit_state
+    with audit_state['lock']:
+        if audit_state['status'] == 'running':
+            return
+        audit_state['status'] = 'running'
+        audit_state['checked'] = 0
+        audit_state['mismatches'] = []
+        audit_state['errors'] = []
+        audit_state['total'] = len(SYMBOLS)
+    for sym in SYMBOLS:
+        local_name = NAMES.get(sym, '')
+        yahoo_name = ''
+        try:
+            info = yf.Ticker(sym).get_info()
+            yahoo_name = info.get('longName') or info.get('shortName') or ''
+        except Exception as e:
+            with audit_state['lock']:
+                audit_state['errors'].append({'symbol': sym, 'error': str(e)})
+        if yahoo_name and not _name_matches(local_name, yahoo_name):
+            with audit_state['lock']:
+                audit_state['mismatches'].append({
+                    'symbol': sym,
+                    'local_name': local_name,
+                    'yahoo_name': yahoo_name,
+                    'local_sector': SECTORS.get(sym, ''),
+                    'local_tv': TV_SYMBOLS.get(sym, ''),
+                })
+        with audit_state['lock']:
+            audit_state['checked'] += 1
+        time.sleep(0.4)
+    with audit_state['lock']:
+        audit_state['status'] = 'done'
+    log.info(f"股票代碼核對完成：共{len(SYMBOLS)}檔，發現{len(audit_state['mismatches'])}個疑似錯置")
 
 def is_market_hours():
     now = datetime.now(MY_TZ)
@@ -1446,6 +1497,28 @@ def status():
 @app.route('/health')
 def health():
     return jsonify({'status': 'ok'})
+
+@app.route('/audit_names', methods=['POST', 'GET'])
+def audit_names():
+    """一次性診斷：核對SYMBOLS清單裡每個代碼的NAMES是否跟Yahoo Finance官方名稱相符。
+    背景執行（160檔逐一查詢，每檔間隔0.4秒，全部跑完約需2-3分鐘），
+    用 /audit_names_result 輪詢進度與結果。"""
+    with audit_state['lock']:
+        already_running = audit_state['status'] == 'running'
+    if not already_running:
+        threading.Thread(target=run_name_audit, daemon=True).start()
+    return jsonify({'started': not already_running})
+
+@app.route('/audit_names_result')
+def audit_names_result():
+    with audit_state['lock']:
+        return jsonify({
+            'status': audit_state['status'],
+            'checked': audit_state['checked'],
+            'total': audit_state['total'],
+            'mismatches': audit_state['mismatches'],
+            'error_count': len(audit_state['errors']),
+        })
 
 @app.route('/debug_c')
 def debug_c():
