@@ -1451,6 +1451,27 @@ def debug_c():
 
     out = {'symbol': symbol, 'tf': tf, 'n_bars': len(df)}
 
+    # 診斷用：MA50/150/200現值 + 最近5根K棒，方便核對Yahoo資料是否與TradingView一致
+    _s50  = calc_sma(df['close'], 50)
+    _s150 = calc_sma(df['close'], 150)
+    _s200 = calc_sma(df['close'], 200)
+    _ma50  = None if pd.isna(_s50.iloc[-1])  else round(float(_s50.iloc[-1]), 4)
+    _ma150 = None if pd.isna(_s150.iloc[-1]) else round(float(_s150.iloc[-1]), 4)
+    _ma200 = None if pd.isna(_s200.iloc[-1]) else round(float(_s200.iloc[-1]), 4)
+    out['last_date']  = str(df.index[-1])
+    out['last_close'] = round(float(df['close'].iloc[-1]), 4)
+    out['ma50']  = _ma50
+    out['ma150'] = _ma150
+    out['ma200'] = _ma200
+    out['bull_aligned'] = bool(_ma50 is not None and _ma150 is not None and _ma200 is not None and _ma50 > _ma150 > _ma200)
+    out['bear_aligned'] = bool(_ma50 is not None and _ma150 is not None and _ma200 is not None and _ma50 < _ma150 < _ma200)
+    out['last5'] = [
+        {'date': str(df.index[i]),
+         'o': round(float(df['open'].iloc[i]), 4), 'h': round(float(df['high'].iloc[i]), 4),
+         'l': round(float(df['low'].iloc[i]), 4), 'c': round(float(df['close'].iloc[i]), 4)}
+        for i in range(max(0, len(df) - 5), len(df))
+    ]
+
     start_idx_bull = find_start_bar_bull(df)
     start_idx_bear = find_start_bar_bear(df)
     out['start_idx_bull'] = fmt_idx(start_idx_bull) if start_idx_bull >= 0 else None
