@@ -398,30 +398,47 @@ def is_market_hours():
     close_t = now.replace(hour=17, minute=0,  second=0, microsecond=0)
     return open_t <= now <= close_t
 
-def fetch_ohlcv(symbol, timeframe):
-    """抓取OHLCV。1H/4H改用最大可取範圍(730天，yfinance 60m interval上限)，
-    確保有足夠根數計算MA150/MA200，避免C系列判斷因資料不足而失真。"""
-    try:
-        if timeframe == '1D':
-            df = yf.download(symbol, period='2y', interval='1d', progress=False, auto_adjust=True)
-        elif timeframe == '4H':
+def _fetch_1h_raw(symbol, retries=2):
+    """抓取原始1小時K線（730天，yfinance 60m interval上限）。
+    4H和1H共用同一份原始資料，避免同一symbol重複下載造成Yahoo限流。
+    帶簡單重試，因為批次掃描時intraday端點比daily端點更容易被限流/逾時。"""
+    for attempt in range(retries):
+        try:
             df = yf.download(symbol, period='730d', interval='1h', progress=False, auto_adjust=True)
-            if df.empty:
-                return pd.DataFrame()
+        except Exception as e:
+            log.warning(f"fetch {symbol} 1H raw attempt{attempt+1}: {e}")
+            df = pd.DataFrame()
+        if not df.empty:
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
             df.columns = [c.lower() for c in df.columns]
-            df = df.resample('4h').agg({'open':'first','high':'max','low':'min','close':'last','volume':'sum'}).dropna()
-            return df
+            df = df.dropna()
+            if not df.empty:
+                return df
+        if attempt < retries - 1:
+            time.sleep(1.0)
+    return pd.DataFrame()
+
+def fetch_ohlcv(symbol, timeframe, raw_1h=None):
+    """抓取OHLCV。1H/4H改用最大可取範圍(730天，yfinance 60m interval上限)，
+    確保有足夠根數計算MA150/MA200，避免C系列判斷因資料不足而失真。
+    raw_1h: 可選，傳入已抓好的1H原始資料，4H/1H會直接沿用，不重複下載。"""
+    try:
+        if timeframe == '1D':
+            df = yf.download(symbol, period='2y', interval='1d', progress=False, auto_adjust=True)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            df.columns = [c.lower() for c in df.columns]
+            return df.dropna()
+        elif timeframe == '4H':
+            base = raw_1h if raw_1h is not None else _fetch_1h_raw(symbol)
+            if base.empty:
+                return pd.DataFrame()
+            return base.resample('4h').agg({'open':'first','high':'max','low':'min','close':'last','volume':'sum'}).dropna()
         elif timeframe == '1H':
-            df = yf.download(symbol, period='730d', interval='1h', progress=False, auto_adjust=True)
+            return raw_1h if raw_1h is not None else _fetch_1h_raw(symbol)
         else:
             return pd.DataFrame()
-
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        df.columns = [c.lower() for c in df.columns]
-        return df.dropna()
     except Exception as e:
         log.warning(f"fetch {symbol} {timeframe}: {e}")
         return pd.DataFrame()
@@ -1050,10 +1067,11 @@ def scan_symbol(symbol):
     result['tv_symbol'] = f"MYX:{tv_ticker}"
 
     df_daily = fetch_ohlcv(symbol, '1D')
+    raw_1h = _fetch_1h_raw(symbol)  # 4H/1H共用同一份原始資料，只下載一次
 
     for tf in TF_LABELS:
         try:
-            df = df_daily if tf == '1D' else fetch_ohlcv(symbol, tf)
+            df = df_daily if tf == '1D' else fetch_ohlcv(symbol, tf, raw_1h=raw_1h)
             if df.empty or len(df) < 50 or df_daily.empty or len(df_daily) < 50:
                 result[tf] = '-'
                 result[f'{tf}_cls'] = 'gray'
