@@ -187,70 +187,70 @@ SYMBOLS = [
 
 # 股票名稱對照表
 NAMES = {
-    '1155.KL': 'Maybank', '1023.KL': 'CIMB', '1295.KL': 'Public Bank',
+    '1155.KL': 'Malayan Banking', '1023.KL': 'CIMB', '1295.KL': 'Public Bank',
     '5819.KL': 'Hong Leong Bank', '1066.KL': 'RHB Bank', '1015.KL': 'AMMB',
-    '5185.KL': 'Affin Bank', '1082.KL': 'Alliance Bank', '6947.KL': 'Axiata',
-    '6888.KL': 'Maxis', '5168.KL': 'TM', '6012.KL': 'Digi/CelcomDigi',
-    '1597.KL': 'BIMB', '5258.KL': 'MBSB', '6399.KL': 'Astro',
-    '5183.KL': 'Petronas Gas', '3816.KL': 'Petronas Dagangan',
-    '5071.KL': 'Dialog', '1532.KL': 'Hibiscus', '6033.KL': 'Sapura Energy',
-    '3948.KL': 'Bumi Armada', '5026.KL': 'Velesto', '2771.KL': 'Wah Seong',
-    '5116.KL': 'Yinson', '1929.KL': 'Serba Dinamik',
-    '4863.KL': 'Telekom', '6742.KL': 'Time dotcom', '5053.KL': 'Inari',
-    '2445.KL': 'IOI Corp', '1961.KL': 'KL Kepong', '2291.KL': 'Sime Darby Plant',
-    '1899.KL': 'Genting Plant', '2038.KL': 'Boustead Plant',
-    '5029.KL': 'FGV', '2220.KL': 'Berjaya Land',
+    '5185.KL': 'Affin Bank', '1082.KL': 'Hong Leong Financial Group', '6947.KL': 'Celcomdigi',
+    '6888.KL': 'Axiata Group', '5168.KL': 'Hartalega Holdings', '6012.KL': 'Maxis',
+    '1597.KL': 'BIMB', '5258.KL': 'Bank Islam Malaysia', '6399.KL': 'Astro',
+    '5183.KL': 'Petronas Gas', '3816.KL': 'MISC',
+    '5071.KL': 'Coastal Contracts', '1532.KL': 'Hibiscus', '6033.KL': 'PETRONAS Gas',
+    '3948.KL': 'DutaLand', '5026.KL': 'MHC Plantations', '2771.KL': 'Wah Seong',
+    '5116.KL': 'Al-\'Aqar Healthcare REIT', '1929.KL': 'Chin Teck Plantations',
+    '4863.KL': 'Telekom', '6742.KL': 'YTL Power International', '5053.KL': 'OSK Holdings',
+    '2445.KL': 'Kuala Lumpur Kepong', '1961.KL': 'IOI Corporation', '2291.KL': 'Sime Darby Plant',
+    '1899.KL': 'Batu Kawan', '2038.KL': 'Negri Sembilan Oil Palms',
+    '5029.KL': 'Far East Holdings', '2220.KL': 'Berjaya Land',
     '5135.KL': 'Sarawak Plant', '5033.KL': 'Kulim',
-    '4731.KL': 'PPB Group', '3182.KL': 'Genting', '4715.KL': 'Genting Malaysia',
-    '3336.KL': 'IJM Corp', '1996.KL': 'Gamuda', '9679.KL': 'Sunway',
-    '3549.KL': 'YTL Corp', '5148.KL': 'YTL Power', '8583.KL': 'Parkson',
-    '5141.KL': 'Hap Seng', '1724.KL': 'Sime Darby',
-    '9261.KL': 'Berjaya Corp', '2194.KL': 'WCT Holdings',
-    '3476.KL': 'MMC Corp', '5053.KL': 'Inari', '6742.KL': 'Time dotcom',
-    '2267.KL': 'Lafarge', '1562.KL': 'Panasonic', '7076.KL': 'Poh Kong',
-    '0177.KL': 'Datasonic', '5878.KL': 'Aeon', '7153.KL': 'Top Glove',
-    '5027.KL': 'Kossan', '7113.KL': 'Supermax', '0138.KL': 'MyEG',
-    '7090.KL': 'Hartalega', '0197.KL': 'Genetec', '7212.KL': 'Karex',
-    '4665.KL': 'Pos Malaysia', '0049.KL': 'Vitrox', '5296.KL': 'Revenue Group',
-    '0078.KL': 'GHL Systems', '0090.KL': 'Globetronics', '7034.KL': 'Unisem',
-    '9814.KL': 'Pentamaster', '5243.KL': 'UWC', '0097.KL': 'Coraza',
-    '0196.KL': 'Dagang NeXchange', '0065.KL': 'Scicom', '9296.KL': 'RCE Capital',
-    '7073.KL': 'Frontken', '0050.KL': 'Prestariang', '0186.KL': 'D&O Green',
-    '5216.KL': 'IHH Healthcare', '1301.KL': 'KPJ Healthcare',
-    '5236.KL': 'Sunway REIT', '5180.KL': 'KLCC REIT', '5111.KL': 'Pavilion REIT',
-    '5227.KL': 'Axis REIT', '5124.KL': 'Amanahraya REIT',
-    '5269.KL': 'IGB REIT', '5020.KL': 'Suria Capital', '5275.KL': 'Sentral REIT',
-    '6599.KL': 'Malaysia Airports', '5247.KL': 'MAS (MAB)',
-    '5106.KL': 'Westports', '5109.KL': 'Bintulu Port',
+    '4731.KL': 'Scientex', '3182.KL': 'Genting', '4715.KL': 'Genting Malaysia',
+    '3336.KL': 'IJM Corp', '1996.KL': 'Kretam Holdings', '9679.KL': 'WCT Holdings',
+    '3549.KL': 'YTL Corp', '5148.KL': 'UEM Sunrise', '8583.KL': 'Mah Sing Group',
+    '5141.KL': 'Dayang Enterprise Holdings', '1724.KL': 'Paramount Corporation',
+    '9261.KL': 'Gadang Holdings', '2194.KL': 'WCT Holdings',
+    '3476.KL': 'Keck Seng (Malaysia)', '5053.KL': 'OSK Holdings', '6742.KL': 'YTL Power International',
+    '2267.KL': 'Lafarge', '1562.KL': 'Sports Toto', '7076.KL': 'CB Industrial Product Holding',
+    '0177.KL': 'Midtown Group', '5878.KL': 'KPJ Healthcare', '7153.KL': 'Kossan Rubber Industries',
+    '5027.KL': 'Kim Loong Resources', '7113.KL': 'Top Glove Corporation', '0138.KL': 'Zetrix AI',
+    '7090.KL': 'Hartalega', '0197.KL': 'Wegmans Holdings', '7212.KL': 'Destini',
+    '4665.KL': 'Pos Malaysia', '0049.KL': 'Oceancash Pacific', '5296.KL': 'Revenue Group',
+    '0078.KL': 'GDEX', '0090.KL': 'Elsoft Research', '7034.KL': 'Thong Guan Industries',
+    '9814.KL': 'Bertam Alliance', '5243.KL': 'Velesto Energy', '0097.KL': 'ViTrox Corporation',
+    '0196.KL': 'QES Group', '0065.KL': 'Excel Force MSC', '9296.KL': 'RCE Capital',
+    '7073.KL': 'Seacera Group', '0050.KL': 'Systech', '0186.KL': 'Perak Transit',
+    '5216.KL': 'NEXG', '1301.KL': 'KPJ Healthcare',
+    '5236.KL': 'Matrix Concepts Holdings', '5180.KL': 'CapitaLand Malaysia Trust', '5111.KL': 'Tower Real Estate Investment Trust',
+    '5227.KL': 'IGB Real Estate Investment Trust', '5124.KL': 'Amanahraya REIT',
+    '5269.KL': 'Al-Salam Real Estate Investment Trust', '5020.KL': 'Glomac', '5275.KL': 'Mynews Holdings',
+    '6599.KL': 'Aeon Co. (M)', '5247.KL': 'Karex',
+    '5106.KL': 'Axis Real Estate Investment Trust', '5109.KL': 'YTL Hospitality REIT',
     '5119.KL': 'Lingkaran Trans', '3786.KL': 'PLUS (Litrak)',
-    '4898.KL': 'UEM Sunrise', '5008.KL': 'SP Setia',
-    '5246.KL': 'Eco World', '7028.KL': 'Mah Sing',
-    '3557.KL': 'Pharmaniaga', '5079.KL': 'Apex Healthcare',
-    '3794.KL': 'Duopharma', '5007.KL': 'Hovid',
-    '9121.KL': 'CCK Consolidated', '5136.KL': 'Caring Pharmacy',
-    '8869.KL': 'Matrix Concepts', '9075.KL': 'Signature International',
-    '5139.KL': 'Sarawak Consolidated', '8230.KL': 'Tambun Indah',
-    '4635.KL': 'Misc', '5983.KL': 'KKB Engineering',
-    '1619.KL': 'Berjaya Land Dev', '7293.KL': 'Aeon Credit',
-    '4588.KL': 'Nestle', '5285.KL': 'QL Resources',
-    '5081.KL': 'Dutch Lady', '7222.KL': 'Fraser & Neave',
-    '4609.KL': 'Heineken', '0051.KL': 'TWL Holdings',
-    '3026.KL': 'Tradewinds Plant', '3867.KL': 'Malaysian Pacific',
-    '2658.KL': 'TH Plantation', '4162.KL': 'Scientex',
-    '7178.KL': 'Padini', '5242.KL': 'Bonia',
-    '6556.KL': 'Mr DIY', '3255.KL': 'V.S. Industry',
-    '4197.KL': 'Kerjaya Prospek', '5347.KL': 'Tenaga Nasional',
-    '2488.KL': 'KLCC Property', '5099.KL': 'Bursa Malaysia',
-    '5250.KL': 'Press Metal', '5822.KL': '99 Speed Mart',
-    '5264.KL': 'Farm Fresh', '5294.KL': 'IOI Properties',
-    '5879.KL': 'AirAsia X', '6076.KL': 'AmBank Group',
-    '7182.KL': '7-Eleven Malaysia', '0023.KL': 'Revenue Group',
-    '5209.KL': 'Eco World Dev', '5205.KL': 'Technove Global',
-    '5299.KL': 'Teladan Setia', '5143.KL': 'Malayan Flour',
-    '3689.KL': 'Batu Kawan', '5134.KL': 'Capital A',
-    '3042.KL': 'Hai-O Enterprise', '0163.KL': 'Berjaya Food',
-    '3417.KL': 'Tan Chong Motor', '5014.KL': 'Magnum',
-    '4502.KL': 'IJM Plantations', '0249.KL': 'Sentoria Group',
+    '4898.KL': 'UEM Sunrise', '5008.KL': 'Harrisons Holdings (Malaysia)',
+    '5246.KL': 'Westports Holdings', '7028.KL': 'Zecon',
+    '3557.KL': 'EcoFirst Consolidated', '5079.KL': 'One Glove Group',
+    '3794.KL': 'Malayan Cement', '5007.KL': 'Chin Well Holdings',
+    '9121.KL': 'KPS Consortium', '5136.KL': 'Hextar Technologies Solutions',
+    '8869.KL': 'Press Metal Aluminium Holdings', '9075.KL': 'Theta Edge',
+    '5139.KL': 'AEON Credit Service (M)', '8230.KL': 'Tambun Indah',
+    '4635.KL': 'Misc', '5983.KL': 'MBM Resources',
+    '1619.KL': 'DRB-HICOM', '7293.KL': 'Yinson Holdings',
+    '4588.KL': 'Nestle', '5285.KL': 'SD Guthrie',
+    '5081.KL': 'Esthetics International Group', '7222.KL': 'Imaspro Corporation',
+    '4609.KL': 'Heineken', '0051.KL': 'Cuscapi',
+    '3026.KL': 'Dutch Lady Milk Industries', '3867.KL': 'Malaysian Pacific',
+    '2658.KL': 'Ajinomoto (Malaysia)', '4162.KL': 'British American Tobacco (Malaysia)',
+    '7178.KL': 'Y.S.P. Southeast Asia Holding', '5242.KL': 'Solid Automotive',
+    '6556.KL': 'Ann Joo Resources', '3255.KL': 'Heineken Malaysia',
+    '4197.KL': 'Sime Darby', '5347.KL': 'Tenaga Nasional',
+    '2488.KL': 'Alliance Bank Malaysia', '5099.KL': 'Capital A',
+    '5250.KL': '7-Eleven Malaysia Holdings', '5822.KL': '99 Speed Mart',
+    '5264.KL': 'Malakoff Corporation', '5294.KL': 'IOI Properties',
+    '5879.KL': 'AirAsia X', '6076.KL': 'Encorp',
+    '7182.KL': '7-Eleven Malaysia', '0023.KL': 'IFCA MSC',
+    '5209.KL': 'Gas Malaysia', '5205.KL': 'Eversendai Corporation',
+    '5299.KL': 'IGB Commercial Real Estate Investment Trust', '5143.KL': 'Luxchem Corporation',
+    '3689.KL': 'Fraser & Neave Holdings', '5134.KL': 'Southern Acids (M)',
+    '3042.KL': 'Petron Malaysia Refining & Marketing', '0163.KL': 'Careplus Group',
+    '3417.KL': 'Eastern & Oriental', '5014.KL': 'Magnum',
+    '4502.KL': 'Media Prima', '0249.KL': 'Sentoria Group',
     '3239.KL': 'TSM Global', '7084.KL': 'QL Resources',
     '5398.KL': 'Genting Plant Dev', '8532.KL': 'Aeon Credit',
     '0820EA.KL': 'Eco-Arc',
@@ -394,7 +394,7 @@ scan_state = {'status': 'idle', 'last_scan': None, 'lock': threading.Lock()}
 # 股票代碼核對：跟Yahoo Finance官方名稱比對，找出SYMBOLS/NAMES錯置的代碼
 # （3867.KL / 9296.KL 錯置事件後新增，一次性診斷工具）
 # ============================================================
-audit_state = {'status': 'idle', 'checked': 0, 'total': 0, 'mismatches': [], 'errors': [], 'lock': threading.Lock()}
+audit_state = {'status': 'idle', 'checked': 0, 'total': 0, 'mismatches': [], 'all_names': [], 'errors': [], 'lock': threading.Lock()}
 
 def _name_matches(local_name, yahoo_name):
     """寬鬆比對：只要任一方的關鍵字出現在另一方就算符合，避免誤報太多。"""
@@ -407,6 +407,9 @@ def _name_matches(local_name, yahoo_name):
     return (a in b) or (b in a) or any(w in b for w in a.split() if len(w) >= 4) or any(w in a for w in b.split() if len(w) >= 4)
 
 def run_name_audit():
+    """核對全部156檔：不只記錄「疑似錯置」，同時把Yahoo官方資料(全名/sector/industry/symbol)
+    完整記下來(all_names)，方便之後直接用Yahoo的資料重建NAMES/SECTORS表，
+    而不用一檔一檔手動網路搜尋核對。"""
     global audit_state
     with audit_state['lock']:
         if audit_state['status'] == 'running':
@@ -414,19 +417,36 @@ def run_name_audit():
         audit_state['status'] = 'running'
         audit_state['checked'] = 0
         audit_state['mismatches'] = []
+        audit_state['all_names'] = []
         audit_state['errors'] = []
         audit_state['total'] = len(SYMBOLS)
     for sym in SYMBOLS:
         local_name = NAMES.get(sym, '')
         yahoo_name = ''
+        yahoo_sector = ''
+        yahoo_industry = ''
+        yahoo_symbol = ''
         try:
             info = yf.Ticker(sym).get_info()
-            yahoo_name = info.get('longName') or info.get('shortName') or ''
+            yahoo_name     = info.get('longName') or info.get('shortName') or ''
+            yahoo_sector   = info.get('sector', '') or ''
+            yahoo_industry = info.get('industry', '') or ''
+            yahoo_symbol   = info.get('symbol', '') or ''
         except Exception as e:
             with audit_state['lock']:
                 audit_state['errors'].append({'symbol': sym, 'error': str(e)})
-        if yahoo_name and not _name_matches(local_name, yahoo_name):
-            with audit_state['lock']:
+        with audit_state['lock']:
+            audit_state['all_names'].append({
+                'symbol': sym,
+                'local_name': local_name,
+                'local_sector': SECTORS.get(sym, ''),
+                'local_tv': TV_SYMBOLS.get(sym, ''),
+                'yahoo_name': yahoo_name,
+                'yahoo_sector': yahoo_sector,
+                'yahoo_industry': yahoo_industry,
+                'yahoo_symbol': yahoo_symbol,
+            })
+            if yahoo_name and not _name_matches(local_name, yahoo_name):
                 audit_state['mismatches'].append({
                     'symbol': sym,
                     'local_name': local_name,
@@ -434,7 +454,6 @@ def run_name_audit():
                     'local_sector': SECTORS.get(sym, ''),
                     'local_tv': TV_SYMBOLS.get(sym, ''),
                 })
-        with audit_state['lock']:
             audit_state['checked'] += 1
         time.sleep(0.4)
     with audit_state['lock']:
@@ -1114,8 +1133,9 @@ def scan_symbol(symbol):
     result = {'symbol': symbol}
     result['name'] = NAMES.get(symbol, symbol.replace('.KL',''))
     result['sector'] = SECTORS.get(symbol, '其他')
-    tv_ticker = TV_SYMBOLS.get(symbol, symbol.replace('.KL',''))
-    result['tv_symbol'] = f"MYX:{tv_ticker}"
+    # 改用數字代碼直接組TradingView連結（MYX:5168這種），TradingView會自動導向正確股票，
+    # 不再依賴容易錯置的TV_SYMBOLS簡稱對照表（見audit_names發現的大量代碼錯置問題）
+    result['tv_symbol'] = f"MYX:{symbol.replace('.KL', '')}"
 
     df_daily = fetch_ohlcv(symbol, '1D')
     raw_1h = _fetch_1h_raw(symbol)  # 4H/1H共用同一份原始資料，只下載一次
@@ -1511,14 +1531,18 @@ def audit_names():
 
 @app.route('/audit_names_result')
 def audit_names_result():
+    include_all = request.args.get('all', '') == '1'
     with audit_state['lock']:
-        return jsonify({
+        out = {
             'status': audit_state['status'],
             'checked': audit_state['checked'],
             'total': audit_state['total'],
             'mismatches': audit_state['mismatches'],
             'error_count': len(audit_state['errors']),
-        })
+        }
+        if include_all:
+            out['all_names'] = audit_state['all_names']
+        return jsonify(out)
 
 @app.route('/debug_c')
 def debug_c():
