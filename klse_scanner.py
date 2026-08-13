@@ -1,9 +1,9 @@
 """
 莊家思維 大馬股票掃描器 (KLSE)
 - 數據來源：yfinance (.KL)
-- 邏輯：C系列收縮（ZigZag pivot）
+- 邏輯：C系列收縮（對齊 莊家思維 Contraction V53 / scannerrailway.py 核心演算法）
 - 通知：Telegram
-- 界面：Flask Web
+- 界面：Flask Web（視覺風格對齊 crypto 版 scannerrailway.py）
 """
 
 import os
@@ -13,8 +13,9 @@ import logging
 import requests
 import yfinance as yf
 import pandas as pd
-from datetime import datetime
-from flask import Flask, jsonify
+import numpy as np
+from datetime import datetime, timedelta
+from flask import Flask, jsonify, Response, request
 import pytz
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
@@ -375,7 +376,16 @@ TV_SYMBOLS = {
     '8532.KL': 'AEONCR', '0820EA.KL': 'ECOARC',
 }
 
-TF_LABELS = ['1D', '4H', '1H']
+TF_LABELS = ['1D', '4H', '1H']   # 由高到低（跟crypto版TF_LABELS的順序相反，這裡直接就是高到低）
+
+# ============================================================
+# C系列參數（對齊 莊家思維 Contraction V53 / scannerrailway.py）
+# ============================================================
+MIN_DROP_PCT       = 10.0   # C1最小跌幅%，跟Pine的minDropPct一致；股票波動比crypto小，如果訊號太少可調低
+SLOPE_THRESHOLD_PCT = 0.05  # 走平判定閾值(%)，跟Pine的slopeThreshold一致
+S3_LOOKBACK_BARS    = 90    # S3判斷「是否曾向上」回看根數
+
+SIGNAL_CLASSES = ('bull-c', 'bull-ready', 'bear-c', 'bear-ready')
 
 cached_results = []
 scan_state = {'status': 'idle', 'last_scan': None, 'lock': threading.Lock()}
@@ -389,11 +399,13 @@ def is_market_hours():
     return open_t <= now <= close_t
 
 def fetch_ohlcv(symbol, timeframe):
+    """抓取OHLCV。1H/4H改用最大可取範圍(730天，yfinance 60m interval上限)，
+    確保有足夠根數計算MA150/MA200，避免C系列判斷因資料不足而失真。"""
     try:
         if timeframe == '1D':
-            df = yf.download(symbol, period='1y', interval='1d', progress=False, auto_adjust=True)
+            df = yf.download(symbol, period='2y', interval='1d', progress=False, auto_adjust=True)
         elif timeframe == '4H':
-            df = yf.download(symbol, period='60d', interval='1h', progress=False, auto_adjust=True)
+            df = yf.download(symbol, period='730d', interval='1h', progress=False, auto_adjust=True)
             if df.empty:
                 return pd.DataFrame()
             if isinstance(df.columns, pd.MultiIndex):
@@ -402,7 +414,7 @@ def fetch_ohlcv(symbol, timeframe):
             df = df.resample('4h').agg({'open':'first','high':'max','low':'min','close':'last','volume':'sum'}).dropna()
             return df
         elif timeframe == '1H':
-            df = yf.download(symbol, period='30d', interval='1h', progress=False, auto_adjust=True)
+            df = yf.download(symbol, period='730d', interval='1h', progress=False, auto_adjust=True)
         else:
             return pd.DataFrame()
 
@@ -414,132 +426,727 @@ def fetch_ohlcv(symbol, timeframe):
         log.warning(f"fetch {symbol} {timeframe}: {e}")
         return pd.DataFrame()
 
-def calc_stage(df):
-    if len(df) < 200:
-        return '-'
-    close = df['close']
-    ma50  = close.rolling(50).mean()
-    ma150 = close.rolling(150).mean()
-    ma200 = close.rolling(200).mean()
-    c = close.iloc[-1]
-    m50  = ma50.iloc[-1]
-    m150 = ma150.iloc[-1]
-    m200 = ma200.iloc[-1]
-    slope150 = ma150.iloc[-1] - ma150.iloc[-10]
-    slope200 = ma200.iloc[-1] - ma200.iloc[-10]
-    bull_arr = m50 > m150 > m200
-    bear_arr = m50 < m150 < m200
-    if bull_arr and slope150 > 0 and slope200 > 0 and c > m150:
-        return 'S2'
-    elif bull_arr and c < m150:
-        return 'S3'
-    elif bear_arr and slope150 < 0 and c < m150:
-        return 'S4'
-    else:
-        return 'S1'
+# ============================================================
+# MA / Stage（對齊scannerrailway.py的get_stage，Weinstein四階段模型）
+# ============================================================
+def calc_sma(series, period):
+    return series.rolling(period, min_periods=period).mean()
 
-def is_pivot_high(df, i, length=5):
-    if i < length or i >= len(df) - length:
-        return False
-    h = df['high'].iloc[i]
-    return all(h >= df['high'].iloc[i-j] for j in range(1, length+1)) and \
-           all(h >= df['high'].iloc[i+j] for j in range(1, length+1))
+def get_stage(df_daily: pd.DataFrame) -> tuple:
+    """回傳 (stage, s1_strong, divergence)，邏輯跟crypto版scannerrailway.py完全一致。"""
+    min_len = 150 + 20
+    if len(df_daily) < min_len:
+        return 0, False, ''
+    c = df_daily['close']
+    v = df_daily['volume']
+    ma150   = c.rolling(150).mean()
+    volma50 = v.rolling(50).mean()
 
-def is_pivot_low(df, i, length=5):
-    if i < length or i >= len(df) - length:
-        return False
-    l = df['low'].iloc[i]
-    return all(l <= df['low'].iloc[i-j] for j in range(1, length+1)) and \
-           all(l <= df['low'].iloc[i+j] for j in range(1, length+1))
+    cur150   = ma150.iloc[-1]
+    prev150  = ma150.iloc[-10]
+    ma150_20 = ma150.iloc[-20]
+    price    = c.iloc[-1]
+    cur_vol  = v.iloc[-1]
+    cur_volma50 = volma50.iloc[-1]
 
-def has_three_combo(df, start, end):
-    count = 0
-    for i in range(start, min(end, len(df))):
-        o = df['open'].iloc[i]
-        c = df['close'].iloc[i]
-        h = df['high'].iloc[i]
-        body = abs(c - o)
-        rng  = h - df['low'].iloc[i]
-        is_bear = c < o
-        is_doji = rng > 0 and body / rng < 0.3 and (h - max(o,c)) > 2 * body
-        if is_bear or is_doji:
-            count += 1
-            if count >= 3:
-                return True
+    if pd.isna(cur150) or pd.isna(prev150) or pd.isna(ma150_20):
+        return 0, False, ''
+
+    slope10 = (cur150 - prev150)  / prev150  * 100
+    slope20 = (cur150 - ma150_20) / ma150_20 * 100
+
+    is_up   = slope10 >=  SLOPE_THRESHOLD_PCT and slope20 >=  SLOPE_THRESHOLD_PCT
+    is_down = slope10 <= -SLOPE_THRESHOLD_PCT and slope20 <= -SLOPE_THRESHOLD_PCT
+    is_flat = not is_up and not is_down
+
+    ab150 = price > cur150
+
+    if is_up:
+        return 2, False, ('' if ab150 else 'down')
+    if is_down:
+        return 4, False, ('up' if ab150 else '')
+
+    if is_flat and ab150:
+        if not pd.isna(cur_volma50) and cur_vol < cur_volma50:
+            consolidation_days = _count_consolidation_days(ma150)
+            s1_strong = consolidation_days >= 180
+            return 1, s1_strong, ''
+        return 0, False, ''
+
+    if is_flat and not ab150:
+        idx_a = S3_LOOKBACK_BARS + 10
+        idx_b = S3_LOOKBACK_BARS + 20
+        if len(ma150) <= idx_b:
+            return 0, False, ''
+        ma150_lb      = ma150.iloc[-idx_a]
+        ma150_lb_prev = ma150.iloc[-idx_b]
+        if pd.isna(ma150_lb) or pd.isna(ma150_lb_prev):
+            return 0, False, ''
+        slope_lb = (ma150_lb - ma150_lb_prev) / ma150_lb_prev * 100
+        was_up   = slope_lb >= SLOPE_THRESHOLD_PCT
+        if was_up:
+            return 3, False, ''
+        return 0, False, ''
+
+    return 0, False, ''
+
+def _count_consolidation_days(ma150: pd.Series) -> int:
+    days = 0
+    n = len(ma150)
+    max_check = min(400, n - 10)
+    for back in range(10, max_check, 10):
+        cur  = ma150.iloc[-back]
+        prev = ma150.iloc[-(back + 10)] if (back + 10) <= n else None
+        if prev is None or pd.isna(cur) or pd.isna(prev) or prev == 0:
+            break
+        slope = (cur - prev) / prev * 100
+        if -SLOPE_THRESHOLD_PCT < slope < SLOPE_THRESHOLD_PCT:
+            days += 10
         else:
-            count = 0
+            break
+    return days
+
+# ============================================================
+# Swing High/Low + K棒組合判定（跟crypto版scannerrailway.py逐行對齊）
+# ============================================================
+def is_swing_high2(high_arr, idx):
+    if idx < 2 or idx >= len(high_arr) - 2: return False
+    h = high_arr[idx]
+    return h > high_arr[idx-1] and h > high_arr[idx-2] and h > high_arr[idx+1] and h > high_arr[idx+2]
+
+def is_swing_low2(low_arr, idx):
+    if idx < 2 or idx >= len(low_arr) - 2: return False
+    l = low_arr[idx]
+    return l < low_arr[idx-1] and l < low_arr[idx-2] and l < low_arr[idx+1] and l < low_arr[idx+2]
+
+def is_valid_bar_bull(o, h, l, c):
+    body = abs(c - o)
+    uw   = h - max(c, o)
+    dw   = min(c, o) - l
+    tw   = uw + dw
+    is_bear = c < o
+    is_doji = (c >= o) and (tw > body) and (uw > dw)
+    return is_bear or is_doji
+
+def has_three_combo(open_arr, high_arr, low_arr, close_arr, start_idx, end_idx):
+    lo = min(start_idx, end_idx)
+    hi = max(start_idx, end_idx)
+    for j in range(lo, hi - 1):
+        if j + 2 >= len(close_arr): break
+        if (is_valid_bar_bull(open_arr[j],   high_arr[j],   low_arr[j],   close_arr[j]) and
+            is_valid_bar_bull(open_arr[j+1], high_arr[j+1], low_arr[j+1], close_arr[j+1]) and
+            is_valid_bar_bull(open_arr[j+2], high_arr[j+2], low_arr[j+2], close_arr[j+2])):
+            return True
     return False
 
-def find_c_count(df):
-    n = len(df)
-    if n < 20:
-        return 0
-    pivot_lows = [i for i in range(5, n-5) if is_pivot_low(df, i, 5)]
-    if not pivot_lows:
-        pivot_lows = [i for i in range(3, n-3) if is_pivot_low(df, i, 3)]
-    if not pivot_lows:
-        return 0
-    c_count = 0
-    first_pl = pivot_lows[0]
-    c1_high_idx = df['high'].iloc[:first_pl].idxmax() if first_pl > 0 else None
-    if c1_high_idx is None:
-        return 0
-    c1_high_pos = df.index.get_loc(c1_high_idx)
-    c1_high = df['high'].iloc[c1_high_pos]
-    c1_low  = df['low'].iloc[first_pl]
-    if not has_three_combo(df, c1_high_pos, first_pl):
-        return 0
-    c_count = 1
-    prev_high = c1_high
-    prev_low  = c1_low
-    prev_pl   = first_pl
-    for pl_idx in pivot_lows[1:]:
-        if c_count >= 6:
-            break
-        segment_high = df['high'].iloc[prev_pl:pl_idx].max() if pl_idx > prev_pl else 0
-        segment_low  = df['low'].iloc[pl_idx]
-        if segment_high <= prev_high and segment_low >= prev_low:
-            if has_three_combo(df, prev_pl, pl_idx):
-                c_count += 1
-                prev_high = segment_high
-                prev_low  = segment_low
-                prev_pl   = pl_idx
-    return c_count
+def is_valid_bar_bear(o, h, l, c):
+    body = abs(c - o)
+    uw   = h - max(c, o)
+    dw   = min(c, o) - l
+    tw   = uw + dw
+    is_bull = c > o
+    is_doji = (c <= o) and (tw > body) and (uw > dw)
+    return is_bull or is_doji
 
+def has_three_combo_bear(open_arr, high_arr, low_arr, close_arr, start_idx, end_idx):
+    lo = min(start_idx, end_idx)
+    hi = max(start_idx, end_idx)
+    for j in range(lo, hi - 1):
+        if j + 2 >= len(close_arr): break
+        if (is_valid_bar_bear(open_arr[j],   high_arr[j],   low_arr[j],   close_arr[j]) and
+            is_valid_bar_bear(open_arr[j+1], high_arr[j+1], low_arr[j+1], close_arr[j+1]) and
+            is_valid_bar_bear(open_arr[j+2], high_arr[j+2], low_arr[j+2], close_arr[j+2])):
+            return True
+    return False
+
+# ============================================================
+# 多頭/空頭起點
+# ============================================================
+def find_start_bar_bull(df: pd.DataFrame) -> int:
+    s50  = calc_sma(df['close'], 50)
+    s150 = calc_sma(df['close'], 150)
+    s200 = calc_sma(df['close'], 200)
+    has200 = not s200.isna().all()
+    if has200:
+        bull = (s50 > s150) & (s150 > s200)
+        ref  = s200
+    else:
+        bull = (s50 > s150)
+        ref  = s150
+    if not bull.iloc[-1]: return -1
+    bull_arr = bull.values
+    n = len(bull_arr)
+    for i in range(n - 1, -1, -1):
+        if not bull_arr[i]: return i + 1
+    for i in range(n):
+        if not pd.isna(ref.iloc[i]) and bull_arr[i]: return i
+    return -1
+
+def find_start_bar_bear(df: pd.DataFrame) -> int:
+    s50  = calc_sma(df['close'], 50)
+    s150 = calc_sma(df['close'], 150)
+    s200 = calc_sma(df['close'], 200)
+    has200 = not s200.isna().all()
+    if has200:
+        bear = (s50 < s150) & (s150 < s200)
+        ref  = s200
+    else:
+        bear = (s50 < s150)
+        ref  = s150
+    if not bear.iloc[-1]: return -1
+    bear_arr = bear.values
+    n = len(bear_arr)
+    for i in range(n - 1, -1, -1):
+        if not bear_arr[i]: return i + 1
+    for i in range(n):
+        if not pd.isna(ref.iloc[i]) and bear_arr[i]: return i
+    return -1
+
+# ============================================================
+# C1 搜尋（含兩個已在crypto版驗證過的邊界修正：
+#   1) 候選轉折點掃描不排除barsAgo=4；2) 低點追蹤排除最後2根未確認K棒）
+# ============================================================
+def find_c1(df: pd.DataFrame, start_idx: int) -> dict:
+    result = {'found': False}
+    n = len(df)
+    total_bars = n - 1 - start_idx
+    if total_bars <= 7: return result
+
+    high_arr  = df['high'].values
+    low_arr   = df['low'].values
+    open_arr  = df['open'].values
+    close_arr = df['close'].values
+    s50_arr   = calc_sma(df['close'], 50).values
+
+    start_off = min(total_bars - 2, 498)
+    scan_i = start_off
+    max_loop = 11
+    fail_priority = 0
+    fail_msg = ''
+
+    for _loop in range(max_loop):
+        if scan_i <= 4:
+            break
+
+        sh_v, sh_i_off = None, None
+        for i_off in range(scan_i, 3, -1):
+            bar_idx = (n - 1) - i_off
+            if bar_idx < start_idx: continue
+            if bar_idx < 2 or bar_idx >= n - 2: continue
+            if is_swing_high2(high_arr, bar_idx):
+                sh_v = high_arr[bar_idx]
+                sh_i_off = i_off
+                break
+
+        if sh_v is None:
+            if fail_priority < 1:
+                fail_msg = '找不到更多候選高點'
+                fail_priority = 1
+            break
+
+        sh_bar = (n - 1) - sh_i_off
+
+        sl_v, sl_bar = None, None
+        aborted = False
+        for k in range(sh_bar + 1, n - 2):
+            if high_arr[k] > sh_v:
+                aborted = True
+                break
+            if sl_v is None or low_arr[k] < sl_v:
+                sl_v = low_arr[k]
+                sl_bar = k
+
+        if sl_v is None or aborted:
+            scan_i = sh_i_off - 1
+            if fail_priority < 1:
+                fail_msg = f'高點被更高K線突破 (高={sh_v:.4f})' if aborted else '找不到對應低點'
+                fail_priority = 1
+            continue
+
+        pct = (sh_v - sl_v) / sh_v * 100
+
+        if pct < MIN_DROP_PCT:
+            if fail_priority < 2:
+                fail_msg = f'跌幅不足 {pct:.2f}% < {MIN_DROP_PCT}% (高={sh_v:.4f} 低={sl_v:.4f})'
+                fail_priority = 2
+            scan_i = sh_i_off - 1
+            continue
+
+        touched = any(
+            not pd.isna(s50_arr[m]) and low_arr[m] <= s50_arr[m]
+            for m in range(sh_bar, sl_bar + 1)
+        )
+        if not touched:
+            if fail_priority < 3:
+                fail_msg = f'跌幅夠但未觸碰MA50 (高={sh_v:.4f} 低={sl_v:.4f} 跌幅={pct:.2f}%)'
+                fail_priority = 3
+            scan_i = sh_i_off - 1
+            continue
+
+        if not has_three_combo(open_arr, high_arr, low_arr, close_arr, sh_bar, sl_bar):
+            if fail_priority < 4:
+                fail_msg = f'跌幅與MA50都符合，但無combo (高={sh_v:.4f} 低={sl_v:.4f} 跌幅={pct:.2f}%)'
+                fail_priority = 4
+            scan_i = sh_i_off - 1
+            continue
+
+        return {'found': True, 'hv': sh_v, 'hb': sh_bar,
+                'lv': sl_v, 'lb': sl_bar,
+                'pct': pct}
+
+    result['fail_msg'] = fail_msg
+    return result
+
+def find_c1_bear(df: pd.DataFrame, start_idx: int) -> dict:
+    result = {'found': False}
+    n = len(df)
+    total_bars = n - 1 - start_idx
+    if total_bars <= 7: return result
+
+    high_arr  = df['high'].values
+    low_arr   = df['low'].values
+    open_arr  = df['open'].values
+    close_arr = df['close'].values
+    s50_arr   = calc_sma(df['close'], 50).values
+
+    start_off = min(total_bars - 2, 498)
+    scan_i = start_off
+    max_loop = 11
+    fail_priority = 0
+    fail_msg = ''
+
+    for _loop in range(max_loop):
+        if scan_i <= 4:
+            break
+
+        sl_v, sl_i_off = None, None
+        for i_off in range(scan_i, 3, -1):
+            bar_idx = (n - 1) - i_off
+            if bar_idx < start_idx: continue
+            if bar_idx < 2 or bar_idx >= n - 2: continue
+            if is_swing_low2(low_arr, bar_idx):
+                sl_v = low_arr[bar_idx]
+                sl_i_off = i_off
+                break
+
+        if sl_v is None:
+            if fail_priority < 1:
+                fail_msg = '找不到更多候選低點'
+                fail_priority = 1
+            break
+
+        sl_bar = (n - 1) - sl_i_off
+
+        sh_v, sh_bar = None, None
+        aborted = False
+        for k in range(sl_bar + 1, n - 2):
+            if low_arr[k] < sl_v:
+                aborted = True
+                break
+            if sh_v is None or high_arr[k] > sh_v:
+                sh_v = high_arr[k]
+                sh_bar = k
+
+        if sh_v is None or aborted:
+            scan_i = sl_i_off - 1
+            if fail_priority < 1:
+                fail_msg = f'低點被更低K線突破 (低={sl_v:.4f})' if aborted else '找不到對應高點'
+                fail_priority = 1
+            continue
+
+        pct = (sh_v - sl_v) / sl_v * 100
+
+        if pct < MIN_DROP_PCT:
+            if fail_priority < 2:
+                fail_msg = f'漲幅不足 {pct:.2f}% < {MIN_DROP_PCT}% (低={sl_v:.4f} 高={sh_v:.4f})'
+                fail_priority = 2
+            scan_i = sl_i_off - 1
+            continue
+
+        touched = any(
+            not pd.isna(s50_arr[m]) and high_arr[m] >= s50_arr[m]
+            for m in range(sl_bar, sh_bar + 1)
+        )
+        if not touched:
+            if fail_priority < 3:
+                fail_msg = f'漲幅夠但未觸碰MA50 (低={sl_v:.4f} 高={sh_v:.4f} 漲幅={pct:.2f}%)'
+                fail_priority = 3
+            scan_i = sl_i_off - 1
+            continue
+
+        if not has_three_combo_bear(open_arr, high_arr, low_arr, close_arr, sl_bar, sh_bar):
+            if fail_priority < 4:
+                fail_msg = f'漲幅與MA50都符合，但無combo (低={sl_v:.4f} 高={sh_v:.4f} 漲幅={pct:.2f}%)'
+                fail_priority = 4
+            scan_i = sl_i_off - 1
+            continue
+
+        return {'found': True, 'lv': sl_v, 'lb': sl_bar,
+                'hv': sh_v, 'hb': sh_bar,
+                'pct': pct}
+
+    result['fail_msg'] = fail_msg
+    return result
+
+# ============================================================
+# C2~C6 搜尋（含breakout override + 兩個邊界修正）
+# ============================================================
+def find_next_c(df, prev_lv, prev_lb, start_bar_bull=0, prev_hb=None, debug=False, c1_hv=None):
+    result = {'found': False}
+    trace = [] if debug else None
+    n = len(df)
+    high_arr  = df['high'].values
+    low_arr   = df['low'].values
+    open_arr  = df['open'].values
+    close_arr = df['close'].values
+
+    scan_start_bar = max(prev_lb + 1, start_bar_bull)
+    if scan_start_bar >= n - 4:
+        if debug: result['trace'] = trace
+        return result
+
+    scan_i_off = (n - 1) - scan_start_bar
+
+    for _loop in range(11):
+        if scan_i_off <= 4:
+            break
+
+        sh_v, sh_i_off = None, None
+        for i_off in range(scan_i_off, 3, -1):
+            bar_idx = (n - 1) - i_off
+            if bar_idx < scan_start_bar: continue
+            if bar_idx < 2 or bar_idx >= n - 2: continue
+            if is_swing_high2(high_arr, bar_idx):
+                sh_v = high_arr[bar_idx]
+                sh_i_off = i_off
+                break
+
+        if sh_v is None:
+            break
+
+        sh_bar = (n - 1) - sh_i_off
+
+        sl_v, sl_bar = None, None
+        aborted = False
+        for k in range(sh_bar + 1, n - 2):
+            if high_arr[k] > sh_v:
+                aborted = True
+                break
+            if sl_v is None or low_arr[k] < sl_v:
+                sl_v = low_arr[k]
+                sl_bar = k
+
+        if sl_v is None or aborted:
+            scan_i_off = sh_i_off - 1
+            if debug: trace.append({'h_idx': sh_bar, 'hv': round(sh_v,6), 'reason': '高點被突破或找不到低點'})
+            continue
+
+        is_breakout = (c1_hv is not None) and (sh_v > c1_hv)
+        low_ok = is_breakout or (sl_v > prev_lv)
+        if not low_ok:
+            scan_i_off = sh_i_off - 1
+            if debug: trace.append({'h_idx': sh_bar, 'hv': round(sh_v,6), 'l_idx': sl_bar, 'lv': round(sl_v,6), 'reason': f'低點未越抬越高 ({sl_v:.6f} <= {prev_lv:.6f})'})
+            continue
+
+        if not has_three_combo(open_arr, high_arr, low_arr, close_arr, sh_bar, sl_bar):
+            scan_i_off = sh_i_off - 1
+            if debug: trace.append({'h_idx': sh_bar, 'hv': round(sh_v,6), 'l_idx': sl_bar, 'lv': round(sl_v,6), 'reason': '沒有combo'})
+            continue
+
+        drop_pct = (sh_v - sl_v) / sh_v * 100
+        if debug: result['trace'] = trace
+        result.update({'found': True, 'hv': sh_v, 'hb': sh_bar,
+                'lv': sl_v, 'lb': sl_bar,
+                'pct': drop_pct})
+        return result
+
+    if debug: result['trace'] = trace
+    return result
+
+def find_next_c_bear(df, prev_hv, prev_hb, start_bar_bear=0, prev_lb=None, debug=False, c1_lv=None):
+    result = {'found': False}
+    trace = [] if debug else None
+    n = len(df)
+    high_arr  = df['high'].values
+    low_arr   = df['low'].values
+    open_arr  = df['open'].values
+    close_arr = df['close'].values
+
+    scan_start_bar = max(prev_hb + 1, start_bar_bear)
+    if scan_start_bar >= n - 4:
+        if debug: result['trace'] = trace
+        return result
+
+    scan_i_off = (n - 1) - scan_start_bar
+
+    for _loop in range(11):
+        if scan_i_off <= 4:
+            break
+
+        sl_v, sl_i_off = None, None
+        for i_off in range(scan_i_off, 3, -1):
+            bar_idx = (n - 1) - i_off
+            if bar_idx < scan_start_bar: continue
+            if bar_idx < 2 or bar_idx >= n - 2: continue
+            if is_swing_low2(low_arr, bar_idx):
+                sl_v = low_arr[bar_idx]
+                sl_i_off = i_off
+                break
+
+        if sl_v is None:
+            break
+
+        sl_bar = (n - 1) - sl_i_off
+
+        sh_v, sh_bar = None, None
+        aborted = False
+        for k in range(sl_bar + 1, n - 2):
+            if low_arr[k] < sl_v:
+                aborted = True
+                break
+            if sh_v is None or high_arr[k] > sh_v:
+                sh_v = high_arr[k]
+                sh_bar = k
+
+        if sh_v is None or aborted:
+            scan_i_off = sl_i_off - 1
+            if debug: trace.append({'l_idx': sl_bar, 'lv': round(sl_v,6), 'reason': '低點被突破或找不到高點'})
+            continue
+
+        is_breakout = (c1_lv is not None) and (sl_v < c1_lv)
+        high_ok = is_breakout or (sh_v < prev_hv)
+
+        if not high_ok:
+            scan_i_off = sl_i_off - 1
+            if debug: trace.append({'l_idx': sl_bar, 'lv': round(sl_v,6), 'h_idx': sh_bar, 'hv': round(sh_v,6), 'reason': f'高點未越壓越低 ({sh_v:.6f} >= {prev_hv:.6f})'})
+            continue
+
+        if not has_three_combo_bear(open_arr, high_arr, low_arr, close_arr, sl_bar, sh_bar):
+            scan_i_off = sl_i_off - 1
+            if debug: trace.append({'l_idx': sl_bar, 'lv': round(sl_v,6), 'h_idx': sh_bar, 'hv': round(sh_v,6), 'reason': '沒有combo'})
+            continue
+
+        rise_pct = (sh_v - sl_v) / sl_v * 100
+        if debug: result['trace'] = trace
+        result.update({'found': True, 'lv': sl_v, 'lb': sl_bar,
+                'hv': sh_v, 'hb': sh_bar,
+                'pct': rise_pct})
+        return result
+
+    if debug: result['trace'] = trace
+    return result
+
+# ============================================================
+# BASE 偵測 / 進場區間
+# ============================================================
+def detect_base(c_list):
+    if len(c_list) < 2: return 0
+    base_count = 0
+    base_hv = c_list[0]['hv']
+    for i in range(1, len(c_list)):
+        if c_list[i]['hv'] > base_hv:
+            base_count += 1
+            base_hv = c_list[i]['hv']
+    return base_count
+
+def get_entry_zone(c1_hv, c1_lv, last_c_lv):
+    c1_range = c1_hv - c1_lv
+    pivot    = c1_hv - c1_range / 3
+    cheat    = c1_hv - c1_range * 2 / 3
+    if last_c_lv >= pivot:   return 'Pivot'
+    elif last_c_lv >= cheat: return 'Cheat'
+    else:                    return 'LCheat'
+
+def detect_base_bear(c_list):
+    if len(c_list) < 2: return 0
+    base_count = 0
+    base_lv = c_list[0]['lv']
+    for i in range(1, len(c_list)):
+        if c_list[i]['lv'] < base_lv:
+            base_count += 1
+            base_lv = c_list[i]['lv']
+    return base_count
+
+def get_entry_zone_bear(c1_lv, c1_hv, last_c_hv):
+    c1_range = c1_hv - c1_lv
+    pivot    = c1_lv + c1_range / 3
+    cheat    = c1_lv + c1_range * 2 / 3
+    if last_c_hv <= pivot:   return 'Pivot'
+    elif last_c_hv <= cheat: return 'Cheat'
+    else:                     return 'LCheat'
+
+# ============================================================
+# 分析（對齊scannerrailway.py的analyze()）
+# ============================================================
+def analyze(df: pd.DataFrame, df_daily: pd.DataFrame) -> dict:
+    empty = {'stage': 0, 's1_strong': False, 'divergence': '', 'has_c': False, 'c_count': 0,
+             'base': 0, 'entry_zone': '', 'ready': False, 'is_bear': False, 'last_pct': None}
+    if df.empty or len(df) < 50: return empty
+    if df_daily.empty or len(df_daily) < 50: return empty
+
+    stage, s1_strong, divergence = get_stage(df_daily)
+
+    start_idx_bull = find_start_bar_bull(df)
+    c_list = []
+    is_bear = False
+
+    if start_idx_bull >= 0:
+        c1 = find_c1(df, start_idx_bull)
+        if c1['found']:
+            c_list = [c1]
+            prev_lv = c1['lv']
+            prev_lb = c1['lb']
+            for _ in range(5):
+                cx = find_next_c(df, prev_lv, prev_lb, start_idx_bull, c1_hv=c1['hv'])
+                if not cx['found']: break
+                c_list.append(cx)
+                prev_lv = cx['lv']
+                prev_lb = cx['lb']
+                if cx['pct'] < 2.0:
+                    break
+    else:
+        start_idx_bear = find_start_bar_bear(df)
+        if start_idx_bear >= 0:
+            is_bear = True
+            c1b = find_c1_bear(df, start_idx_bear)
+            if c1b['found']:
+                c_list = [c1b]
+                prev_hv = c1b['hv']
+                prev_hb = c1b['hb']
+                for _ in range(5):
+                    cxb = find_next_c_bear(df, prev_hv, prev_hb, start_idx_bear, c1_lv=c1b['lv'])
+                    if not cxb['found']: break
+                    c_list.append(cxb)
+                    prev_hv = cxb['hv']
+                    prev_hb = cxb['hb']
+                    if cxb['pct'] < 2.0:
+                        break
+
+    has_c = len(c_list) > 0
+    c_count = len(c_list)
+    if has_c and is_bear:
+        base = detect_base_bear(c_list)
+        entry_zone = get_entry_zone_bear(c_list[0]['lv'], c_list[0]['hv'], c_list[-1]['hv'])
+    elif has_c:
+        base = detect_base(c_list)
+        entry_zone = get_entry_zone(c_list[0]['hv'], c_list[0]['lv'], c_list[-1]['lv'])
+    else:
+        base = 0
+        entry_zone = ''
+    ready = c_list[-1]['pct'] < 10.0 if c_list else False
+    last_pct = round(c_list[-1]['pct'], 1) if c_list else None
+
+    return {'stage': stage, 's1_strong': s1_strong, 'divergence': divergence, 'has_c': has_c, 'c_count': c_count,
+            'base': base, 'entry_zone': entry_zone, 'ready': ready, 'is_bear': is_bear, 'last_pct': last_pct}
+
+# ============================================================
+# 掃描單一股票
+# ============================================================
 def scan_symbol(symbol):
     result = {'symbol': symbol}
     result['name'] = NAMES.get(symbol, symbol.replace('.KL',''))
     result['sector'] = SECTORS.get(symbol, '其他')
     tv_ticker = TV_SYMBOLS.get(symbol, symbol.replace('.KL',''))
     result['tv_symbol'] = f"MYX:{tv_ticker}"
+
+    df_daily = fetch_ohlcv(symbol, '1D')
+
     for tf in TF_LABELS:
         try:
-            df = fetch_ohlcv(symbol, tf)
-            if df.empty or len(df) < 20:
+            df = df_daily if tf == '1D' else fetch_ohlcv(symbol, tf)
+            if df.empty or len(df) < 50 or df_daily.empty or len(df_daily) < 50:
                 result[tf] = '-'
                 result[f'{tf}_cls'] = 'gray'
                 continue
+
+            res = analyze(df, df_daily)
+            hc        = res['has_c']
+            cnt       = res['c_count']
+            pct       = res.get('last_pct')
+            is_bear_c = res.get('is_bear', False)
+            ready     = res['ready']
+            base      = res['base']
+            zone      = res['entry_zone']
+            div       = res.get('divergence', '')
+            s1s       = res.get('s1_strong', False)
+
+            pct_str  = f'({pct}%)' if pct is not None else ''
+            c_suffix = '(空)' if is_bear_c else ''
+            base_str = f' B{base}' if base > 0 else ''
+            zone_str = f' {zone}' if ready else ''
+
             if tf == '1D':
-                stage = calc_stage(df)
-                c_count = find_c_count(df)
-                if c_count > 0:
-                    result[tf] = f'{stage} C{c_count}\U0001f3af'
-                    result[f'{tf}_cls'] = 'green'
+                s = res['stage']
+                div_mark = '↘' if div == 'down' else ('↗' if div == 'up' else '')
+                if s == 0:
+                    text, cls = '-', 'gray'
+                elif s == 1:
+                    text, cls = ('S1⭐' if s1s else 'S1'), 'stage1'
+                elif s == 2:
+                    if hc:
+                        text = f'S2{div_mark} {cnt}C{c_suffix}{pct_str}🎯{base_str}{zone_str}' if ready else f'S2{div_mark} {cnt}C{c_suffix}{pct_str}{base_str}'
+                        cls  = 'bull-ready' if ready else 'bull-c'
+                    else:
+                        text, cls = f'S2{div_mark}', 'bull'
+                elif s == 3:
+                    text, cls = 'S3⚠️', 'stage3'
+                elif s == 4:
+                    if hc:
+                        text = f'S4{div_mark} {cnt}C{c_suffix}{pct_str}🎯' if ready else f'S4{div_mark} {cnt}C{c_suffix}{pct_str}'
+                        cls  = 'bear-ready' if ready else 'bear-c'
+                    else:
+                        text, cls = f'S4{div_mark}', 'bear'
                 else:
-                    result[tf] = stage
-                    result[f'{tf}_cls'] = 'gray'
+                    text, cls = '-', 'gray'
             else:
-                c_count = find_c_count(df)
-                if c_count > 0:
-                    result[tf] = f'C{c_count}\U0001f3af'
-                    result[f'{tf}_cls'] = 'green'
+                if not hc:
+                    text, cls = '-', 'gray'
+                elif is_bear_c:
+                    text = f'{cnt}C{c_suffix}{pct_str}🎯' if ready else f'{cnt}C{c_suffix}{pct_str}'
+                    cls  = 'bear-ready' if ready else 'bear-c'
                 else:
-                    result[tf] = '-'
-                    result[f'{tf}_cls'] = 'gray'
+                    text = f'{cnt}C{c_suffix}{pct_str}🎯{base_str}{zone_str}' if ready else f'{cnt}C{c_suffix}{pct_str}{base_str}'
+                    cls  = 'bull-ready' if ready else 'bull-c'
+
+            result[tf]            = text
+            result[f'{tf}_cls']   = cls
+            result[f'{tf}_pct']   = pct
+            result[f'{tf}_isbear'] = is_bear_c
         except Exception as e:
+            log.warning(f"⚠️ {symbol} {tf}: {e}")
             result[tf] = 'ERR'
             result[f'{tf}_cls'] = 'gray'
     return result
+
+# ============================================================
+# 動態錨點（跟crypto版一樣的邏輯，只是TF_LABELS已經是高到低，不用reversed）
+# ============================================================
+def get_row_anchor_marks(r, tfs=TF_LABELS):
+    anchor_label = None
+    for tf in tfs:  # KLSE的TF_LABELS已經是高到低(1D→4H→1H)，不用像crypto版那樣reversed
+        if r.get(f'{tf}_cls', 'gray') in SIGNAL_CLASSES:
+            anchor_label = tf
+            break
+    if anchor_label is None:
+        return {}
+
+    anchor_isbear = r.get(f'{anchor_label}_isbear', False)
+    anchor_pct    = r.get(f'{anchor_label}_pct')
+
+    marks = {anchor_label: 'anchor'}
+    for tf in tfs:
+        if tf == anchor_label:
+            continue
+        if r.get(f'{tf}_cls', 'gray') not in SIGNAL_CLASSES:
+            continue
+        isbear = r.get(f'{tf}_isbear', False)
+        if isbear == anchor_isbear:
+            marks[tf] = 'align'
+        elif anchor_pct is not None and anchor_pct > 20.0:
+            marks[tf] = 'conflict-loose'
+        else:
+            marks[tf] = 'conflict-tight'
+    return marks
 
 def run_scan():
     global cached_results
@@ -547,7 +1154,6 @@ def run_scan():
         if scan_state['status'] == 'scanning':
             return
         scan_state['status'] = 'scanning'
-    # Deduplicate symbols
     seen = set()
     unique_syms = [s for s in SYMBOLS if s not in seen and not seen.add(s)]
     log.info(f"🇲🇾 莊家思維 大馬掃描器 開始掃描 ({len(unique_syms)} 只)")
@@ -570,19 +1176,22 @@ def send_telegram(results):
     now = datetime.now(MY_TZ).strftime('%Y-%m-%d %H:%M')
     lines = []
     for r in results:
-        d1 = r.get('1D', '-')
-        # 只看S2有C的
-        if not d1.startswith('S2') or '\U0001f3af' not in d1:
+        d1  = r.get('1D', '-')
+        cls = r.get('1D_cls', 'gray')
+        # 多頭跟空頭都通知（對齊crypto版後來的改動，原本只看多頭S2）
+        if cls not in ('bull-c', 'bull-ready', 'bear-c', 'bear-ready'):
             continue
-        name   = r.get('name', r['symbol'].replace('.KL',''))
-        sector = r.get('sector', '')
-        h4 = r.get('4H', '-')
-        h1 = r.get('1H', '-')
-        lines.append(f"{name}({sector}) | 1D:{d1} | 4H:{h4} | 1H:{h1}")
+        name    = r.get('name', r['symbol'].replace('.KL',''))
+        sector  = r.get('sector', '')
+        h4      = r.get('4H', '-')
+        h1      = r.get('1H', '-')
+        side    = '空' if r.get('1D_isbear', False) else '多'
+        pct     = r.get('1D_pct')
+        pct_str = f" | 收斂{pct}%" if pct is not None else ""
+        lines.append(f"{name}({sector}) | {side} | 1D:{d1}{pct_str} | 4H:{h4} | 1H:{h1}")
     if not lines:
         return
-    # 分批發送，每批25行避免太長
-    header = f"\U0001f1f2\U0001f1fe 大馬莊家思維掃描\n{now}\n共{len(lines)}只 S2有C信號\n{'─'*20}"
+    header = f"\U0001f1f2\U0001f1fe 大馬莊家思維掃描\n{now}\n共{len(lines)}只 訊號\n{'─'*20}"
     batches = [lines[i:i+25] for i in range(0, len(lines), 25)]
     for i, batch in enumerate(batches):
         part = f" ({i+1}/{len(batches)})" if len(batches) > 1 else ""
@@ -600,126 +1209,149 @@ def send_telegram(results):
 app = Flask(__name__)
 
 HTML = """<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>&#x1F1F2;&#x1F1FE; 大馬莊家思維掃描器</title>
 <style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{background:#0d1117;color:#e6edf3;font-family:monospace;font-size:13px}
-.header{background:#161b22;padding:12px 16px;border-bottom:1px solid #30363d;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
-.title{font-size:16px;font-weight:bold;color:#58a6ff}
-.info{color:#8b949e;font-size:12px}
-.btn{padding:6px 14px;border:none;border-radius:6px;cursor:pointer;font-size:12px;font-weight:bold}
-.btn-scan{background:#238636;color:#fff}
-.btn-scan:hover{background:#2ea043}
-.scanning{color:#f0a742;animation:blink 1s infinite}
-@keyframes blink{0%,100%{opacity:1}50%{opacity:0.4}}
-.controls{padding:8px 16px;background:#161b22;border-bottom:1px solid #30363d;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-input[type=text]{background:#0d1117;border:1px solid #30363d;color:#e6edf3;padding:5px 10px;border-radius:6px;font-size:12px;width:180px}
-select{background:#0d1117;border:1px solid #30363d;color:#e6edf3;padding:5px 10px;border-radius:6px;font-size:12px}
-.btn-export{background:#1f6feb;color:#fff;padding:6px 14px;border:none;border-radius:6px;cursor:pointer;font-size:12px;font-weight:bold}
-.chk-label{color:#8b949e;font-size:12px;display:flex;align-items:center;gap:4px;cursor:pointer}
-table{width:100%;border-collapse:collapse}
-th{background:#161b22;padding:8px 6px;text-align:center;border-bottom:2px solid #30363d;color:#8b949e;position:sticky;top:0}
-td{padding:7px 6px;text-align:center;border-bottom:1px solid #21262d}
-td.sym{text-align:left;padding-left:12px;font-weight:bold}
-td.sym a{color:#58a6ff;text-decoration:none}
-td.sym a:hover{text-decoration:underline}
-tr:hover td{background:#161b22}
-.green{color:#3fb950;font-weight:bold}
-.gray{color:#8b949e}
-</style>
+  body{font-family:monospace;background:#1a1a2e;color:#eee;margin:20px}
+  h2{color:#fff;margin-bottom:4px}
+  .subtitle{color:#aaa;font-size:13px;margin-bottom:12px}
+  .info{color:#aaa;margin-bottom:15px;font-size:14px}
+  table{border-collapse:collapse;width:auto}
+  th{background:#333;color:#fff;padding:8px 12px;font-size:13px;border:1px solid #444}
+  .sym{background:#2a2a3e;color:#fff;padding:6px 12px;font-size:13px;border:1px solid #444;font-weight:bold}
+  .sym a{color:#fff;text-decoration:none} .sym a:hover{color:#7ab3ff}
+  .cell{text-align:center;padding:6px 10px;font-size:12px;border:1px solid #444;font-weight:bold;min-width:80px}
+  .gray{background:#333;color:#888}
+  .stage1{background:#1a3a6e;color:#7ab3ff}
+  .bull{background:#1a3a6e;color:#7ab3ff}
+  .bull-c{background:#1565c0;color:#fff}
+  .bull-ready{background:#e65100;color:#fff}
+  .stage3{background:#5a3a00;color:#ffb74d}
+  .bear{background:#5a1a1a;color:#ff8a8a}
+  .bear-c{background:#c62828;color:#fff}
+  .bear-ready{background:#e65100;color:#fff}
+  .mark-anchor{outline:2px solid #ffffff;outline-offset:-2px}
+  .mark-align{outline:2px solid #2e7d32;outline-offset:-2px}
+  .mark-conflict-loose{outline:2px dashed #ffb300;outline-offset:-2px}
+  .mark-conflict-tight{outline:2px solid #e53935;outline-offset:-2px}
+  .hidden{display:none}
+  .ctrl-bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px}
+  .btn{color:#fff;border:none;padding:10px 20px;font-size:14px;cursor:pointer;border-radius:6px;font-family:monospace;font-weight:bold}
+  .btn-blue{background:#1565c0} .btn-blue:hover{background:#1976d2}
+  .btn-green{background:#2e7d32} .btn-green:hover{background:#388e3c}
+  .btn-gray{background:#333} .btn-gray:hover{background:#555}
+  .btn:disabled{background:#555;cursor:not-allowed}
+  select{background:#2a2a3e;color:#fff;border:1px solid #444;padding:9px 14px;border-radius:6px;font-size:14px;font-family:monospace}
+  .search-box{padding:8px 14px;font-size:14px;border-radius:6px;border:1px solid #444;background:#2a2a3e;color:#fff;font-family:monospace;width:180px}
+  .scanning-banner{background:#1565c0;color:#fff;padding:12px 20px;border-radius:6px;margin-bottom:15px;font-size:15px;font-weight:bold}
+  .chk-label{color:#aaa;font-size:13px;display:flex;align-items:center;gap:4px;cursor:pointer}
+</style></head><body>
+<h2>&#x1F1F2;&#x1F1FE; 大馬莊家思維掃描器</h2>
+<div class="subtitle">KLSE股票 · 操盤跟莊（邏輯已對齊 莊家思維 Contraction V53）</div>
+SCANNING_BANNER
+<div class="ctrl-bar">
+  <button class="btn btn-blue" onclick="startRefresh()" id="refreshBtn">&#x1F504; 重新掃描</button>
+  <select id="stageFilter" onchange="applyFilter()">
+    <option value="all">全部 Stage</option>
+    <option value="2">S2 只看牛市</option>
+    <option value="4">S4 只看熊市</option>
+    <option value="1">S1 橫盤</option>
+    <option value="3">S3 頂部</option>
+  </select>
+  <select id="sectorFilter" onchange="applyFilter()">
+    <option value="">全部板塊</option>
+    SECTOR_OPTIONS
+  </select>
+  <input class="search-box" type="text" id="searchBox" placeholder="搜尋股票..." oninput="applyFilter()">
+  <button class="btn btn-gray" onclick="clearSearch()">&#x2715;</button>
+  <label class="chk-label"><input type="checkbox" id="onlyC" onchange="applyFilter()"> 只顯示有C的</label>
+  <button class="btn btn-green" onclick="exportWatchlist()">&#x1F4CB; Export Watchlist</button>
+</div>
+<div class="info">更新：LAST_SCAN | 共 TOTAL 只 | 顯示 <span id="countDisplay">TOTAL</span> 個</div>
+<textarea id="watchlistBox" readonly style="background:#1a1a2e;color:#0f0;border:1px solid #444;padding:12px;border-radius:6px;width:500px;height:150px;font-family:monospace;font-size:12px;margin-top:8px;display:none"></textarea>
+<br id="watchlistBr" style="display:none">
+<table id="mainTable">
+  <tr><th>股票</th><th>板塊</th><th>1D</th><th>4H</th><th>1H</th></tr>
+  ROWS
+</table>
+<br>
+<div class="info">
+  <span style="background:#1a3a6e;color:#7ab3ff;padding:2px 6px">■</span> S1橫盤 &nbsp;
+  <span style="background:#1565c0;color:#fff;padding:2px 6px">■</span> S2/多頭有C &nbsp;
+  <span style="background:#e65100;color:#fff;padding:2px 6px">🎯</span> 進場信號 &nbsp;
+  <span style="background:#5a3a00;color:#ffb74d;padding:2px 6px">■</span> S3頂部 &nbsp;
+  <span style="background:#c62828;color:#fff;padding:2px 6px">■</span> S4/空頭有C &nbsp;|&nbsp;
+  <span style="outline:2px solid #ffffff;outline-offset:-2px;padding:2px 6px">■</span> 動態錨點 &nbsp;
+  <span style="outline:2px solid #2e7d32;outline-offset:-2px;padding:2px 6px">■</span> 順勢 &nbsp;
+  <span style="outline:2px dashed #ffb300;outline-offset:-2px;padding:2px 6px">■</span> 逆勢-新 &nbsp;
+  <span style="outline:2px solid #e53935;outline-offset:-2px;padding:2px 6px">■</span> 逆勢-舊
+</div>
 <script>
-function doScan(){
-  fetch('/rescan',{method:'POST'});
-  document.querySelector('.btn-scan').disabled=true;
-  document.querySelector('.btn-scan').innerText='⏳ 掃描中...';
-  var check=setInterval(function(){
-    fetch('/status').then(function(r){return r.json();}).then(function(d){
-      if(d.status==='done'){clearInterval(check);location.reload();}
-    });
-  },10000);
-}
-function exportTxt(){
-  var lines=[];
-  document.querySelectorAll('tbody tr').forEach(function(r){
-    if(r.style.display==='none') return;
-    var sym=r.getAttribute('data-symbol');
-    if(sym) lines.push(sym.replace('KLSE:',''));
+function applyFilter() {
+  var stage  = document.getElementById('stageFilter').value;
+  var sector = document.getElementById('sectorFilter').value;
+  var search = document.getElementById('searchBox').value.toUpperCase();
+  var onlyC  = document.getElementById('onlyC').checked;
+  var rows   = document.querySelectorAll('#mainTable tr:not(:first-child)');
+  var count  = 0;
+  rows.forEach(function(row) {
+    var sym = row.querySelector('.sym');
+    if (!sym) return;
+    var rowStage  = row.getAttribute('data-stage');
+    var rowSector = row.getAttribute('data-sector');
+    var hasC      = row.getAttribute('data-hasc') === '1';
+    var matchStage  = (stage === 'all') || (rowStage === stage);
+    var matchSector = (sector === '') || (rowSector === sector);
+    var matchSearch = sym.textContent.toUpperCase().indexOf(search) > -1;
+    if (matchStage && matchSector && matchSearch && (!onlyC || hasC)) {
+      row.classList.remove('hidden'); count++;
+    } else {
+      row.classList.add('hidden');
+    }
   });
-  var txt=lines.join(String.fromCharCode(10));
-  var blob=new Blob([txt],{type:'text/plain'});
-  var a=document.createElement('a');
-  a.href=URL.createObjectURL(blob);
-  a.download='klse_watchlist.txt';
-  a.click();
+  document.getElementById('countDisplay').textContent = count;
 }
-function filterTable(){
-  var q=document.getElementById('search').value.toLowerCase();
-  var stage=document.getElementById('stageFilter').value;
-  var sector=document.getElementById('sectorFilter').value;
-  var onlyC=document.getElementById('onlyC').checked;
-  document.querySelectorAll('tbody tr').forEach(function(r){
-    var text=r.innerText.toLowerCase();
-    var hasC=text.includes('c1')||text.includes('c2')||text.includes('c3')||text.includes('c4')||text.includes('c5')||text.includes('c6');
-    var matchQ=q===''||text.includes(q);
-    var rowStage=r.getAttribute('data-stage')||'';
-    var rowSector=r.getAttribute('data-sector')||'';
-    var matchStage=stage===''||rowStage===stage;
-    var matchSector=sector===''||rowSector===sector;
-    r.style.display=(matchQ&&matchStage&&matchSector&&(!onlyC||hasC))?'':'none';
+function clearSearch() {
+  document.getElementById('searchBox').value = '';
+  applyFilter();
+}
+function exportWatchlist() {
+  var stage = document.getElementById('stageFilter').value;
+  var rows  = document.querySelectorAll('#mainTable tr:not(:first-child)');
+  var list  = [];
+  rows.forEach(function(row) {
+    if (row.classList.contains('hidden')) return;
+    var sym = row.getAttribute('data-symbol');
+    if (sym) list.push(sym);
+  });
+  var box = document.getElementById('watchlistBox');
+  var br  = document.getElementById('watchlistBr');
+  if (list.length === 0) {
+    box.value = '沒有符合條件的股票！';
+  } else {
+    box.value = list.join(',');
+  }
+  box.style.display = 'block';
+  br.style.display  = 'block';
+  box.select();
+  try { document.execCommand('copy'); } catch(e) {}
+  alert('已複製 ' + list.length + ' 支股票到剪貼板！\\n直接貼到 TradingView Watchlist！');
+}
+function startRefresh() {
+  var btn = document.getElementById('refreshBtn');
+  btn.disabled = true;
+  btn.textContent = '⏳ 掃描中...';
+  fetch('/rescan', {method:'POST'}).then(function() { pollStatus(); })
+    .catch(function() { btn.disabled=false; btn.textContent='🔄 重新掃描'; });
+}
+function pollStatus() {
+  fetch('/status').then(function(r){return r.json();}).then(function(d) {
+    if (d.status === 'done') { location.reload(); }
+    else { setTimeout(pollStatus, 5000); }
   });
 }
 </script>
-</head>
-<body>
-<div class="header">
-  <span class="title">&#x1F1F2;&#x1F1FE; 大馬莊家思維掃描器</span>
-  <span class="info">上次掃描：LAST_SCAN</span>
-  <button class="btn btn-scan" onclick="doScan()">&#x1F504; 重新掃描</button>
-  STATUS_SPAN
-</div>
-<div class="controls">
-  <input type="text" id="search" placeholder="搜尋股票..." oninput="filterTable()">
-  <select id="stageFilter" onchange="filterTable()">
-    <option value="">全部Stage</option>
-    <option value="S1">S1</option>
-    <option value="S2">S2</option>
-    <option value="S3">S3</option>
-    <option value="S4">S4</option>
-  </select>
-  <select id="sectorFilter" onchange="filterTable()">
-    <option value="">全部板塊</option>
-    <option value="金融">金融</option>
-    <option value="能源">能源</option>
-    <option value="電信">電信</option>
-    <option value="棕榈油">棕榈油</option>
-    <option value="消費">消費</option>
-    <option value="工業">工業</option>
-    <option value="科技">科技</option>
-    <option value="手套">手套</option>
-    <option value="醫療">醫療</option>
-    <option value="房地產">房地產</option>
-    <option value="運輸">運輸</option>
-    <option value="其他">其他</option>
-  </select>
-  <label class="chk-label"><input type="checkbox" id="onlyC" onchange="filterTable()"> 只顯示有C的</label>
-  <button class="btn-export" onclick="exportTxt()">&#x1F4E5; Export TXT</button>
-  <span class="info">共 TOTAL 只</span>
-</div>
-BANNER
-<table>
-<thead><tr>
-<th>股票</th><th>板塊</th><th>1D</th><th>4H</th><th>1H</th>
-</tr></thead>
-<tbody>
-ROWS
-</tbody>
-</table>
-</body>
-</html>"""
+</body></html>"""
 
 def build_html(status='done'):
     rows = ''
@@ -727,38 +1359,60 @@ def build_html(status='done'):
         sym = r['symbol']
         tv  = r.get('tv_symbol', sym.replace('.KL',''))
         tv_url = f"https://www.tradingview.com/chart/?symbol={tv}"
-        d1  = r.get('1D', '-')
-        stage = d1.split(' ')[0] if d1 not in ('-', '') else '-'
         name = r.get('name', sym)
         sector = r.get('sector', '其他')
-        tv_code = r.get('tv_symbol', 'KLSE:' + sym.replace('.KL',''))
-        rows += f'<tr data-stage="{stage}" data-sector="{sector}" data-symbol="{tv_code}"><td class="sym"><a href="{tv_url}" target="_blank">{name}</a><br><span style="color:#8b949e;font-size:10px">{sym}</span></td>'
-        rows += f'<td style="color:#8b949e;font-size:12px">{sector}</td>'
+
+        d_cls = r.get('1D_cls', 'gray')
+        if d_cls in ('bull', 'bull-c', 'bull-ready'):   stage_val = '2'
+        elif d_cls in ('bear', 'bear-c', 'bear-ready'): stage_val = '4'
+        elif d_cls == 'stage1':                          stage_val = '1'
+        elif d_cls == 'stage3':                          stage_val = '3'
+        else:                                            stage_val = '0'
+
+        has_c_any = any(r.get(f'{t}_cls','gray') in SIGNAL_CLASSES for t in TF_LABELS)
+        anchor_marks = get_row_anchor_marks(r)
+
+        rows += f'<tr data-stage="{stage_val}" data-sector="{sector}" data-symbol="{tv}" data-hasc="{"1" if has_c_any else "0"}">'
+        rows += f'<td class="sym"><a href="{tv_url}" target="_blank">{name}</a><br><span style="color:#8b949e;font-size:10px">{sym}</span></td>'
+        rows += f'<td style="color:#aaa;font-size:12px;text-align:center">{sector}</td>'
         for tf in TF_LABELS:
-            txt = r.get(tf, '-')
-            cls = r.get(f'{tf}_cls', 'gray')
-            rows += f'<td class="{cls}">{txt}</td>'
+            text = r.get(tf, '-')
+            cls  = r.get(f'{tf}_cls', 'gray')
+            mark = anchor_marks.get(tf, '')
+            mark_cls = f' mark-{mark}' if mark else ''
+            rows += f'<td class="cell {cls}{mark_cls}"><a href="{tv_url}" target="_blank" style="color:inherit;text-decoration:none;display:block">{text}</a></td>'
         rows += '</tr>\n'
+
     last = scan_state.get('last_scan') or '-'
     total = len(cached_results)
-    status_span = '<span class="scanning">⏳ 掃描中...</span>' if status == 'scanning' else ''
-    banner = '<div style="background:#f0a742;color:#000;text-align:center;padding:6px;font-weight:bold">⏳ 掃描中，請稍候...</div>' if status == 'scanning' else ''
+    scanning_banner = '<div class="scanning-banner">⏳ 掃描中，請稍候...（約需10分鐘）</div>' if status == 'scanning' else ''
+    sector_opts = ''.join(f'<option value="{s}">{s}</option>' for s in sorted(set(SECTORS.values())))
+
     return (HTML
+        .replace('SCANNING_BANNER', scanning_banner)
+        .replace('SECTOR_OPTIONS', sector_opts)
         .replace('LAST_SCAN', last)
-        .replace('STATUS_SPAN', status_span)
         .replace('TOTAL', str(total))
-        .replace('BANNER', banner)
         .replace('ROWS', rows))
 
 @app.route('/')
 def index():
     with scan_state['lock']:
         status = scan_state['status']
+    if status == 'idle':
+        threading.Thread(target=run_scan, daemon=True).start()
+        return Response('''<!DOCTYPE html><html><head><meta charset="utf-8"><title>莊家思維</title>
+<meta http-equiv="refresh" content="15">
+<style>body{font-family:monospace;background:#1a1a2e;color:#eee;margin:40px;text-align:center}</style>
+</head><body><h2>&#x1F1F2;&#x1F1FE; 大馬莊家思維掃描器</h2>
+<p style="color:#7ab3ff;font-size:18px">⏳ 首次啟動，正在掃描中...</p>
+<p style="color:#aaa">約需10分鐘，頁面將自動刷新</p>
+</body></html>''', mimetype='text/html')
     try:
         return build_html(status)
     except Exception as e:
         log.error(f"build_html error: {e}")
-        return f"<html><body style='background:#0d1117;color:#e6edf3;font-family:monospace;padding:40px'><h2>🇲🇾 大馬莊家思維掃描器</h2><p>⏳ 掃描中，請稍候約10分鐘後刷新頁面...</p><p style='color:#8b949e'>Error: {e}</p></body></html>", 200
+        return f"<html><body style='background:#1a1a2e;color:#eee;font-family:monospace;padding:40px'><h2>🇲🇾 大馬莊家思維掃描器</h2><p>⏳ 掃描中，請稍候...</p><p style='color:#8b949e'>Error: {e}</p></body></html>", 200
 
 @app.route('/rescan', methods=['POST'])
 def rescan():
@@ -774,6 +1428,100 @@ def status():
 @app.route('/health')
 def health():
     return jsonify({'status': 'ok'})
+
+@app.route('/debug_c')
+def debug_c():
+    import json as _json
+    symbol = request.args.get('symbol', '1155.KL')
+    if not symbol.upper().endswith('.KL'):
+        symbol = symbol.upper() + '.KL'
+    tf = request.args.get('tf', '1D').upper()
+    if tf not in TF_LABELS:
+        tf = '1D'
+
+    df_daily = fetch_ohlcv(symbol, '1D')
+    df = df_daily if tf == '1D' else fetch_ohlcv(symbol, tf)
+    if df.empty:
+        return Response(_json.dumps({'error': 'no data'}), mimetype='application/json')
+
+    def fmt_idx(i):
+        if i is None or i < 0 or i >= len(df): return None
+        t = df.index[i]
+        return {'idx': int(i), 'time': str(t)}
+
+    out = {'symbol': symbol, 'tf': tf, 'n_bars': len(df)}
+
+    start_idx_bull = find_start_bar_bull(df)
+    start_idx_bear = find_start_bar_bear(df)
+    out['start_idx_bull'] = fmt_idx(start_idx_bull) if start_idx_bull >= 0 else None
+    out['start_idx_bear'] = fmt_idx(start_idx_bear) if start_idx_bear >= 0 else None
+
+    c_list = []
+    next_c_fail_trace = None
+    if start_idx_bull >= 0:
+        c1 = find_c1(df, start_idx_bull)
+        if c1['found']:
+            c1['label'] = 'C1'
+            c_list = [c1]
+            prev_lv = c1['lv']; prev_lb = c1['lb']
+            for n in range(5):
+                cx = find_next_c(df, prev_lv, prev_lb, start_idx_bull, debug=True, c1_hv=c1['hv'])
+                if not cx['found']:
+                    next_c_fail_trace = cx.get('trace')
+                    break
+                next_c_fail_trace = None
+                cx['label'] = f'C{len(c_list)+1}'
+                c_list.append(cx)
+                prev_lv = cx['lv']; prev_lb = cx['lb']
+                if cx['pct'] < 2.0: break
+        else:
+            out['c1_fail_msg'] = c1.get('fail_msg')
+        out['direction'] = 'bull'
+    elif start_idx_bear >= 0:
+        c1b = find_c1_bear(df, start_idx_bear)
+        if c1b['found']:
+            c1b['label'] = 'C1'
+            c_list = [c1b]
+            prev_hv = c1b['hv']; prev_hb = c1b['hb']
+            for n in range(5):
+                cxb = find_next_c_bear(df, prev_hv, prev_hb, start_idx_bear, debug=True, c1_lv=c1b['lv'])
+                if not cxb['found']:
+                    next_c_fail_trace = cxb.get('trace')
+                    break
+                next_c_fail_trace = None
+                cxb['label'] = f'C{len(c_list)+1}'
+                c_list.append(cxb)
+                prev_hv = cxb['hv']; prev_hb = cxb['hb']
+                if cxb['pct'] < 2.0: break
+        else:
+            out['c1_fail_msg'] = c1b.get('fail_msg')
+        out['direction'] = 'bear'
+    else:
+        out['direction'] = 'none'
+
+    detail = []
+    for c in c_list:
+        hb = c.get('hb'); lb = c.get('lb')
+        detail.append({
+            'label': c['label'],
+            'hv': round(c['hv'], 6), 'h_time': fmt_idx(hb),
+            'lv': round(c['lv'], 6), 'l_time': fmt_idx(lb),
+            'pct': round(c['pct'], 3)
+        })
+    out['c_list'] = detail
+
+    if next_c_fail_trace:
+        trace_out = []
+        for t in next_c_fail_trace:
+            t2 = dict(t)
+            if 'h_idx' in t2: t2['h_time'] = fmt_idx(t2['h_idx'])
+            if 'l_idx' in t2: t2['l_time'] = fmt_idx(t2['l_idx'])
+            trace_out.append(t2)
+        out['next_c_fail_trace'] = trace_out
+    else:
+        out['next_c_fail_trace'] = []
+
+    return Response(_json.dumps(out, indent=2, ensure_ascii=False, default=str), mimetype='application/json')
 
 def scheduler():
     while True:
