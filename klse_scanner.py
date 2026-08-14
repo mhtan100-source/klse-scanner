@@ -1084,6 +1084,13 @@ TV_SYMBOLS = {
 }
 
 TF_LABELS = ['1D', '4H', '1H']   # 由高到低（跟crypto版TF_LABELS的順序相反，這裡直接就是高到低）
+TV_INTERVAL  = {'1H': '60', '4H': '240', '1D': 'D'}
+# 跟crypto版(scannerrailway.py)共用同一個TradingView Layout（莊家思維指標已經加在上面），
+# 預設值bd3vZUwt是crypto版目前使用的Layout代碼；可用環境變數TV_LAYOUT_ID覆寫
+TV_LAYOUT_ID = os.environ.get('TV_LAYOUT_ID', 'bd3vZUwt')
+
+def tv_chart_base():
+    return f"https://www.tradingview.com/chart/{TV_LAYOUT_ID}/" if TV_LAYOUT_ID else "https://www.tradingview.com/chart/"
 
 # ============================================================
 # C系列參數（對齊 莊家思維 Contraction V53 / scannerrailway.py）
@@ -2154,7 +2161,7 @@ def build_html(status='done'):
     for r in (cached_results or []):
         sym = r['symbol']
         tv  = r.get('tv_symbol', sym.replace('.KL',''))
-        tv_url = f"https://www.tradingview.com/chart/?symbol={tv}"
+        tv_url = f"{tv_chart_base()}?symbol={tv}&interval=D"  # 股票名稱欄預設跳日線
         name = r.get('name', sym)
         sector = r.get('sector', '其他')
         alias = TV_SYMBOLS.get(sym, '')  # 常見簡稱（如MPI/TM），只用來讓搜尋找得到，不影響顯示或連結
@@ -2177,7 +2184,8 @@ def build_html(status='done'):
             cls  = r.get(f'{tf}_cls', 'gray')
             mark = anchor_marks.get(tf, '')
             mark_cls = f' mark-{mark}' if mark else ''
-            rows += f'<td class="cell {cls}{mark_cls}"><a href="{tv_url}" target="_blank" style="color:inherit;text-decoration:none;display:block">{text}</a></td>'
+            tf_url = f"{tv_chart_base()}?symbol={tv}&interval={TV_INTERVAL.get(tf, 'D')}"  # 點哪個時間段的欄位就跳到那個時間段
+            rows += f'<td class="cell {cls}{mark_cls}"><a href="{tf_url}" target="_blank" style="color:inherit;text-decoration:none;display:block">{text}</a></td>'
         rows += '</tr>\n'
 
     last = scan_state.get('last_scan') or '-'
