@@ -1640,6 +1640,88 @@ scan_state = {'status': 'idle', 'last_scan': None, 'lock': threading.Lock()}
 # ============================================================
 audit_state = {'status': 'idle', 'checked': 0, 'total': 0, 'mismatches': [], 'all_names': [], 'errors': [], 'lock': threading.Lock()}
 
+# ============================================================
+# 快速核對：只針對606檔擴充後仍缺NAMES/SECTORS的那批代碼（180檔），
+# 避免完整audit_names的606檔結果太大導致抓取時被截斷讀不到後半段資料。
+# ============================================================
+MISSING_INFO_SYMBOLS = [
+    '0025.KL', '0028.KL', '0039.KL', '0040.KL', '0058.KL', '0089.KL', '0106.KL', '0131.KL',
+    '0149.KL', '0158.KL', '0167.KL', '0192.KL', '0202.KL', '0206.KL', '0212.KL', '0222.KL',
+    '0237.KL', '0250.KL', '0252.KL', '0256.KL', '0257.KL', '0258.KL', '0277.KL', '0284.KL',
+    '0290.KL', '0299.KL', '0302.KL', '0307.KL', '0313.KL', '0317.KL', '0319.KL', '0323.KL',
+    '0327.KL', '0331.KL', '0333.KL', '0336.KL', '0340.KL', '0341.KL', '0342.KL', '0346.KL',
+    '0348.KL', '0353.KL', '0355.KL', '0357.KL', '0363.KL', '0370.KL', '0380.KL', '0383.KL',
+    '0386.KL', '0396.KL', '0455.KL', '0460.KL', '0465.KL', '3247.KL', '3913.KL', '5036.KL',
+    '5070.KL', '5078.KL', '5147.KL', '5149.KL', '5219.KL', '5300.KL', '6203.KL', '6297.KL',
+    '6912.KL', '7004.KL', '7055.KL', '7085.KL', '7115.KL', '7131.KL', '7133.KL', '7134.KL',
+    '7145.KL', '7170.KL', '7176.KL', '7211.KL', '7230.KL', '7382.KL', '7579.KL', '7935.KL',
+    '8192.KL', '8273.KL', '8435.KL', '8613.KL', '9326.KL', '9369.KL', '9776.KL', '5238.KL',
+    '0391.KL', '5308.KL', '7155.KL', '6378.KL', '5073.KL', '5703.KL', '2097.KL', '2054.KL',
+    '5010.KL', '0012.KL', '7501.KL', '0368.KL', '0246.KL', '7210.KL', '5303.KL', '7108.KL',
+    '5196.KL', '5077.KL', '7192.KL', '0006.KL', '0034.KL', '0066.KL', '0074.KL', '0080.KL',
+    '0109.KL', '0116.KL', '0136.KL', '0143.KL', '0174.KL', '0175.KL', '0188.KL', '0195.KL',
+    '0200.KL', '0281.KL', '0289.KL', '0347.KL', '0350.KL', '0365.KL', '0367.KL', '0379.KL',
+    '0393.KL', '0457.KL', '0458.KL', '0459.KL', '0463.KL', '0466.KL', '1236.KL', '3778.KL',
+    '3891.KL', '4057.KL', '4235.KL', '4316.KL', '5098.KL', '5127.KL', '5157.KL', '5175.KL',
+    '5179.KL', '5222.KL', '5305.KL', '5322.KL', '5345.KL', '5533.KL', '5576.KL', '5738.KL',
+    '5797.KL', '6025.KL', '6637.KL', '7020.KL', '7068.KL', '7071.KL', '7078.KL', '7080.KL',
+    '7112.KL', '7120.KL', '7123.KL', '7140.KL', '7164.KL', '7173.KL', '7213.KL', '7215.KL',
+    '7219.KL', '7315.KL', '7439.KL', '7854.KL', '8699.KL', '8826.KL', '8893.KL', '9148.KL',
+    '9237.KL', '9288.KL', '9334.KL', '9881.KL',
+]
+missing_audit_state = {'status': 'idle', 'checked': 0, 'total': 0, 'results': [], 'lock': threading.Lock()}
+
+def run_missing_audit():
+    global missing_audit_state
+    with missing_audit_state['lock']:
+        if missing_audit_state['status'] == 'running':
+            return
+        missing_audit_state['status'] = 'running'
+        missing_audit_state['checked'] = 0
+        missing_audit_state['results'] = []
+        missing_audit_state['total'] = len(MISSING_INFO_SYMBOLS)
+    for sym in MISSING_INFO_SYMBOLS:
+        yahoo_name = ''
+        yahoo_sector = ''
+        yahoo_industry = ''
+        try:
+            info = yf.Ticker(sym).get_info()
+            yahoo_name     = info.get('longName') or info.get('shortName') or ''
+            yahoo_sector   = info.get('sector', '') or ''
+            yahoo_industry = info.get('industry', '') or ''
+        except Exception as e:
+            yahoo_name = f'ERROR:{e}'
+        with missing_audit_state['lock']:
+            missing_audit_state['results'].append({
+                'symbol': sym,
+                'yahoo_name': yahoo_name,
+                'yahoo_sector': yahoo_sector,
+                'yahoo_industry': yahoo_industry,
+            })
+            missing_audit_state['checked'] += 1
+        time.sleep(0.35)
+    with missing_audit_state['lock']:
+        missing_audit_state['status'] = 'done'
+    log.info(f"缺NAMES/SECTORS快速核對完成：共{len(MISSING_INFO_SYMBOLS)}檔")
+
+@app.route('/audit_missing', methods=['POST', 'GET'])
+def audit_missing():
+    with missing_audit_state['lock']:
+        already_running = missing_audit_state['status'] == 'running'
+    if not already_running:
+        threading.Thread(target=run_missing_audit, daemon=True).start()
+    return jsonify({'started': not already_running})
+
+@app.route('/audit_missing_result')
+def audit_missing_result():
+    with missing_audit_state['lock']:
+        return jsonify({
+            'status': missing_audit_state['status'],
+            'checked': missing_audit_state['checked'],
+            'total': missing_audit_state['total'],
+            'results': missing_audit_state['results'],
+        })
+
 def _name_matches(local_name, yahoo_name):
     """寬鬆比對：只要任一方的關鍵字出現在另一方就算符合，避免誤報太多。"""
     if not yahoo_name:
