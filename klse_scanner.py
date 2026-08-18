@@ -1984,7 +1984,7 @@ def fetch_ohlcv(symbol, timeframe, raw_1h=None):
     raw_1h: 可選，傳入已抓好的1H原始資料，4H/1H會直接沿用，不重複下載。"""
     try:
         if timeframe == '1D':
-            df = yf.download(symbol, period='2y', interval='1d', progress=False, auto_adjust=True)
+            df = yf.download(symbol, period='5y', interval='1d', progress=False, auto_adjust=True)
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
             df.columns = [c.lower() for c in df.columns]
