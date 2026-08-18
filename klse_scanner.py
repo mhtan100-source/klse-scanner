@@ -1704,24 +1704,6 @@ def run_missing_audit():
         missing_audit_state['status'] = 'done'
     log.info(f"缺NAMES/SECTORS快速核對完成：共{len(MISSING_INFO_SYMBOLS)}檔")
 
-@app.route('/audit_missing', methods=['POST', 'GET'])
-def audit_missing():
-    with missing_audit_state['lock']:
-        already_running = missing_audit_state['status'] == 'running'
-    if not already_running:
-        threading.Thread(target=run_missing_audit, daemon=True).start()
-    return jsonify({'started': not already_running})
-
-@app.route('/audit_missing_result')
-def audit_missing_result():
-    with missing_audit_state['lock']:
-        return jsonify({
-            'status': missing_audit_state['status'],
-            'checked': missing_audit_state['checked'],
-            'total': missing_audit_state['total'],
-            'results': missing_audit_state['results'],
-        })
-
 def _name_matches(local_name, yahoo_name):
     """寬鬆比對：只要任一方的關鍵字出現在另一方就算符合，避免誤報太多。"""
     if not yahoo_name:
@@ -2871,6 +2853,24 @@ def audit_names_result():
         if include_all:
             out['all_names'] = audit_state['all_names']
         return jsonify(out)
+
+@app.route('/audit_missing', methods=['POST', 'GET'])
+def audit_missing():
+    with missing_audit_state['lock']:
+        already_running = missing_audit_state['status'] == 'running'
+    if not already_running:
+        threading.Thread(target=run_missing_audit, daemon=True).start()
+    return jsonify({'started': not already_running})
+
+@app.route('/audit_missing_result')
+def audit_missing_result():
+    with missing_audit_state['lock']:
+        return jsonify({
+            'status': missing_audit_state['status'],
+            'checked': missing_audit_state['checked'],
+            'total': missing_audit_state['total'],
+            'results': missing_audit_state['results'],
+        })
 
 @app.route('/debug_bars')
 def debug_bars():
