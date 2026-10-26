@@ -15,7 +15,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from flask import Flask, jsonify, Response, request
+from flask import Flask, jsonify, Response, request, redirect
 import pytz
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
@@ -3719,6 +3719,8 @@ def backtest_page():
         limit = int(limit) if limit and limit.isdigit() else None
         threading.Thread(target=run_c1_backtest, args=(run_tf, None, limit), daemon=True).start()
         time.sleep(0.5)
+        # 轉回不帶run參數的網址：否則頁面每30秒自動刷新時，跑完又會重新開始一次
+        return redirect(f'/backtest?tf={run_tf}')
     view_tf = request.args.get('tf', run_tf if run_tf in TF_LABELS else (bt_state.get('tf') or '1D')).upper()
     if view_tf not in TF_LABELS: view_tf = '1D'
 
