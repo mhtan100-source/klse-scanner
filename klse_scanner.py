@@ -2182,7 +2182,9 @@ def find_start_bar_bear(df: pd.DataFrame) -> int:
 # C1 搜尋（含兩個已在crypto版驗證過的邊界修正：
 #   1) 候選轉折點掃描不排除barsAgo=4；2) 低點追蹤排除最後2根未確認K棒）
 # ============================================================
-def find_c1(df: pd.DataFrame, start_idx: int) -> dict:
+def find_c1(df: pd.DataFrame, start_idx: int, min_drop=None, atr_mult=None) -> dict:
+    """min_drop / atr_mult 只給回測用：不傳就是原本的 MIN_DROP_PCT（正式掃描、跟Pine對齊的邏輯不變）。
+    atr_mult：C1跌幅門檻改成「候選高點那根的ATR14% × 倍數」。"""
     result = {'found': False}
     n = len(df)
     total_bars = n - 1 - start_idx
@@ -2193,6 +2195,12 @@ def find_c1(df: pd.DataFrame, start_idx: int) -> dict:
     open_arr  = df['open'].values
     close_arr = df['close'].values
     s50_arr   = calc_sma(df['close'], 50).values
+    base_thr  = MIN_DROP_PCT if min_drop is None else float(min_drop)
+    atr_pct_arr = None
+    if atr_mult is not None:
+        _pc = df['close'].shift(1)
+        _tr = pd.concat([df['high'] - df['low'], (df['high'] - _pc).abs(), (df['low'] - _pc).abs()], axis=1).max(axis=1)
+        atr_pct_arr = (_tr.rolling(14).mean() / df['close'] * 100).values
 
     start_off = min(total_bars - 2, 498)
     scan_i = start_off
@@ -2240,10 +2248,13 @@ def find_c1(df: pd.DataFrame, start_idx: int) -> dict:
             continue
 
         pct = (sh_v - sl_v) / sh_v * 100
+        thr = base_thr
+        if atr_pct_arr is not None and not pd.isna(atr_pct_arr[sh_bar]):
+            thr = float(atr_mult) * float(atr_pct_arr[sh_bar])
 
-        if pct < MIN_DROP_PCT:
+        if pct < thr:
             if fail_priority < 2:
-                fail_msg = f'跌幅不足 {pct:.2f}% < {MIN_DROP_PCT}% (高={sh_v:.4f} 低={sl_v:.4f})'
+                fail_msg = f'跌幅不足 {pct:.2f}% < {thr:.2f}% (高={sh_v:.4f} 低={sl_v:.4f})'
                 fail_priority = 2
             scan_i = sh_i_off - 1
             continue
@@ -2554,7 +2565,8 @@ def get_entry_zone_bear(c1_lv, c1_hv, last_c_hv):
 # ============================================================
 # 分析（對齊scannerrailway.py的analyze()）
 # ============================================================
-def analyze(df: pd.DataFrame, df_daily: pd.DataFrame) -> dict:
+def analyze(df: pd.DataFrame, df_daily: pd.DataFrame, c1_cfg=None) -> dict:
+    """c1_cfg只給回測用（例如 {'min_drop': 7} 或 {'atr_mult': 3}），正式掃描不傳。"""
     empty = {'stage': 0, 's1_strong': False, 'divergence': '', 'has_c': False, 'c_count': 0,
              'base': 0, 'entry_zone': '', 'ready': False, 'is_bear': False, 'last_pct': None}
     if df.empty or len(df) < 50: return empty
@@ -2567,7 +2579,7 @@ def analyze(df: pd.DataFrame, df_daily: pd.DataFrame) -> dict:
     is_bear = False
 
     if start_idx_bull >= 0:
-        c1 = find_c1(df, start_idx_bull)
+        c1 = find_c1(df, start_idx_bull, **(c1_cfg or {}))
         if c1['found']:
             c_list = [c1]
             prev_lv = c1['lv']
@@ -2802,8 +2814,8 @@ def send_telegram(results):
 # ============================================================
 # 🃏 突破卡片引擎（BO / SL / 目標 + 已突破追蹤 + 戰績統計）
 # 規則（MH 2026-10-26 確認）：
-#   BO  = 最後一個C的高點 × 1.01，K線「收盤」站上才算突破
-#   SL  = 最後一個C的低點 − 0.5%（至少低一個Bursa跳動單位）
+#   BO  = 最後一個C的高點 + 緩衝，K線「收盤」站上才算突破
+#   SL  = 最後一個C的低點 − 緩衝（老師規則：天圖1%、時圖0.5%、分圖0.25%）
 #   進場 = 還沒突破用BO；已突破用確認那根K線的收盤價
 #   目標 = 進場 + 1.5R / 2R（R = 進場 − SL）
 #   快突破 = 現價離BO 5%以內；已突破追蹤到碰SL或1:1.5為止，超過20根K線記為「到期」
@@ -2814,15 +2826,15 @@ import json
 
 CARD_TFS          = [t.strip() for t in os.environ.get('CARD_TFS', '1D,4H,1H').split(',') if t.strip() in TF_LABELS]
 CARD_TELEGRAM_TFS = [t.strip() for t in os.environ.get('CARD_TELEGRAM_TFS', '1D').split(',') if t.strip()]
-BO_BUFFER_PCT     = 1.0     # BO = C高 × (1 + 1%)
-SL_BUFFER_PCT     = 0.5     # SL = C低 × (1 − 0.5%)，且至少低一個跳動單位
+# 老師規則（股票、加密貨幣通用）：天圖 ±1%、時圖 ±0.5%、分圖 ±0.25%
+#   BO = C高 × (1 + 緩衝%)，SL = C低 × (1 − 緩衝%)
+TF_BUFFER_PCT     = {'1D': 1.0, '4H': 0.5, '1H': 0.5}
 QUICK_BO_PCT      = 5.0     # 快突破：現價離BO ≤ 5%
 MIN_C_FOR_CARD    = 2       # 至少要有C2
 TP1_R             = 1.5
 TP2_R             = 2.0
 MAX_HOLD_BARS     = 20      # 突破後20根K線內沒碰SL也沒到1:1.5 → 記為到期
 CHASE_MAX_PCT     = 3.0     # 確認價高於BO超過3% → 標「⚠️不追」
-CHASE_MAX_ATR     = 2.0     # 或 SL距離 > 2倍ATR14 → 標「⚠️不追」
 VOL_SURGE_X       = 1.5     # 突破量 ≥ 1.5倍20根均量 → 標「🔥放量」
 PROVISIONAL_BARS  = 2       # 最後一個C低點之後確認K線少於2根 → 標⏳（跟crypto版同一個定義）
 BACKFILL_BARS     = int(os.environ.get('CARD_BACKFILL_BARS', '20'))  # 第一次看到某檔時，回放最近20根K線補抓已突破案例
@@ -2875,10 +2887,9 @@ def bursa_tick(p):
     if p < 100:  return 0.02
     return 0.10
 
-def calc_levels(c_hv, c_lv):
-    bo = c_hv * (1 + BO_BUFFER_PCT / 100)
-    sl = min(c_lv * (1 - SL_BUFFER_PCT / 100), c_lv - bursa_tick(c_lv))
-    return bo, sl
+def calc_levels(c_hv, c_lv, tf='1D'):
+    buf = TF_BUFFER_PCT.get(tf, 1.0) / 100
+    return c_hv * (1 + buf), c_lv * (1 - buf)
 
 def calc_targets(entry, sl):
     r = entry - sl
@@ -2940,7 +2951,7 @@ def _vol_ratio(df, i):
     avg = float(np.mean(v[i-20:i]))
     return round(float(v[i]) / avg, 2) if avg > 0 else None
 
-def _setup_from_analysis(df, res):
+def _setup_from_analysis(df, res, tf='1D'):
     """把analyze()結果轉成一個「等待突破」的卡片設定；不符合條件回傳None"""
     if not res.get('has_c') or res.get('is_bear'): return None
     if res.get('c_count', 0) < MIN_C_FOR_CARD: return None
@@ -2948,7 +2959,7 @@ def _setup_from_analysis(df, res):
     if not lc: return None
     n = len(df)
     hb, lb = int(lc['hb']), int(lc['lb'])
-    bo, sl = calc_levels(float(lc['hv']), float(lc['lv']))
+    bo, sl = calc_levels(float(lc['hv']), float(lc['lv']), tf)
     if bo <= sl: return None
     return {
         'c_hv': float(lc['hv']), 'c_lv': float(lc['lv']),
@@ -2962,14 +2973,14 @@ def _setup_from_analysis(df, res):
         'last_checked': _iso(df.index[max(lb, n - 3)]),
     }
 
-def _open_case(key, meta, tf, p, dfc, i, backfill):
+def _open_case(key, meta, tf, p, dfc, i, backfill, st):
     entry = float(dfc['close'].values[i])
     sl = p['sl']
     r = entry - sl
     if r <= 0: return
     tp1, tp2 = calc_targets(entry, sl)
-    atr = _atr14(dfc, i)
-    chase = entry > p['bo'] * (1 + CHASE_MAX_PCT / 100) or (atr is not None and r > CHASE_MAX_ATR * atr)
+    atr = _atr14(dfc, i)                                   # 只記錄參考，不再用來判斷「不追」
+    chase = entry > p['bo'] * (1 + CHASE_MAX_PCT / 100)
     cid = f"{key}|{p['h_time']}"
     case = dict(p)
     case.update({
@@ -2980,78 +2991,79 @@ def _open_case(key, meta, tf, p, dfc, i, backfill):
         'bars_held': 0, 'last_close': entry, 'vol_x': _vol_ratio(dfc, i),
         'atr': atr, 'chase': bool(chase), 'backfill': bool(backfill),
     })
-    cards_state['active'][cid] = case
-    cards_state['used'][cid] = case['confirm_time']
+    st['active'][cid] = case
+    st['used'][cid] = case['confirm_time']
     if not backfill:
-        card_events.append(('open', case))
+        st.get('events', card_events).append(('open', case))
 
-def _check_pending(key, meta, tf, dfc, backfill):
-    p = cards_state['pending'].get(key)
+def _check_pending(key, meta, tf, dfc, backfill, st):
+    p = st['pending'].get(key)
     if not p: return
     pos = _positions_after(dfc, p['last_checked'])
     closes = dfc['close'].values; lows = dfc['low'].values
     for i in pos:
         if closes[i] >= p['bo']:
-            cards_state['pending'].pop(key, None)
-            _open_case(key, meta, tf, p, dfc, i, backfill)
+            st['pending'].pop(key, None)
+            _open_case(key, meta, tf, p, dfc, i, backfill, st)
             return
         if lows[i] <= p['sl']:          # 還沒突破就先跌破SL → 這個形態作廢
-            cards_state['pending'].pop(key, None)
+            st['pending'].pop(key, None)
             return
     if pos:
         p['last_checked'] = _iso(dfc.index[pos[-1]])
 
-def _finish(case, result, r_mult, t, backfill):
+def _finish(case, result, r_mult, t, backfill, st):
     case.update({'result': result, 'r_mult': round(float(r_mult), 2), 'end_time': _iso(t)})
-    cards_state['active'].pop(case['id'], None)
-    cards_state['done'].append(case)
+    st['active'].pop(case['id'], None)
+    st['done'].append(case)
     if not backfill and not case.get('backfill'):
-        card_events.append(('close', case))
+        st.get('events', card_events).append(('close', case))
 
-def _check_active(key, dfc, backfill):
+def _check_active(key, dfc, backfill, st):
     highs = dfc['high'].values; lows = dfc['low'].values; closes = dfc['close'].values
-    for cid, case in list(cards_state['active'].items()):
+    for cid, case in list(st['active'].items()):
         if case.get('key') != key: continue
         r = case['entry'] - case['sl']
         for i in _positions_after(dfc, case['last_checked']):
             case['bars_held'] += 1
             t = dfc.index[i]
             if lows[i] <= case['sl']:                       # 同一根同時碰SL和TP1 → 保守算SL
-                _finish(case, 'SL', -1.0, t, backfill); break
+                _finish(case, 'SL', -1.0, t, backfill, st); break
             if highs[i] >= case['tp1']:
-                _finish(case, 'TP1', TP1_R, t, backfill); break
+                _finish(case, 'TP1', TP1_R, t, backfill, st); break
             case['last_checked'] = _iso(t)
             case['last_close'] = float(closes[i])
             if case['bars_held'] >= MAX_HOLD_BARS:
-                _finish(case, 'TIMEOUT', (closes[i] - case['entry']) / r, t, backfill); break
+                _finish(case, 'TIMEOUT', (closes[i] - case['entry']) / r, t, backfill, st); break
 
-def _card_step(meta, tf, df_all, dfc, res, backfill=False):
+def _card_step(meta, tf, df_all, dfc, res, backfill=False, st=None):
     """一次更新：1)檢查等待中的形態有沒有收盤突破 2)用最新分析更新等待中的形態 3)檢查進行中案例"""
+    st = cards_state if st is None else st   # 回測用獨立的st，不影響正式卡片
     key = f"{meta['symbol']}|{tf}"
-    _check_pending(key, meta, tf, dfc, backfill)
-    setup = _setup_from_analysis(df_all, res)
+    _check_pending(key, meta, tf, dfc, backfill, st)
+    setup = _setup_from_analysis(df_all, res, tf)
     if setup is None:
-        cards_state['pending'].pop(key, None)
+        st['pending'].pop(key, None)
     else:
         cid = f"{key}|{setup['h_time']}"
-        if cid not in cards_state['used']:
-            cur = cards_state['pending'].get(key)
+        if cid not in st['used']:
+            cur = st['pending'].get(key)
             if cur and cur['h_time'] == setup['h_time'] and cur['l_time'] == setup['l_time']:
                 for k in ('stage', 'provisional', 'base', 'c_count', 'pct', 'entry_zone'):
                     cur[k] = setup[k]
             else:
                 setup.update({'key': key, 'tf': tf, 'symbol': meta['symbol'], 'name': meta.get('name'),
                               'sector': meta.get('sector'), 'tv_symbol': meta.get('tv_symbol')})
-                cards_state['pending'][key] = setup
-                _check_pending(key, meta, tf, dfc, backfill)   # 最後2根K線可能已經收盤突破
+                st['pending'][key] = setup
+                _check_pending(key, meta, tf, dfc, backfill, st)   # 最後2根K線可能已經收盤突破
         else:
-            cards_state['pending'].pop(key, None)
-    p = cards_state['pending'].get(key)
+            st['pending'].pop(key, None)
+    p = st['pending'].get(key)
     if p is not None and not df_all.empty:
         p['price'] = float(df_all['close'].values[-1])
         p['price_time'] = _iso(df_all.index[-1])
-    _check_active(key, dfc, backfill)
-    for case in cards_state['active'].values():
+    _check_active(key, dfc, backfill, st)
+    for case in st['active'].values():
         if case.get('key') == key and not df_all.empty:
             case['price'] = float(df_all['close'].values[-1])
 
@@ -3133,6 +3145,116 @@ def send_card_telegram():
         except Exception as e:
             log.warning(f"Telegram card error: {e}")
 
+# ============================================================
+# 🧪 C1跌幅門檻回測（只用來比較，不影響正式掃描）
+# 每一檔、每一種門檻，用歷史K線一步一步重播「突破卡片」的完整規則
+# （同樣的BO/SL/1:1.5/20根到期），統計訊號數、勝率、平均R。
+# ============================================================
+from bisect import bisect_right
+
+BT_CONFIGS = [
+    ('固定10%（現在）', {}),
+    ('固定7%',         {'min_drop': 7}),
+    ('固定5%',         {'min_drop': 5}),
+    ('3×ATR%',        {'atr_mult': 3}),
+    ('4×ATR%',        {'atr_mult': 4}),
+]
+BT_DEFAULT_BARS = {'1D': 500, '4H': 900, '1H': 1500}   # 回測最近幾根K線（1D 500根 ≈ 2年）
+BT_STEP = 3   # 每3根重新分析一次；中間的K線照樣逐根檢查突破/SL/TP，幾乎不會漏
+bt_state = {'status': 'idle', 'tf': None, 'done': 0, 'total': 0, 'started': None, 'finished': None,
+            'results': None, 'error': None, 'lock': threading.Lock()}
+BT_CASE_KEYS = ('symbol', 'name', 'sector', 'confirm_time', 'end_time', 'entry', 'bo', 'sl', 'c_hv', 'c_lv',
+                'result', 'r_mult', 'stage', 'vol_x', 'chase', 'provisional', 'pct', 'c_count', 'bars_held')
+
+def _bt_file(tf):
+    return os.path.join(DATA_DIR, f'backtest_c1_{tf}.json')
+
+def _bt_agg(cases):
+    n = len(cases)
+    w = sum(1 for d in cases if d['result'] == 'TP1')
+    l = sum(1 for d in cases if d['result'] == 'SL')
+    to = sum(1 for d in cases if d['result'] == 'TIMEOUT')
+    tot = sum(d['r_mult'] for d in cases)
+    return {'n': n, 'win': w, 'loss': l, 'timeout': to,
+            'winrate': round(w / (w + l) * 100, 1) if (w + l) else None,
+            'avg_r': round(tot / n, 3) if n else None, 'total_r': round(tot, 1)}
+
+def run_c1_backtest(tf='1D', bars=None, limit=None):
+    with bt_state['lock']:
+        if bt_state['status'] == 'running':
+            return
+        bt_state.update({'status': 'running', 'tf': tf, 'done': 0, 'error': None, 'results': None,
+                         'started': datetime.now(MY_TZ).strftime('%Y-%m-%d %H:%M'), 'finished': None})
+    bars = bars or BT_DEFAULT_BARS.get(tf, 500)
+    seen = set()
+    syms = [s for s in SYMBOLS if s not in seen and not seen.add(s)]
+    if limit: syms = syms[:limit]
+    bt_state['total'] = len(syms)
+    per = {name: {'cases': [], 'open': 0} for name, _ in BT_CONFIGS}
+    first_date = last_date = None
+    try:
+        for si, sym in enumerate(syms):
+            meta = {'symbol': sym, 'name': NAMES.get(sym, sym.replace('.KL', '')),
+                    'sector': SECTORS.get(sym, '其他'), 'tv_symbol': f"MYX:{sym.replace('.KL', '')}"}
+            try:
+                daily = fetch_ohlcv(sym, '1D')
+                df = daily if tf == '1D' else fetch_ohlcv(sym, tf)
+                if df.empty or len(df) < 300 or daily.empty:
+                    continue
+                daily_dates = [pd.Timestamp(x).date() for x in daily.index]
+                n = len(df)
+                start = max(260, n - bars)
+                steps = list(range(start, n, BT_STEP)) + [n]
+                d0 = str(df.index[start])[:10]; d1 = str(df.index[-1])[:10]
+                first_date = d0 if first_date is None or d0 < first_date else first_date
+                last_date = d1 if last_date is None or d1 > last_date else last_date
+                for name, cfg in BT_CONFIGS:
+                    st = {'pending': {}, 'active': {}, 'done': [], 'used': {}, 'events': []}
+                    for t in steps:
+                        d = df.iloc[:t]
+                        if tf == '1D':
+                            dd = d
+                        else:
+                            dd = daily.iloc[:bisect_right(daily_dates, pd.Timestamp(d.index[-1]).date())]
+                        res = analyze(d, dd, cfg)
+                        _card_step(meta, tf, d, d, res, backfill=True, st=st)
+                    per[name]['cases'].extend({k: c.get(k) for k in BT_CASE_KEYS} for c in st['done'])
+                    per[name]['open'] += len(st['active'])
+            except Exception as e:
+                log.warning(f"🧪 backtest {sym}: {e}")
+            bt_state['done'] = si + 1
+            time.sleep(0.2)
+
+        results = {'tf': tf, 'bars': bars, 'step': BT_STEP, 'symbols': len(syms),
+                   'period': [first_date, last_date],
+                   'finished': datetime.now(MY_TZ).strftime('%Y-%m-%d %H:%M'), 'configs': []}
+        for name, cfg in BT_CONFIGS:
+            cases = per[name]['cases']
+            s2 = [c for c in cases if c.get('stage') == 2]
+            nochase = [c for c in cases if not c.get('chase')]
+            results['configs'].append({
+                'name': name, 'cfg': cfg, 'open': per[name]['open'],
+                'all': _bt_agg(cases), 's2': _bt_agg(s2), 'nochase': _bt_agg(nochase),
+                'stocks': len({c['symbol'] for c in cases}),
+                'cases': sorted(cases, key=lambda c: c.get('confirm_time') or '', reverse=True),
+            })
+        with open(_bt_file(tf), 'w', encoding='utf-8') as f:
+            json.dump(results, f, ensure_ascii=False, default=str)
+        with bt_state['lock']:
+            bt_state.update({'status': 'done', 'results': results, 'finished': results['finished']})
+        log.info(f"🧪 C1門檻回測完成 {tf}：{len(syms)}檔")
+    except Exception as e:
+        log.error(f"🧪 backtest error: {e}")
+        with bt_state['lock']:
+            bt_state.update({'status': 'error', 'error': str(e)})
+
+def load_bt_result(tf):
+    try:
+        with open(_bt_file(tf), 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return None
+
 load_cards()
 
 app = Flask(__name__)
@@ -3181,7 +3303,7 @@ HTML = """<!DOCTYPE html>
 </style></head><body>
 <h2>&#x1F1F2;&#x1F1FE; 大馬莊家思維掃描器</h2>
 <div class="subtitle">KLSE股票 · 操盤跟莊（邏輯已對齊 莊家思維 Contraction V53）</div>
-<div class="nav"><a class="nav-on" href="/">📊 C系列總表</a><a href="/cards">🃏 突破卡片</a></div>
+<div class="nav"><a class="nav-on" href="/">📊 C系列總表</a><a href="/cards">🃏 突破卡片</a><a href="/backtest">🧪 C1門檻回測</a></div>
 SCANNING_BANNER
 <div class="ctrl-bar">
   <button class="btn btn-blue" onclick="startRefresh()" id="refreshBtn">&#x1F504; 重新掃描</button>
@@ -3528,8 +3650,8 @@ def build_cards_html(tf):
     return f'''<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>🃏 大馬突破卡片</title><style>{CARDS_CSS}</style></head><body>
 <h2>&#x1F1F2;&#x1F1FE; 大馬莊家思維 ・ 突破卡片</h2>
-<div class="subtitle">BO = 最後一個C高點×1.01（收盤確認）・ SL = 最後一個C低點−0.5% ・ 目標 1:1.5 / 1:2 ・ 至少C2、只看多頭</div>
-<div class="nav"><a href="/">📊 C系列總表</a><a class="nav-on" href="/cards?tf={tf}">🃏 突破卡片</a></div>
+<div class="subtitle">BO = 最後一個C高點+緩衝（收盤確認）・ SL = 最後一個C低點−緩衝（天圖1%、時圖0.5%）・ 目標 1:1.5 / 1:2 ・ 至少C2、只看多頭</div>
+<div class="nav"><a href="/">📊 C系列總表</a><a class="nav-on" href="/cards?tf={tf}">🃏 突破卡片</a><a href="/backtest">🧪 C1門檻回測</a></div>
 {warn}{banner}
 <div class="tfbar">{tfbar}</div>
 <div class="ctrl"><select id="sec" onchange="f()"><option value="">全部板塊</option>{sector_opts}</select>
@@ -3552,7 +3674,7 @@ def build_cards_html(tf):
 <table class="st"><tr><th>分組</th><th>條件</th><th>筆數</th><th>✅</th><th>❌</th><th>⏱</th><th>勝率</th><th>平均R</th></tr>{stats_rows}</table></div>
 
 <div class="foot">只供自己研究：數字照規則自動計算，不是投資建議；過去戰績不代表未來。「回補」= 第一次部署時回放最近{BACKFILL_BARS}根K線補抓的案例。<br>
-⏳ = 最後一個C的低點之後確認K線不到{PROVISIONAL_BARS}根 ・ 🔥 = 突破量 ≥ 20根均量{VOL_SURGE_X}倍 ・ ⚠️不追 = 確認價高於BO超過{CHASE_MAX_PCT:.0f}%，或SL距離大於{CHASE_MAX_ATR:.0f}倍ATR14</div>
+⏳ = 最後一個C的低點之後確認K線不到{PROVISIONAL_BARS}根 ・ 🔥 = 突破量 ≥ 20根均量{VOL_SURGE_X}倍 ・ ⚠️不追 = 確認價高於BO超過{CHASE_MAX_PCT:.0f}% ・ 緩衝：天圖±1%、時圖±0.5%</div>
 <script>
 function f(){{var s=document.getElementById('sec').value,q=document.getElementById('q').value.toUpperCase();
 document.querySelectorAll('.card').forEach(function(c){{var ok=(!s||c.getAttribute('data-sector')===s)&&(c.getAttribute('data-q')||'').indexOf(q)>-1;
@@ -3587,6 +3709,90 @@ def cards_json():
                         'done': len(cards_state['done']), 'seen': len(cards_state['seen'])},
         }
     return Response(json.dumps(out, indent=2, ensure_ascii=False, default=str), mimetype='application/json')
+
+@app.route('/backtest')
+def backtest_page():
+    """🧪 C1跌幅門檻回測頁面。?run=1D 開始跑（背景執行），可加 &limit=50 先試50檔"""
+    run_tf = request.args.get('run', '').upper()
+    if run_tf in TF_LABELS:
+        limit = request.args.get('limit')
+        limit = int(limit) if limit and limit.isdigit() else None
+        threading.Thread(target=run_c1_backtest, args=(run_tf, None, limit), daemon=True).start()
+        time.sleep(0.5)
+    view_tf = request.args.get('tf', run_tf if run_tf in TF_LABELS else (bt_state.get('tf') or '1D')).upper()
+    if view_tf not in TF_LABELS: view_tf = '1D'
+
+    with bt_state['lock']:
+        st = {k: v for k, v in bt_state.items() if k not in ('lock', 'results')}
+        live_res = bt_state['results'] if bt_state.get('tf') == view_tf else None
+    res = live_res or load_bt_result(view_tf)
+
+    if st['status'] == 'running':
+        pct = st['done'] / st['total'] * 100 if st['total'] else 0
+        status_html = (f'<div class="scanning-banner">⏳ 回測中（{st["tf"]}）：{st["done"]}/{st["total"]} 檔（{pct:.0f}%）・'
+                       f'開始於 {st["started"]}・全部約需20～60分鐘，頁面每30秒自動更新</div>'
+                       '<script>setTimeout(function(){location.reload()},30000)</script>')
+    elif st['status'] == 'error':
+        status_html = f'<div class="warnbox">❌ 回測出錯：{_h(st["error"])}</div>'
+    else:
+        status_html = ''
+
+    runbar = ''.join(f'<a href="/backtest?run={t}" onclick="return confirm(\'開始跑 {t} 回測？會在背景跑20～60分鐘\')">▶ 跑 {t} 回測</a>'
+                     for t in TF_LABELS)
+    tfbar = ''.join(f'<a class="{"on" if t == view_tf else ""}" href="/backtest?tf={t}">{t} 結果</a>' for t in TF_LABELS)
+
+    body = ''
+    if res:
+        def row(c, key):
+            s = c[key]
+            wr = f'{s["winrate"]:.0f}%' if s['winrate'] is not None else '-'
+            ar = f'{s["avg_r"]:+.2f}R' if s['avg_r'] is not None else '-'
+            return f'<td>{s["n"]}</td><td>{s["win"]}</td><td>{s["loss"]}</td><td>{s["timeout"]}</td><td>{wr}</td><td>{ar}</td><td>{s["total_r"]:+.1f}R</td>'
+        rows = ''
+        for c in res['configs']:
+            rows += (f'<tr><td class="g"><b>{_h(c["name"])}</b></td><td class="g">全部</td>{row(c, "all")}'
+                     f'<td>{c["stocks"]}</td><td>{c["open"]}</td></tr>')
+            rows += f'<tr><td></td><td class="g">只看日線S2</td>{row(c, "s2")}<td></td><td></td></tr>'
+            rows += f'<tr><td></td><td class="g">排除⚠️不追</td>{row(c, "nochase")}<td></td><td></td></tr>'
+        recent = ''
+        for c in res['configs']:
+            items = c['cases'][:15]
+            li = ''.join(
+                f'<div>{_fmt_time(x["confirm_time"], res["tf"])} <b>{_h(x["symbol"].replace(".KL", ""))}</b> {_h(x.get("name") or "")} '
+                f'進場{fmt_px(x["entry"])} SL{fmt_px(x["sl"])} → '
+                f'<span class="{"pos" if x["r_mult"] > 0 else "neg"}">{x["result"]} {x["r_mult"]:+.2f}R</span></div>'
+                for x in items)
+            recent += f'<details><summary>{_h(c["name"])}：最近15筆案例</summary><div class="lst">{li or "沒有案例"}</div></details>'
+        body = f'''
+<div class="desc">期間 {res["period"][0]} ～ {res["period"][1]}・{res["symbols"]}檔・每檔最近{res["bars"]}根{res["tf"]}K線・完成於 {res["finished"]}</div>
+<table class="st"><tr><th>C1門檻</th><th>範圍</th><th>筆數</th><th>✅</th><th>❌</th><th>⏱</th><th>勝率</th><th>平均R</th><th>總R</th><th>出現股票數</th><th>結尾未結束</th></tr>{rows}</table>
+<div class="sec"><h3>🔍 抽查案例</h3><div class="desc">可以挑幾筆到TradingView核對，確認回測有照規則跑。</div>{recent}</div>'''
+    else:
+        body = f'<div class="empty">{view_tf}：還沒有回測結果。按上面「▶ 跑 {view_tf} 回測」開始。</div>'
+
+    return f'''<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>🧪 C1門檻回測</title><style>{CARDS_CSS}
+details{{background:#22223a;border:1px solid #3a3a55;border-radius:6px;padding:8px 12px;margin-bottom:6px;max-width:1150px}}
+summary{{cursor:pointer;color:#ffb74d}} .lst{{font-size:12px;line-height:1.8;margin-top:6px}}</style></head><body>
+<h2>&#x1F1F2;&#x1F1FE; 大馬莊家思維 ・ C1跌幅門檻回測</h2>
+<div class="subtitle">用歷史K線重播突破卡片的完整規則（BO/SL/1:1.5/20根到期），只改C1跌幅門檻，比較哪一種比較好。正式掃描完全不受影響。</div>
+<div class="nav"><a href="/">📊 C系列總表</a><a href="/cards">🃏 突破卡片</a><a class="nav-on" href="/backtest">🧪 C1門檻回測</a></div>
+{status_html}
+<div class="tfbar">{runbar}</div>
+<div class="tfbar">{tfbar}</div>
+{body}
+<div class="foot">勝率 = ✅ ÷（✅+❌）；⏱ = 20根到期（不算勝負，但計入平均R和總R）。「總R」= 每筆都冒1R風險時累積的結果，比勝率更能看出整體賺不賺。<br>
+ATR% = 14根平均真實波幅 ÷ 收盤價；「3×ATR%」= C1跌幅要超過候選高點那根的ATR%的3倍（波動大的股票門檻自動變高）。<br>
+注意：回測沒算手續費和滑價；同一檔可能同時出現多筆；樣本少於30筆的結果參考就好。</div>
+</body></html>'''
+
+@app.route('/backtest_json')
+def backtest_json():
+    tf = request.args.get('tf', '1D').upper()
+    with bt_state['lock']:
+        st = {k: v for k, v in bt_state.items() if k not in ('lock', 'results')}
+    res = load_bt_result(tf)
+    return Response(json.dumps({'state': st, 'result': res}, ensure_ascii=False, default=str, indent=1), mimetype='application/json')
 
 @app.route('/rescan', methods=['POST'])
 def rescan():
