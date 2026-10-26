@@ -2612,8 +2612,10 @@ def analyze(df: pd.DataFrame, df_daily: pd.DataFrame) -> dict:
     ready = c_list[-1]['pct'] < 10.0 if c_list else False
     last_pct = round(c_list[-1]['pct'], 1) if c_list else None
 
+    # 突破卡片需要最後一個C的高低點（BO=C高×1.01、SL=C低−0.5%），原有欄位完全不變
     return {'stage': stage, 's1_strong': s1_strong, 'divergence': divergence, 'has_c': has_c, 'c_count': c_count,
-            'base': base, 'entry_zone': entry_zone, 'ready': ready, 'is_bear': is_bear, 'last_pct': last_pct}
+            'base': base, 'entry_zone': entry_zone, 'ready': ready, 'is_bear': is_bear, 'last_pct': last_pct,
+            'last_c': (c_list[-1] if c_list else None)}
 
 # ============================================================
 # 掃描單一股票
@@ -2638,6 +2640,12 @@ def scan_symbol(symbol):
                 continue
 
             res = analyze(df, df_daily)
+            # 🃏 突破卡片：記錄快突破/已突破/結果（獨立try，出錯也不影響原本表格）
+            if tf in CARD_TFS:
+                try:
+                    card_process_tf(result, tf, df, df_daily, res)
+                except Exception as ce:
+                    log.warning(f"🃏 card {symbol} {tf}: {ce}")
             hc        = res['has_c']
             cnt       = res['c_count']
             pct       = res.get('last_pct')
@@ -2735,18 +2743,25 @@ def run_scan():
     seen = set()
     unique_syms = [s for s in SYMBOLS if s not in seen and not seen.add(s)]
     log.info(f"🇲🇾 莊家思維 大馬掃描器 開始掃描 ({len(unique_syms)} 只)")
+    card_events.clear()
     results = []
-    for sym in unique_syms:
-        r = scan_symbol(sym)
-        results.append(r)
-        log.info(f"✅ {sym}: {{'1D': '{r.get('1D','-')}', '4H': '{r.get('4H','-')}', '1H': '{r.get('1H','-')}'}}")
-        time.sleep(0.3)
-    cached_results = results
-    with scan_state['lock']:
-        scan_state['status'] = 'done'
-        scan_state['last_scan'] = datetime.now(MY_TZ).strftime('%Y-%m-%d %H:%M:%S')
+    try:
+        for i, sym in enumerate(unique_syms):
+            r = scan_symbol(sym)
+            results.append(r)
+            log.info(f"✅ {sym}: {{'1D': '{r.get('1D','-')}', '4H': '{r.get('4H','-')}', '1H': '{r.get('1H','-')}'}}")
+            if (i + 1) % 100 == 0:
+                save_cards()
+            time.sleep(0.3)
+        cached_results = results
+    finally:
+        save_cards()
+        with scan_state['lock']:
+            scan_state['status'] = 'done'
+            scan_state['last_scan'] = datetime.now(MY_TZ).strftime('%Y-%m-%d %H:%M:%S')
     log.info(f"掃描完成！共 {len(results)} 只")
     send_telegram(results)
+    send_card_telegram()
 
 def send_telegram(results):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -2783,6 +2798,342 @@ def send_telegram(results):
             time.sleep(1)
         except Exception as e:
             log.warning(f"Telegram error: {e}")
+
+# ============================================================
+# 🃏 突破卡片引擎（BO / SL / 目標 + 已突破追蹤 + 戰績統計）
+# 規則（MH 2026-10-26 確認）：
+#   BO  = 最後一個C的高點 × 1.01，K線「收盤」站上才算突破
+#   SL  = 最後一個C的低點 − 0.5%（至少低一個Bursa跳動單位）
+#   進場 = 還沒突破用BO；已突破用確認那根K線的收盤價
+#   目標 = 進場 + 1.5R / 2R（R = 進場 − SL）
+#   快突破 = 現價離BO 5%以內；已突破追蹤到碰SL或1:1.5為止，超過20根K線記為「到期」
+#   只做多頭、至少C2（SL用C2或之後最新那個C的低點）
+# 狀態存在 DATA_DIR/cards_state.json（Railway要掛Volume到/data才會永久保存）
+# ============================================================
+import json
+
+CARD_TFS          = [t.strip() for t in os.environ.get('CARD_TFS', '1D,4H,1H').split(',') if t.strip() in TF_LABELS]
+CARD_TELEGRAM_TFS = [t.strip() for t in os.environ.get('CARD_TELEGRAM_TFS', '1D').split(',') if t.strip()]
+BO_BUFFER_PCT     = 1.0     # BO = C高 × (1 + 1%)
+SL_BUFFER_PCT     = 0.5     # SL = C低 × (1 − 0.5%)，且至少低一個跳動單位
+QUICK_BO_PCT      = 5.0     # 快突破：現價離BO ≤ 5%
+MIN_C_FOR_CARD    = 2       # 至少要有C2
+TP1_R             = 1.5
+TP2_R             = 2.0
+MAX_HOLD_BARS     = 20      # 突破後20根K線內沒碰SL也沒到1:1.5 → 記為到期
+CHASE_MAX_PCT     = 3.0     # 確認價高於BO超過3% → 標「⚠️不追」
+CHASE_MAX_ATR     = 2.0     # 或 SL距離 > 2倍ATR14 → 標「⚠️不追」
+VOL_SURGE_X       = 1.5     # 突破量 ≥ 1.5倍20根均量 → 標「🔥放量」
+PROVISIONAL_BARS  = 2       # 最後一個C低點之後確認K線少於2根 → 標⏳（跟crypto版同一個定義）
+BACKFILL_BARS     = int(os.environ.get('CARD_BACKFILL_BARS', '20'))  # 第一次看到某檔時，回放最近20根K線補抓已突破案例
+DONE_KEEP         = 5000
+
+def _resolve_data_dir():
+    d = os.environ.get('DATA_DIR') or ('/data' if os.path.isdir('/data') else
+                                       os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data'))
+    os.makedirs(d, exist_ok=True)
+    return d
+
+DATA_DIR        = _resolve_data_dir()
+CARDS_FILE      = os.path.join(DATA_DIR, 'cards_state.json')
+DATA_PERSISTENT = bool(os.environ.get('DATA_DIR')) or DATA_DIR == '/data'
+
+cards_lock  = threading.Lock()
+cards_state = {'pending': {}, 'active': {}, 'done': [], 'used': {}, 'seen': {}}
+card_events = []   # 這一輪掃描產生的新突破/結果，掃完後發Telegram
+
+def load_cards():
+    global cards_state
+    try:
+        if os.path.exists(CARDS_FILE):
+            with open(CARDS_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            for k in ('pending', 'active', 'used', 'seen'):
+                data.setdefault(k, {})
+            data.setdefault('done', [])
+            cards_state = data
+            log.info(f"🃏 已載入卡片狀態：快突破候選{len(data['pending'])} 進行中{len(data['active'])} 已結束{len(data['done'])}")
+    except Exception as e:
+        log.warning(f"🃏 載入 {CARDS_FILE} 失敗，改用空白狀態：{e}")
+
+def save_cards():
+    try:
+        with cards_lock:
+            cards_state['done'] = cards_state['done'][-DONE_KEEP:]
+            payload = json.dumps(cards_state, ensure_ascii=False, default=str)
+        tmp = CARDS_FILE + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            f.write(payload)
+        os.replace(tmp, CARDS_FILE)
+    except Exception as e:
+        log.warning(f"🃏 儲存 {CARDS_FILE} 失敗：{e}")
+
+def bursa_tick(p):
+    """Bursa Malaysia 跳動單位"""
+    if p < 1:    return 0.005
+    if p < 10:   return 0.01
+    if p < 100:  return 0.02
+    return 0.10
+
+def calc_levels(c_hv, c_lv):
+    bo = c_hv * (1 + BO_BUFFER_PCT / 100)
+    sl = min(c_lv * (1 - SL_BUFFER_PCT / 100), c_lv - bursa_tick(c_lv))
+    return bo, sl
+
+def calc_targets(entry, sl):
+    r = entry - sl
+    return entry + TP1_R * r, entry + TP2_R * r
+
+def fmt_px(p):
+    if p is None: return '-'
+    return f'{p:.3f}' if p < 10 else f'{p:.2f}'
+
+def _iso(t):
+    return pd.Timestamp(t).isoformat()
+
+def _to_ts_like(iso, index):
+    ts = pd.Timestamp(iso)
+    tz = getattr(index, 'tz', None)
+    if tz is not None and ts.tzinfo is None:
+        ts = ts.tz_localize(tz)
+    elif tz is None and ts.tzinfo is not None:
+        ts = ts.tz_convert(None)
+    return ts
+
+def _positions_after(df, iso):
+    """回傳df裡時間晚於iso的K線位置（list of int）"""
+    if df.empty: return []
+    ts = _to_ts_like(iso, df.index)
+    mask = df.index > ts
+    return [int(i) for i in np.nonzero(np.asarray(mask))[0]]
+
+def closed_bars(df, tf, now=None):
+    """去掉還沒收盤的K線（只檢查最後3根，前面的一定已收盤）。
+    1D：當天17:05後才算收盤；4H/1H：K線開始時間+長度 ≤ 現在，或是之前的交易日。"""
+    if df.empty: return df
+    now = now or datetime.now(MY_TZ)
+    n = len(df)
+    keep = n
+    for i in range(n - 1, max(-1, n - 4), -1):
+        ts = pd.Timestamp(df.index[i])
+        ts = ts.tz_localize(MY_TZ) if ts.tzinfo is None else ts.tz_convert(MY_TZ)
+        if ts.date() < now.date():
+            break
+        if tf == '1D':
+            close_t = ts.normalize() + timedelta(hours=17, minutes=5)
+        else:
+            close_t = ts + (timedelta(hours=4) if tf == '4H' else timedelta(hours=1))
+        if close_t <= now:
+            break
+        keep = i
+    return df.iloc[:keep]
+
+def _atr14(df, i):
+    if i < 15: return None
+    h = df['high'].values[i-14:i+1]; l = df['low'].values[i-14:i+1]; pc = df['close'].values[i-15:i]
+    tr = np.maximum(h - l, np.maximum(np.abs(h - pc), np.abs(l - pc)))
+    return float(np.mean(tr))
+
+def _vol_ratio(df, i):
+    if 'volume' not in df.columns or i < 20: return None
+    v = df['volume'].values
+    avg = float(np.mean(v[i-20:i]))
+    return round(float(v[i]) / avg, 2) if avg > 0 else None
+
+def _setup_from_analysis(df, res):
+    """把analyze()結果轉成一個「等待突破」的卡片設定；不符合條件回傳None"""
+    if not res.get('has_c') or res.get('is_bear'): return None
+    if res.get('c_count', 0) < MIN_C_FOR_CARD: return None
+    lc = res.get('last_c')
+    if not lc: return None
+    n = len(df)
+    hb, lb = int(lc['hb']), int(lc['lb'])
+    bo, sl = calc_levels(float(lc['hv']), float(lc['lv']))
+    if bo <= sl: return None
+    return {
+        'c_hv': float(lc['hv']), 'c_lv': float(lc['lv']),
+        'h_time': _iso(df.index[hb]), 'l_time': _iso(df.index[lb]),
+        'bo': bo, 'sl': sl,
+        'c_count': int(res.get('c_count', 0)), 'base': int(res.get('base', 0)),
+        'pct': res.get('last_pct'), 'stage': int(res.get('stage', 0)),
+        'entry_zone': res.get('entry_zone', ''),
+        'provisional': ((n - 3) - lb) < PROVISIONAL_BARS,
+        # analyze保證lb~n-3之間沒有K線高過C高、也沒有低過C低，所以只要從n-3之後開始檢查
+        'last_checked': _iso(df.index[max(lb, n - 3)]),
+    }
+
+def _open_case(key, meta, tf, p, dfc, i, backfill):
+    entry = float(dfc['close'].values[i])
+    sl = p['sl']
+    r = entry - sl
+    if r <= 0: return
+    tp1, tp2 = calc_targets(entry, sl)
+    atr = _atr14(dfc, i)
+    chase = entry > p['bo'] * (1 + CHASE_MAX_PCT / 100) or (atr is not None and r > CHASE_MAX_ATR * atr)
+    cid = f"{key}|{p['h_time']}"
+    case = dict(p)
+    case.update({
+        'id': cid, 'key': key, 'tf': tf,
+        'symbol': meta['symbol'], 'name': meta.get('name'), 'sector': meta.get('sector'), 'tv_symbol': meta.get('tv_symbol'),
+        'entry': entry, 'tp1': tp1, 'tp2': tp2,
+        'confirm_time': _iso(dfc.index[i]), 'last_checked': _iso(dfc.index[i]),
+        'bars_held': 0, 'last_close': entry, 'vol_x': _vol_ratio(dfc, i),
+        'atr': atr, 'chase': bool(chase), 'backfill': bool(backfill),
+    })
+    cards_state['active'][cid] = case
+    cards_state['used'][cid] = case['confirm_time']
+    if not backfill:
+        card_events.append(('open', case))
+
+def _check_pending(key, meta, tf, dfc, backfill):
+    p = cards_state['pending'].get(key)
+    if not p: return
+    pos = _positions_after(dfc, p['last_checked'])
+    closes = dfc['close'].values; lows = dfc['low'].values
+    for i in pos:
+        if closes[i] >= p['bo']:
+            cards_state['pending'].pop(key, None)
+            _open_case(key, meta, tf, p, dfc, i, backfill)
+            return
+        if lows[i] <= p['sl']:          # 還沒突破就先跌破SL → 這個形態作廢
+            cards_state['pending'].pop(key, None)
+            return
+    if pos:
+        p['last_checked'] = _iso(dfc.index[pos[-1]])
+
+def _finish(case, result, r_mult, t, backfill):
+    case.update({'result': result, 'r_mult': round(float(r_mult), 2), 'end_time': _iso(t)})
+    cards_state['active'].pop(case['id'], None)
+    cards_state['done'].append(case)
+    if not backfill and not case.get('backfill'):
+        card_events.append(('close', case))
+
+def _check_active(key, dfc, backfill):
+    highs = dfc['high'].values; lows = dfc['low'].values; closes = dfc['close'].values
+    for cid, case in list(cards_state['active'].items()):
+        if case.get('key') != key: continue
+        r = case['entry'] - case['sl']
+        for i in _positions_after(dfc, case['last_checked']):
+            case['bars_held'] += 1
+            t = dfc.index[i]
+            if lows[i] <= case['sl']:                       # 同一根同時碰SL和TP1 → 保守算SL
+                _finish(case, 'SL', -1.0, t, backfill); break
+            if highs[i] >= case['tp1']:
+                _finish(case, 'TP1', TP1_R, t, backfill); break
+            case['last_checked'] = _iso(t)
+            case['last_close'] = float(closes[i])
+            if case['bars_held'] >= MAX_HOLD_BARS:
+                _finish(case, 'TIMEOUT', (closes[i] - case['entry']) / r, t, backfill); break
+
+def _card_step(meta, tf, df_all, dfc, res, backfill=False):
+    """一次更新：1)檢查等待中的形態有沒有收盤突破 2)用最新分析更新等待中的形態 3)檢查進行中案例"""
+    key = f"{meta['symbol']}|{tf}"
+    _check_pending(key, meta, tf, dfc, backfill)
+    setup = _setup_from_analysis(df_all, res)
+    if setup is None:
+        cards_state['pending'].pop(key, None)
+    else:
+        cid = f"{key}|{setup['h_time']}"
+        if cid not in cards_state['used']:
+            cur = cards_state['pending'].get(key)
+            if cur and cur['h_time'] == setup['h_time'] and cur['l_time'] == setup['l_time']:
+                for k in ('stage', 'provisional', 'base', 'c_count', 'pct', 'entry_zone'):
+                    cur[k] = setup[k]
+            else:
+                setup.update({'key': key, 'tf': tf, 'symbol': meta['symbol'], 'name': meta.get('name'),
+                              'sector': meta.get('sector'), 'tv_symbol': meta.get('tv_symbol')})
+                cards_state['pending'][key] = setup
+                _check_pending(key, meta, tf, dfc, backfill)   # 最後2根K線可能已經收盤突破
+        else:
+            cards_state['pending'].pop(key, None)
+    p = cards_state['pending'].get(key)
+    if p is not None and not df_all.empty:
+        p['price'] = float(df_all['close'].values[-1])
+        p['price_time'] = _iso(df_all.index[-1])
+    _check_active(key, dfc, backfill)
+    for case in cards_state['active'].values():
+        if case.get('key') == key and not df_all.empty:
+            case['price'] = float(df_all['close'].values[-1])
+
+def card_process_tf(meta, tf, df, df_daily, res):
+    """scan_symbol()每個時間框架分析完後呼叫"""
+    dfc = closed_bars(df, tf)
+    if len(dfc) < 60: return
+    key = f"{meta['symbol']}|{tf}"
+    with cards_lock:
+        if key not in cards_state['seen'] and BACKFILL_BARS > 0:
+            # 第一次看到：回放最近N根已收盤K線，把最近已經突破、還在進行中的案例補抓回來
+            for k in range(BACKFILL_BARS, 0, -1):
+                dfk = dfc.iloc[:len(dfc) - k]
+                if len(dfk) < 60: continue
+                dd = dfk if tf == '1D' else df_daily
+                try:
+                    rk = analyze(dfk, dd)
+                    _card_step(meta, tf, dfk, dfk, rk, backfill=True)
+                except Exception as e:
+                    log.warning(f"🃏 backfill {key} k={k}: {e}")
+        cards_state['seen'][key] = datetime.now(MY_TZ).isoformat()
+        _card_step(meta, tf, df, dfc, res, backfill=False)
+
+def compute_card_stats(tf=None):
+    with cards_lock:
+        rows = [d for d in cards_state['done'] if tf is None or d.get('tf') == tf]
+    def agg(sub):
+        n = len(sub)
+        w = sum(1 for d in sub if d['result'] == 'TP1')
+        l = sum(1 for d in sub if d['result'] == 'SL')
+        to = sum(1 for d in sub if d['result'] == 'TIMEOUT')
+        wr = (w / (w + l) * 100) if (w + l) else None
+        avg = (sum(d['r_mult'] for d in sub) / n) if n else None
+        return {'n': n, 'win': w, 'loss': l, 'timeout': to, 'winrate': wr, 'avg_r': avg}
+    groups = [
+        ('全部', [('全部', lambda d: True)]),
+        ('日線Stage', [('S2', lambda d: d.get('stage') == 2), ('非S2', lambda d: d.get('stage') != 2)]),
+        ('追高', [('可追', lambda d: not d.get('chase')), ('⚠️不追', lambda d: d.get('chase'))]),
+        ('突破量', [(f'🔥≥{VOL_SURGE_X}x', lambda d: (d.get('vol_x') or 0) >= VOL_SURGE_X),
+                    (f'<{VOL_SURGE_X}x', lambda d: (d.get('vol_x') or 0) < VOL_SURGE_X)]),
+        ('⏳', [('無⏳', lambda d: not d.get('provisional')), ('有⏳', lambda d: d.get('provisional'))]),
+        ('Base', [('第1個base', lambda d: d.get('base', 0) == 0), ('第2個base以上', lambda d: d.get('base', 0) > 0)]),
+    ]
+    out = []
+    for gname, items in groups:
+        for label, fn in items:
+            out.append((gname, label, agg([d for d in rows if fn(d)])))
+    return out
+
+def send_card_telegram():
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID or not card_events:
+        return
+    lines = []
+    for kind, c in card_events:
+        if c.get('tf') not in CARD_TELEGRAM_TFS: continue
+        code = c['symbol'].replace('.KL', '')
+        head = f"{c.get('name') or code}({code}) {c['tf']}"
+        if kind == 'open':
+            tags = [f"S{c.get('stage')}" if c.get('stage') else 'S?']
+            if c.get('vol_x') is not None: tags.append(f"量{c['vol_x']}x" + ('🔥' if c['vol_x'] >= VOL_SURGE_X else ''))
+            if c.get('provisional'): tags.append('⏳')
+            if c.get('chase'): tags.append('⚠️不追')
+            lines.append(f"🚀 突破 {head}\n  確認價{fmt_px(c['entry'])} BO{fmt_px(c['bo'])} SL{fmt_px(c['sl'])} "
+                         f"1:1.5={fmt_px(c['tp1'])} 1:2={fmt_px(c['tp2'])}\n  {' '.join(tags)}")
+        else:
+            icon = {'TP1': '✅ 達1:1.5', 'SL': '❌ 止損', 'TIMEOUT': '⏱ 20根到期'}.get(c['result'], c['result'])
+            lines.append(f"{icon} {head} R={c['r_mult']:+.2f}")
+    if not lines:
+        return
+    now = datetime.now(MY_TZ).strftime('%Y-%m-%d %H:%M')
+    batches = [lines[i:i+15] for i in range(0, len(lines), 15)]
+    for i, batch in enumerate(batches):
+        part = f" ({i+1}/{len(batches)})" if len(batches) > 1 else ""
+        msg = f"🃏 大馬突破卡片{part}\n{now}\n{'─'*20}\n" + "\n".join(batch)
+        try:
+            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                          json={'chat_id': TELEGRAM_CHAT_ID, 'text': msg}, timeout=10)
+            time.sleep(1)
+        except Exception as e:
+            log.warning(f"Telegram card error: {e}")
+
+load_cards()
 
 app = Flask(__name__)
 
@@ -2823,9 +3174,14 @@ HTML = """<!DOCTYPE html>
   .search-box{padding:8px 14px;font-size:14px;border-radius:6px;border:1px solid #444;background:#2a2a3e;color:#fff;font-family:monospace;width:180px}
   .scanning-banner{background:#1565c0;color:#fff;padding:12px 20px;border-radius:6px;margin-bottom:15px;font-size:15px;font-weight:bold}
   .chk-label{color:#aaa;font-size:13px;display:flex;align-items:center;gap:4px;cursor:pointer}
+  .nav{display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap}
+  .nav a{color:#aaa;text-decoration:none;padding:7px 14px;border:1px solid #444;border-radius:6px;font-size:13px}
+  .nav a:hover{color:#fff;border-color:#7ab3ff}
+  .nav a.nav-on{color:#fff;background:#1565c0;border-color:#1565c0}
 </style></head><body>
 <h2>&#x1F1F2;&#x1F1FE; 大馬莊家思維掃描器</h2>
 <div class="subtitle">KLSE股票 · 操盤跟莊（邏輯已對齊 莊家思維 Contraction V53）</div>
+<div class="nav"><a class="nav-on" href="/">📊 C系列總表</a><a href="/cards">🃏 突破卡片</a></div>
 SCANNING_BANNER
 <div class="ctrl-bar">
   <button class="btn btn-blue" onclick="startRefresh()" id="refreshBtn">&#x1F504; 重新掃描</button>
@@ -2928,6 +3284,7 @@ function pollStatus() {
     else { setTimeout(pollStatus, 5000); }
   });
 }
+AUTOPOLL
 </script>
 </body></html>"""
 
@@ -2968,11 +3325,14 @@ def build_html(status='done'):
     scanning_banner = '<div class="scanning-banner">⏳ 掃描中，請稍候...（約需10分鐘）</div>' if status == 'scanning' else ''
     sector_opts = ''.join(f'<option value="{s}">{s}</option>' for s in sorted(set(SECTORS.values())))
 
+    # 掃描中打開頁面時自動輪詢，掃完自動刷新（之前要手動重新整理）
+    autopoll = 'pollStatus();' if status == 'scanning' else ''
     return (HTML
         .replace('SCANNING_BANNER', scanning_banner)
         .replace('SECTOR_OPTIONS', sector_opts)
         .replace('LAST_SCAN', last)
         .replace('TOTAL', str(total))
+        .replace('AUTOPOLL', autopoll)
         .replace('ROWS', rows))
 
 @app.route('/')
@@ -2993,6 +3353,240 @@ def index():
     except Exception as e:
         log.error(f"build_html error: {e}")
         return f"<html><body style='background:#1a1a2e;color:#eee;font-family:monospace;padding:40px'><h2>🇲🇾 大馬莊家思維掃描器</h2><p>⏳ 掃描中，請稍候...</p><p style='color:#8b949e'>Error: {e}</p></body></html>", 200
+
+# ============================================================
+# 🃏 突破卡片頁面 /cards?tf=1D
+# ============================================================
+CARDS_CSS = """
+body{font-family:monospace;background:#1a1a2e;color:#eee;margin:20px}
+h2{color:#fff;margin-bottom:4px} .subtitle{color:#aaa;font-size:13px;margin-bottom:12px}
+.nav{display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap}
+.nav a{color:#aaa;text-decoration:none;padding:7px 14px;border:1px solid #444;border-radius:6px;font-size:13px}
+.nav a:hover{color:#fff;border-color:#7ab3ff} .nav a.nav-on{color:#fff;background:#1565c0;border-color:#1565c0}
+.tfbar{display:flex;gap:6px;margin:6px 0 14px;flex-wrap:wrap}
+.tfbar a{color:#ccc;text-decoration:none;padding:7px 16px;border-radius:18px;border:1px solid #444;font-size:13px}
+.tfbar a.on{background:#e65100;border-color:#e65100;color:#fff;font-weight:bold}
+.ctrl{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px}
+select,.search-box{background:#2a2a3e;color:#fff;border:1px solid #444;padding:8px 12px;border-radius:6px;font-size:13px;font-family:monospace}
+.search-box{width:200px}
+.sec{margin-top:26px} .sec h3{margin:0 0 4px;color:#ffb74d;font-size:16px}
+.sec .desc{color:#8b949e;font-size:12px;margin-bottom:10px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:12px;max-width:1150px}
+.card{background:#22223a;border:1px solid #3a3a55;border-left:3px solid #7ab3ff;border-radius:8px;padding:12px 14px}
+.card.pend{border-left-color:#ffb74d}
+.card.res-TP1{border-left-color:#43a047} .card.res-SL{border-left-color:#e53935} .card.res-TIMEOUT{border-left-color:#888}
+.hd{display:flex;align-items:baseline;gap:8px}
+.hd a{color:#fff;text-decoration:none;font-size:19px;font-weight:bold} .hd a:hover{color:#7ab3ff}
+.hd .nm{color:#aaa;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+.hd .dt{color:#aaa;font-size:12px}
+.dist{background:#5a3a00;color:#ffb74d;padding:2px 8px;border-radius:10px;font-size:12px;font-weight:bold;white-space:nowrap}
+.dist.over{background:#1b5e20;color:#a5d6a7}
+.tags{margin:7px 0;display:flex;gap:5px;flex-wrap:wrap}
+.tag{border:1px solid #444;color:#bbb;font-size:11px;padding:1px 6px;border-radius:4px}
+.tag.s2{border-color:#1565c0;color:#7ab3ff} .tag.sx{border-color:#c62828;color:#ff8a8a}
+.tag.warn{border-color:#e65100;color:#ffb74d} .tag.hot{border-color:#2e7d32;color:#a5d6a7}
+.line{font-size:12px;color:#ddd;display:flex;justify-content:space-between;margin-bottom:6px}
+.line .muted{color:#8b949e}
+.pxrow{display:flex;justify-content:space-between;border-top:1px solid #333;padding-top:7px;margin-top:4px}
+.lbl{color:#8b949e;font-size:11px} .big{font-size:18px;font-weight:bold;color:#fff} .r{text-align:right}
+.lv{border-top:1px solid #333;margin-top:7px;padding-top:6px;font-size:12px}
+.lv div{display:flex;justify-content:space-between;padding:1px 0}
+.neg{color:#ff6b6b} .pos{color:#9ccc65}
+.empty{background:#22223a;border:1px solid #3a3a55;border-radius:8px;padding:14px;color:#aaa;max-width:1150px}
+table.st{border-collapse:collapse;font-size:12px}
+table.st th,table.st td{border:1px solid #444;padding:5px 10px;text-align:center}
+table.st th{background:#333;color:#fff} table.st td.g{color:#8b949e;text-align:left}
+.warnbox{background:#5a3a00;color:#ffb74d;padding:10px 14px;border-radius:6px;font-size:13px;margin-bottom:12px;max-width:1150px}
+.scanning-banner{background:#1565c0;color:#fff;padding:10px 16px;border-radius:6px;margin-bottom:12px;font-size:14px;font-weight:bold;max-width:1150px}
+.foot{color:#666;font-size:11px;margin-top:28px;max-width:1150px;line-height:1.6}
+"""
+
+def _h(s):
+    return (str(s) if s is not None else '').replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;')
+
+def _pct(a, b):
+    return (a - b) / b * 100 if b else 0.0
+
+def _fmt_time(iso, tf):
+    try:
+        t = pd.Timestamp(iso)
+        return t.strftime('%m/%d') if tf == '1D' else t.strftime('%m/%d %H:%M')
+    except Exception:
+        return str(iso)[:10]
+
+def _card_tags(c, tf, extra=None):
+    tags = [f'<span class="tag">{_h(c.get("sector") or "其他")}</span>', f'<span class="tag">{tf}</span>']
+    s = c.get('stage', 0)
+    tags.append(f'<span class="tag {"s2" if s == 2 else "sx"}">日線S{s if s else "?"}</span>')
+    if c.get('entry_zone'): tags.append(f'<span class="tag">{_h(c["entry_zone"])}</span>')
+    if c.get('provisional'): tags.append('<span class="tag warn">⏳ 低點未確認</span>')
+    if c.get('vol_x') is not None:
+        hot = c['vol_x'] >= VOL_SURGE_X
+        tags.append(f'<span class="tag {"hot" if hot else ""}">{"🔥" if hot else ""}量{c["vol_x"]}x</span>')
+    if c.get('chase'): tags.append('<span class="tag warn">⚠️不追</span>')
+    if extra: tags.extend(extra)
+    return '<div class="tags">' + ''.join(tags) + '</div>'
+
+def _search_attr(c):
+    code = c['symbol'].replace('.KL', '')
+    return f'data-sector="{_h(c.get("sector") or "其他")}" data-q="{_h((code + " " + (c.get("name") or "")).upper())}"'
+
+def _tv_url(c, tf):
+    tv = c.get('tv_symbol') or f"MYX:{c['symbol'].replace('.KL', '')}"
+    return f"{tv_chart_base()}?symbol={tv}&interval={TV_INTERVAL.get(tf, 'D')}"
+
+def _render_pending(c, tf):
+    code = c['symbol'].replace('.KL', '')
+    price = c.get('price') or 0
+    bo, sl = c['bo'], c['sl']
+    tp1, tp2 = calc_targets(bo, sl)
+    dist = _pct(bo, price) if price else None
+    if dist is None:      dist_html = ''
+    elif dist <= 0:       dist_html = '<span class="dist over">盤中已過BO・等收盤</span>'
+    else:                 dist_html = f'<span class="dist">差 {dist:.1f}%</span>'
+    return f'''<div class="card pend" {_search_attr(c)}>
+<div class="hd"><a href="{_tv_url(c, tf)}" target="_blank">{code}</a><span class="nm">{_h(c.get("name"))}</span>{dist_html}</div>
+{_card_tags(c, tf)}
+<div class="line"><span>第 {c.get("base", 0) + 1} 個 base ・ 收縮 {c.get("c_count")} 段</span><span class="muted">還沒突破</span></div>
+<div class="pxrow"><div><div class="lbl">現價</div><div class="big">{fmt_px(price)}</div></div>
+<div class="r"><div class="lbl">BO</div><div class="big">{fmt_px(bo)}</div><div class="lbl">C高點 {fmt_px(c["c_hv"])}・收盤站上才算突破</div></div></div>
+<div class="lv"><div><span>SL</span><span>{fmt_px(sl)} <span class="neg">({_pct(sl, bo):.1f}%)</span></span></div>
+<div><span>1:1.5</span><span>{fmt_px(tp1)} <span class="pos">(+{_pct(tp1, bo):.1f}%)</span></span></div>
+<div><span>1:2</span><span>{fmt_px(tp2)} <span class="pos">(+{_pct(tp2, bo):.1f}%)</span></span></div></div>
+</div>'''
+
+def _render_active(c, tf):
+    code = c['symbol'].replace('.KL', '')
+    entry, sl = c['entry'], c['sl']
+    r = entry - sl
+    price = c.get('price') or c.get('last_close') or entry
+    cur_r = (price - entry) / r if r else 0
+    extra = [f'<span class="tag">已過 {c.get("bars_held", 0)}/{MAX_HOLD_BARS} 根</span>']
+    if c.get('backfill'): extra.append('<span class="tag">回補</span>')
+    return f'''<div class="card" {_search_attr(c)}>
+<div class="hd"><a href="{_tv_url(c, tf)}" target="_blank">{code}</a><span class="nm">{_h(c.get("name"))}</span><span class="dt">{_fmt_time(c["confirm_time"], tf)}</span></div>
+{_card_tags(c, tf, extra)}
+<div class="line"><span>第 {c.get("base", 0) + 1} 個 base ・ 收縮 {c.get("c_count")} 段</span><span class="muted">{_fmt_time(c["confirm_time"], tf)} 收盤確認</span></div>
+<div class="pxrow"><div><div class="lbl">確認價（進場）</div><div class="big">{fmt_px(entry)}</div><div class="lbl">現價 {fmt_px(price)}（{cur_r:+.2f}R）</div></div>
+<div class="r"><div class="lbl">BO</div><div class="big">{fmt_px(c["bo"])}</div><div class="lbl">C高點 {fmt_px(c["c_hv"])}</div></div></div>
+<div class="lv"><div><span>SL</span><span>{fmt_px(sl)} <span class="neg">({_pct(sl, entry):.1f}%)</span></span></div>
+<div><span>1:1.5</span><span>{fmt_px(c["tp1"])} <span class="pos">(+{_pct(c["tp1"], entry):.1f}%)</span></span></div>
+<div><span>1:2</span><span>{fmt_px(c["tp2"])} <span class="pos">(+{_pct(c["tp2"], entry):.1f}%)</span></span></div></div>
+</div>'''
+
+def _render_done(c, tf):
+    code = c['symbol'].replace('.KL', '')
+    label = {'TP1': '✅ 達1:1.5', 'SL': '❌ 止損', 'TIMEOUT': '⏱ 20根到期'}.get(c['result'], c['result'])
+    cls = 'pos' if c['r_mult'] > 0 else 'neg'
+    return f'''<div class="card res-{c["result"]}" {_search_attr(c)}>
+<div class="hd"><a href="{_tv_url(c, tf)}" target="_blank">{code}</a><span class="nm">{_h(c.get("name"))}</span><span class="dt">{label}</span></div>
+{_card_tags(c, tf)}
+<div class="line"><span>{_fmt_time(c["confirm_time"], tf)} 進場 {fmt_px(c["entry"])} → {_fmt_time(c.get("end_time"), tf)}</span><span class="{cls}">{c["r_mult"]:+.2f}R</span></div>
+</div>'''
+
+def build_cards_html(tf):
+    with cards_lock:
+        pend = [dict(p) for p in cards_state['pending'].values() if p.get('tf') == tf]
+        act  = [dict(a) for a in cards_state['active'].values() if a.get('tf') == tf]
+        done = [dict(d) for d in cards_state['done'] if d.get('tf') == tf]
+    quick = []
+    for p in pend:
+        price = p.get('price')
+        if not price: continue
+        d = _pct(p['bo'], price)
+        if d <= QUICK_BO_PCT:
+            quick.append((d, p))
+    quick.sort(key=lambda x: x[0])
+    act.sort(key=lambda a: a['confirm_time'], reverse=True)
+    recent = sorted(done, key=lambda d: d.get('end_time', ''), reverse=True)[:24]
+
+    with scan_state['lock']:
+        status = scan_state['status']
+        last = scan_state.get('last_scan') or '-'
+
+    tfbar = ''.join(f'<a class="{"on" if t == tf else ""}" href="/cards?tf={t}">{t}</a>' for t in CARD_TFS)
+    sector_opts = ''.join(f'<option value="{_h(s)}">{_h(s)}</option>' for s in sorted(set(SECTORS.values())))
+
+    def grid(items, render, empty_msg):
+        if not items:
+            return f'<div class="empty">{empty_msg}</div>'
+        return '<div class="grid">' + ''.join(render(x, tf) for x in items) + '</div>'
+
+    stats_rows = ''
+    for gname, label, s in compute_card_stats(tf):
+        wr = f'{s["winrate"]:.0f}%' if s['winrate'] is not None else '-'
+        ar = f'{s["avg_r"]:+.2f}R' if s['avg_r'] is not None else '-'
+        stats_rows += (f'<tr><td class="g">{gname}</td><td class="g">{label}</td><td>{s["n"]}</td>'
+                       f'<td>{s["win"]}</td><td>{s["loss"]}</td><td>{s["timeout"]}</td><td>{wr}</td><td>{ar}</td></tr>')
+
+    warn = '' if DATA_PERSISTENT else ('<div class="warnbox">⚠️ 目前沒有掛載Railway Volume（/data），重新部署後戰績紀錄會清空。'
+                                       '請在Railway替這個服務加一個Volume，Mount Path填 /data。</div>')
+    banner = '<div class="scanning-banner">⏳ 掃描中，資料會在掃完後自動更新...</div>' if status == 'scanning' else ''
+    autopoll = ('<script>(function p(){fetch("/status").then(r=>r.json()).then(d=>{if(d.status==="done")location.reload();'
+                'else setTimeout(p,8000)}).catch(()=>setTimeout(p,15000))})();</script>') if status == 'scanning' else ''
+
+    return f'''<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>🃏 大馬突破卡片</title><style>{CARDS_CSS}</style></head><body>
+<h2>&#x1F1F2;&#x1F1FE; 大馬莊家思維 ・ 突破卡片</h2>
+<div class="subtitle">BO = 最後一個C高點×1.01（收盤確認）・ SL = 最後一個C低點−0.5% ・ 目標 1:1.5 / 1:2 ・ 至少C2、只看多頭</div>
+<div class="nav"><a href="/">📊 C系列總表</a><a class="nav-on" href="/cards?tf={tf}">🃏 突破卡片</a></div>
+{warn}{banner}
+<div class="tfbar">{tfbar}</div>
+<div class="ctrl"><select id="sec" onchange="f()"><option value="">全部板塊</option>{sector_opts}</select>
+<input class="search-box" id="q" placeholder="搜尋代碼或名稱..." oninput="f()"></div>
+<div style="color:#8b949e;font-size:12px">更新：{last}</div>
+
+<div class="sec"><h3>📈 快突破（{len(quick)}）</h3>
+<div class="desc">還沒收盤站上BO、現價離BO {QUICK_BO_PCT:.0f}% 以內的觀察名單。目標用BO當進場價計算。</div>
+{grid([p for _, p in quick], _render_pending, f"{tf}：目前沒有快突破的。")}</div>
+
+<div class="sec"><h3>🚀 已突破、進行中（{len(act)}）</h3>
+<div class="desc">已經收盤站上BO、還沒碰到SL或1:1.5的案例；碰到其中一個、或超過{MAX_HOLD_BARS}根K線就移到「最近結束」。目標用確認收盤價計算。</div>
+{grid(act, _render_active, f"{tf}：目前沒有進行中的突破。")}</div>
+
+<div class="sec"><h3>🏁 最近結束（{len(recent)}）</h3>
+{grid(recent, _render_done, f"{tf}：還沒有結束的案例。")}</div>
+
+<div class="sec"><h3>📊 戰績統計（{tf}・共{len(done)}筆）</h3>
+<div class="desc">勝率 = 達1:1.5 ÷（達1:1.5 + 止損），到期的不算勝負但計入平均R。樣本少於30筆時參考就好。</div>
+<table class="st"><tr><th>分組</th><th>條件</th><th>筆數</th><th>✅</th><th>❌</th><th>⏱</th><th>勝率</th><th>平均R</th></tr>{stats_rows}</table></div>
+
+<div class="foot">只供自己研究：數字照規則自動計算，不是投資建議；過去戰績不代表未來。「回補」= 第一次部署時回放最近{BACKFILL_BARS}根K線補抓的案例。<br>
+⏳ = 最後一個C的低點之後確認K線不到{PROVISIONAL_BARS}根 ・ 🔥 = 突破量 ≥ 20根均量{VOL_SURGE_X}倍 ・ ⚠️不追 = 確認價高於BO超過{CHASE_MAX_PCT:.0f}%，或SL距離大於{CHASE_MAX_ATR:.0f}倍ATR14</div>
+<script>
+function f(){{var s=document.getElementById('sec').value,q=document.getElementById('q').value.toUpperCase();
+document.querySelectorAll('.card').forEach(function(c){{var ok=(!s||c.getAttribute('data-sector')===s)&&(c.getAttribute('data-q')||'').indexOf(q)>-1;
+c.style.display=ok?'':'none';}});}}
+</script>{autopoll}
+</body></html>'''
+
+@app.route('/cards')
+def cards_page():
+    tf = request.args.get('tf', CARD_TFS[0] if CARD_TFS else '1D').upper()
+    if tf not in CARD_TFS:
+        tf = CARD_TFS[0] if CARD_TFS else '1D'
+    try:
+        return build_cards_html(tf)
+    except Exception as e:
+        log.error(f"build_cards_html error: {e}")
+        return f"<html><body style='background:#1a1a2e;color:#eee;font-family:monospace;padding:40px'>🃏 卡片頁錯誤：{_h(e)}</body></html>", 200
+
+@app.route('/cards_json')
+def cards_json():
+    """診斷用：看卡片原始資料。?symbol=0024 可只看某一檔"""
+    sym = request.args.get('symbol', '').upper()
+    with cards_lock:
+        def match(k):
+            return (not sym) or k.startswith(sym if sym.endswith('.KL') else sym + '.KL')
+        out = {
+            'data_dir': DATA_DIR, 'persistent': DATA_PERSISTENT,
+            'pending': {k: v for k, v in cards_state['pending'].items() if match(k)},
+            'active':  {k: v for k, v in cards_state['active'].items() if match(k)},
+            'done':    [d for d in cards_state['done'] if match(d.get('key', ''))][-200:],
+            'counts':  {'pending': len(cards_state['pending']), 'active': len(cards_state['active']),
+                        'done': len(cards_state['done']), 'seen': len(cards_state['seen'])},
+        }
+    return Response(json.dumps(out, indent=2, ensure_ascii=False, default=str), mimetype='application/json')
 
 @app.route('/rescan', methods=['POST'])
 def rescan():
@@ -3198,10 +3792,16 @@ def debug_c():
     return Response(_json.dumps(out, indent=2, ensure_ascii=False, default=str), mimetype='application/json')
 
 def scheduler():
+    last_post_close = None
     while True:
+        now = datetime.now(MY_TZ)
         if is_market_hours():
             run_scan()
             time.sleep(3600)
+        elif now.weekday() < 5 and (now.hour, now.minute) >= (17, 40) and now.hour < 19 and last_post_close != now.date():
+            # 收盤後補掃一次：17:00收盤後的日線/最後一根1H才會被確認，突破卡片才能當天記錄
+            last_post_close = now.date()
+            run_scan()
         else:
             time.sleep(300)
 
