@@ -2645,6 +2645,8 @@ def scan_symbol(symbol):
 
     df_daily = fetch_ohlcv(symbol, '1D')
     raw_1h = _fetch_1h_raw(symbol)  # 4H/1H共用同一份原始資料，只下載一次
+    if not df_daily.empty:
+        wy_process_symbol(result, df_daily)   # 🧱 威科夫：用同一份日線，不多抓資料
 
     for tf in TF_LABELS:
         try:
@@ -2759,6 +2761,7 @@ def run_scan():
     unique_syms = [s for s in SYMBOLS if s not in seen and not seen.add(s)]
     log.info(f"🇲🇾 莊家思維 大馬掃描器 開始掃描 ({len(unique_syms)} 只)")
     card_events.clear()
+    wy_scan_begin()
     results = []
     try:
         for i, sym in enumerate(unique_syms):
@@ -2769,8 +2772,15 @@ def run_scan():
                 save_cards()
             time.sleep(0.3)
         cached_results = results
+        try:
+            wy_scan_finish()
+        except Exception as e:
+            log.warning(f"🧱 威科夫整理失敗：{e}")
     finally:
         save_cards()
+        with WY_LOCK:
+            if WY_STATE['status'] == 'running':
+                WY_STATE['status'] = 'done' if WY_STATE['rows'] else 'idle'
         with scan_state['lock']:
             scan_state['status'] = 'done'
             scan_state['last_scan'] = datetime.now(MY_TZ).strftime('%Y-%m-%d %H:%M:%S')
@@ -3412,6 +3422,665 @@ def load_ex_result(tf, c1):
     except Exception:
         return None
 
+# ============================================================
+# 🧱 威科夫「洗盤 → 真突破」（2026-10-26 從Bybit掃描器 scannerrailway.py 原封不動移植）
+# 跟C系列／突破卡片分開，不需要C：區間（天花板、地板）→ 假跌破洗盤 → 突破前安靜 → 突破時大聲 → 回頭站得穩
+# 所有門檻跟加密版一樣（Railway環境變數名稱也一樣，可以各自覆蓋）。只做多頭、只看日線。
+# ============================================================
+HEADROOM_PIVOT_LEN = int(os.environ.get('HEADROOM_PIVOT_LEN', 5))
+HEADROOM_RECENT    = os.environ.get('HEADROOM_RECENT', '0') == '1'
+HEADROOM_HARD      = os.environ.get('HEADROOM_HARD', '0') == '1'
+HEADROOM_MIN_R     = float(os.environ.get('HEADROOM_MIN_R', 1.5))
+STAGE_LABEL_MAP    = {0: '--', 1: 'S1', 2: 'S2', 3: 'S3⚠️', 4: 'S4'}
+
+def cf_bars(df):
+    return [{'o': float(o), 'h': float(h), 'l': float(l), 'c': float(c), 'v': float(v)}
+            for o, h, l, c, v in zip(df['open'], df['high'], df['low'], df['close'], df['volume'])]
+
+def cf_atr14(bars):
+    if len(bars) < 15: return None
+    trs = [max(bars[i]['h'] - bars[i]['l'], abs(bars[i]['h'] - bars[i-1]['c']), abs(bars[i]['l'] - bars[i-1]['c']))
+           for i in range(1, len(bars))]
+    atr = sum(trs[:14]) / 14
+    for tr in trs[14:]:
+        atr = (atr * 13 + tr) / 14        # Wilder平滑，跟TradingView的ATR一致
+    return atr
+
+def cf_pivots(bars, key, n, is_high):
+    out = []
+    for i in range(n, len(bars) - n):
+        v = bars[i][key]
+        w = [bars[j][key] for j in range(i - n, i + n + 1) if j != i]
+        if (is_high and all(v >= x for x in w)) or (not is_high and all(v <= x for x in w)):
+            out.append(i)
+    return out
+# ---- 牆的分級（2026-10-19，SMC「流動性有優先順序」）----
+# A級＝硬牆（外部流動性）：碰過≥2次（等高點）、或碰的時候有大量、或是左右各WALL_MAJOR_LEN根日K的最高點（主要高點，而且沒被收盤突破過）
+# B級＝軟牆（內部流動性）：只碰過一次、沒有大量的小高點／上影線，或曾被收盤突破過的主要高點
+WALL_TOUCH_PCT  = float(os.environ.get('WALL_TOUCH_PCT', 1.5))   # 高點在牆 ±X% 以內算「碰到這道牆」
+WALL_MAJOR_LEN  = int(os.environ.get('WALL_MAJOR_LEN', 20))      # 左右各幾根日K的最高點＝主要高點
+WALL_BIGVOL     = float(os.environ.get('WALL_BIGVOL', 2.0))      # 碰牆那根K量 ≥ 50日均量幾倍＝大量
+WALL_TAKEN_PCT  = float(os.environ.get('WALL_TAKEN_PCT', 2.0))   # 之後收盤高過牆 X% ＝ 這道牆已經被突破過
+WALL_TOUCH_GAP  = int(os.environ.get('WALL_TOUCH_GAP', 5))      # 兩次碰牆之間至少隔幾根日K才算「碰過2次」（避免同一波連續幾天算成很多次）
+
+
+def wall_levels(daily, entry, n=None):
+    """回傳 Entry 上方的日線牆（由近到遠），每道牆附等級與原因。只做多頭方向。
+    候選＝跟checklist一樣：左右各n根的日線擺動高點＋最近n根日K的高點。"""
+    n = n or HEADROOM_PIVOT_LEN
+    N = len(daily)
+    if N < 30:
+        return []
+    cands = [(daily[i]['h'], i) for i in cf_pivots(daily, 'h', n, True) if daily[i]['h'] > entry]
+    if HEADROOM_RECENT:
+        cands += [(daily[i]['h'], i) for i in range(max(0, N - n), N) if daily[i]['h'] > entry]
+    if not cands:
+        return []
+    tol = WALL_TOUCH_PCT / 100
+    out = []
+    for price, idx in sorted(set(cands)):
+        lo, hi = price * (1 - tol), price * (1 + tol)
+        touches, last, first, big = 0, -999, None, False
+        for i in range(N):
+            b = daily[i]
+            if lo <= b['h'] <= hi and b['c'] < hi:
+                if i - last >= WALL_TOUCH_GAP:
+                    touches += 1
+                if first is None:
+                    first = i
+                last = i
+                if i >= 50:
+                    ma = sum(x['v'] for x in daily[i - 50:i]) / 50
+                    if ma > 0 and b['v'] >= ma * WALL_BIGVOL:
+                        big = True
+        win = daily[max(0, idx - WALL_MAJOR_LEN): idx + WALL_MAJOR_LEN + 1]
+        # 主要高點：左右各 WALL_MAJOR_LEN 根都要有資料（最近才出現、右邊還沒走完的高點不算）
+        major = price >= max(x['h'] for x in win) and idx - WALL_MAJOR_LEN >= 0 and idx + WALL_MAJOR_LEN < N
+        taken = any(x['c'] > price * (1 + WALL_TAKEN_PCT / 100) for x in daily[idx + 1:])
+        why = []
+        if touches >= 2: why.append(f'碰過{touches}次')
+        if big: why.append('碰牆時大量')
+        if major: why.append(f'左右{WALL_MAJOR_LEN}天最高點')
+        if taken: why.append('曾被收盤突破過')
+        # 碰過≥2次或大量：硬牆（就算曾被短暫收盤突破，跌回來後反而多一批被套的追突破者）；
+        # 只靠「主要高點」的：曾被收盤突破過就降成B級（流動性已被掃過）
+        tier = 'A' if (touches >= 2 or big or (major and not taken)) else 'B'
+        if not why: why.append('只碰過一次的小高點')
+        age = N - 1 - (first if first is not None else idx)
+        if age >= 30 and tier == 'A': why.append(f'約{age}天前形成')
+        rec = {'price': price, 'tier': tier, 'why': '、'.join(why), 'touches': touches}
+        # 跟前一道牆距離在 tol 以內：合併成同一個區，用比較低的價（最先碰到），等級取比較硬的
+        if out and price <= out[-1]['price'] * (1 + tol):
+            prev = out[-1]
+            if tier == 'A' and prev['tier'] == 'B':
+                prev['tier'] = 'A'; prev['why'] = rec['why']
+            continue
+        out.append(rec)
+    return out
+
+
+def wall_pick(levels, entry, r1):
+    """從 wall_levels 的結果取出：最近的牆、最近的A級牆、最近的B級牆，和各自幾R"""
+    rr = lambda w: None if (w is None or not r1 or r1 <= 0) else (w['price'] - entry) / r1
+    near = levels[0] if levels else None
+    a = next((w for w in levels if w['tier'] == 'A'), None)
+    b = next((w for w in levels if w['tier'] == 'B'), None)
+    return {'near': near, 'near_r': rr(near), 'a': a, 'a_r': rr(a), 'b': b, 'b_r': rr(b)}
+def bt_wall(daily_bars, entry, include_recent=True):
+    """跟enrich_signal()同一套「上方的牆」：進場價上方最近的日線擺動高點（左右各HEADROOM_PIVOT_LEN根），
+    include_recent=True時再加上最近HEADROOM_PIVOT_LEN根日K的高點（checklist現在的做法）。"""
+    n = HEADROOM_PIVOT_LEN
+    lv = [daily_bars[i]['h'] for i in cf_pivots(daily_bars, 'h', n, True) if daily_bars[i]['h'] > entry]
+    if include_recent:
+        lv += [b['h'] for b in daily_bars[-n:] if b['h'] > entry]
+    return min(lv) if lv else None
+WY_RANGE_LENS        = [120, 90, 60, 45, 30, 20]   # 試哪些區間長度（日），越長越優先
+WY_MAX_HEIGHT_PCT    = float(os.environ.get('WY_MAX_HEIGHT_PCT', 80))   # 區間高度上限：天花板 ÷ 地板 − 1（%）
+WY_CEIL_TOUCH_PCT    = float(os.environ.get('WY_CEIL_TOUCH_PCT', 4))    # 高點在天花板 X% 以內算「碰過天花板」
+WY_MIN_CEIL_TOUCHES  = int(os.environ.get('WY_MIN_CEIL_TOUCHES', 2))     # 天花板至少被碰過幾次（間隔≥5天）
+WY_SPRING_MIN_PCT    = float(os.environ.get('WY_SPRING_MIN_PCT', 1))    # 洗盤：刺穿地板至少 X%
+WY_SPRING_MAX_PCT    = float(os.environ.get('WY_SPRING_MAX_PCT', 15))   # 洗盤：刺穿地板最多 X%（再深就是真跌破）
+WY_SPRING_RECOVER    = int(os.environ.get('WY_SPRING_RECOVER', 3))      # 洗盤：幾根K線內收回地板上方
+# 2026-10-22 改：安靜＝突破前 WY_QUIET_WIN 天裡「最安靜的連續 WY_QUIET_RUN 天」均量 ÷ 那段之前的50日均量
+# （原本是突破前整整10天的均量；洗盤後價格從地板走回天花板那段量本來就會放大，10天均量幾乎不可能 ≤ 0.8）
+WY_QUIET_WIN         = int(os.environ.get('WY_QUIET_WIN', 15))          # 突破前看幾天
+WY_QUIET_RUN         = int(os.environ.get('WY_QUIET_RUN', 5))           # 裡面找最安靜的連續幾天
+WY_QUIET_DAYS        = WY_QUIET_WIN                                     # 舊名稱保留（其他地方用到）
+WY_QUIET_MAX         = float(os.environ.get('WY_QUIET_MAX', 0.8))       # 最安靜那幾天均量 ÷ 50日均量 ≤ 此值＝安靜
+WY_LOUD_MIN          = float(os.environ.get('WY_LOUD_MIN', 2.0))        # 突破當天量 ÷ 50日均量 ≥ 此值＝大聲
+WY_LOUD_MAX          = float(os.environ.get('WY_LOUD_MAX', 20.0))       # 超過此值＝爆量異常（消息／拉盤，不是健康的突破）
+WY_RETEST_VOL_MA_MAX = float(os.environ.get('WY_RETEST_VOL_MA_MAX', 1.5))  # 回踩期間均量 ÷ 突破前50日均量 ≤ 此值（避免突破量太大時「站穩」一定過）
+WY_DATA_MIN_RATIO    = float(os.environ.get('WY_DATA_MIN_RATIO', 0.03)) # 前段成交量中位數 < 最近10天中位數 × 此值＝歷史量是空的（新合約），資料不足
+WY_DATA_MAX_ZERO     = float(os.environ.get('WY_DATA_MAX_ZERO', 0.1))   # 前段零成交量的天數超過此比例＝資料不足
+WY_LOUD_CLOSE_POS    = float(os.environ.get('WY_LOUD_CLOSE_POS', 0.5))  # 突破當天收盤在K線的位置 ≥ 此值（0＝最低、1＝最高）
+WY_RECENT_DAYS       = int(os.environ.get('WY_RECENT_DAYS', 30))        # 只看最近幾天內發生的突破
+WY_RETEST_NEAR_PCT   = float(os.environ.get('WY_RETEST_NEAR_PCT', 3))   # 回踩：低點來到天花板上方 X% 以內
+WY_RETEST_TOL_PCT    = float(os.environ.get('WY_RETEST_TOL_PCT', 2))    # 回踩：容許刺穿天花板 X%（看收盤）
+WY_RETEST_VOL_MAX    = float(os.environ.get('WY_RETEST_VOL_MAX', 0.7))  # 回踩期間均量 ÷ 突破當天量 ≤ 此值
+WY_RETEST_MAX_DAYS   = int(os.environ.get('WY_RETEST_MAX_DAYS', 15))    # 回踩要在突破後幾天內發生（太久＝另一個故事）
+WY_RETEST_MAX_DROP   = float(os.environ.get('WY_RETEST_MAX_DROP', 30))  # 從突破後高點回落超過 X%＝回踩太深（像買盤高潮後的自動回落）
+WY_FAIL_CLOSE_PCT    = float(os.environ.get('WY_FAIL_CLOSE_PCT', 1))    # 收盤低於天花板 X% ＝ 跌回區間（假突破）
+WY_RISK_MAX_ATR      = float(os.environ.get('WY_RISK_MAX_ATR', 2.0))    # SL距離超過幾倍日線ATR＝風險太大
+WY_NEAR_CEIL_PCT     = float(os.environ.get('WY_NEAR_CEIL_PCT', 5))     # 🟡 價格離天花板 X% 以內才放進盯盤名單
+WY_TG_ON             = os.environ.get('WY_TG', '1') == '1'              # 設成0就不推播
+# KLSE版：不另外抓資料，跟著C系列主掃描（開市時間每小時＋17:40收盤後）一起跑：
+#   用「已收盤日K」判斷階段（開市中＝到昨天為止，收盤後＝包含今天），所以一天內階段只會在收盤後變一次；
+#   盯盤（🟡重點名單正在突破、🟠回踩到天花板、🟢觸發Entry／跌破SL）用今天還沒收完的K線，每小時一次。
+WY_LOAD_TEXT         = f'{WY_LOUD_MIN:g} 倍均量、收在K線上半部'
+
+WY_STATE = {'status': 'idle', 'progress': '', 'last_update': None, 'rows': [], 'errors': [],
+            'run_date': None}
+WY_LOCK = threading.Lock()
+WY_ALERTED = {}            # (symbol, kind, 日期) -> True，同一件事一天只推一次
+# 2026-10-23：每次掃描後把各幣的階段存檔（跟持倉清單同一個Volume資料夾），重新部署後的第一次掃描
+# 也能跟上一次比較，新變成🟢／🟠的幣照樣推Telegram（原本重新部署後第一次掃描一律不推，會漏掉）
+WY_STAGE_FILE = os.path.join(DATA_DIR, 'wyckoff_state.json')   # KLSE：存在Volume（/data）
+
+
+def wy_load_stages():
+    """讀上一次掃描的 {symbol: stage}；沒有檔案（第一次使用）回傳None"""
+    import json
+    try:
+        with open(WY_STAGE_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def wy_save_stages(stages):
+    import json
+    try:
+        with open(WY_STAGE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(stages, f, ensure_ascii=False)
+    except Exception as e:
+        print(f'⚠️ 儲存威科夫階段紀錄失敗：{e}')
+WY_STAGE_META = {
+    'green':  ('🟢 三個條件全部符合', '#1b5e20'),
+    'orange': ('🟠 已放量突破，等回踩', '#e65100'),
+    'yellow': ('🟡 洗盤完成，還在區間', '#8d6e00'),
+    'weak':   ('⚪ 突破了，但條件不全', '#455a64'),
+    'fail':   ('❌ 突破後跌回區間', '#7f1d1d'),
+    'nodata': ('⛔ 資料不足（成交量資料不夠／零成交日太多）', '#37474f'),
+}
+# 卡關統計用：每個 ⚪／⛔ 的原因代碼 → 顯示文字
+WY_MISS_LABELS = {
+    'quiet': '突破前不夠安靜',
+    'loud_low': '突破量不夠（< %g 倍）',
+    'loud_high': '爆量異常（> %g 倍，像拉盤）',
+    'close_pos': '突破當天收在K線下半部',
+    'retest_late': '回踩太晚（> %d 天）',
+    'retest_deep': '回踩太深（> %g%%）',
+    'no_retest': '突破後 %d 天還沒回踩',
+    'high_pos': '漲後高位（可能是出貨）',
+    'nodata': '成交量資料不足（零成交日太多／新上市）',
+}
+
+
+def wy_vol_ma(bars, end, n=50):
+    """end之前（不含end）的n根平均量"""
+    lo = max(0, end - n)
+    seg = bars[lo:end]
+    return sum(b['v'] for b in seg) / len(seg) if seg else 0
+
+
+def wy_quiet(bars, end):
+    """突破前（end之前）WY_QUIET_WIN 天裡，最安靜的連續 WY_QUIET_RUN 天：
+    回傳 (那幾天均量 ÷ 這段之前的50日均量, 最安靜那段的起點index)；算不出來回傳 (None, None)"""
+    lo = end - WY_QUIET_WIN
+    if lo < 50 or WY_QUIET_RUN > WY_QUIET_WIN:
+        return None, None
+    ma50 = wy_vol_ma(bars, lo)
+    if not ma50:
+        return None, None
+    best, best_i = None, None
+    for i in range(lo, end - WY_QUIET_RUN + 1):
+        avg = sum(x['v'] for x in bars[i:i + WY_QUIET_RUN]) / WY_QUIET_RUN
+        if best is None or avg < best:
+            best, best_i = avg, i
+    return best / ma50, best_i
+
+
+def wy_data_check(bars):
+    """歷史成交量是不是真的（新合約上線前的K線常常幾乎沒量，算出來的倍數會失真，例如 RSR 252倍）。
+    比較「前段」（最近120天到最近20天）和「最近10天」的成交量中位數。回傳 (ok, 原因)"""
+    prior = sorted(b['v'] for b in bars[-120:-20])
+    recent = sorted(b['v'] for b in bars[-10:])
+    if len(prior) < 50 or not recent:
+        return False, '日線K線太少'
+    zero = sum(1 for v in prior if v <= 0)
+    if zero > len(prior) * WY_DATA_MAX_ZERO:
+        return False, f'前段有 {zero} 天零成交量'
+    pm = prior[len(prior) // 2]
+    rm = recent[len(recent) // 2]
+    if rm > 0 and pm < rm * WY_DATA_MIN_RATIO:
+        return False, f'前段成交量中位數只有最近10天的 {pm / rm:.1%}'
+    return True, ''
+
+
+def wy_find_spring(bars, s0, e):
+    """在區間 [s0, e) 的後70%裡找最後一次假跌破洗盤。回傳dict或None。
+    地板＝洗盤之前的區間最低價；洗盤＝低點刺穿地板WY_SPRING_MIN~MAX%，WY_SPRING_RECOVER根內收盤收回地板上方，
+    而且之後到e為止沒有再跌破洗盤低點。"""
+    first = s0 + max(10, int((e - s0) * 0.3))
+    best = None
+    support = min(b['l'] for b in bars[s0:first])
+    for s in range(first, e):
+        if s > first:
+            support = min(support, bars[s - 1]['l'])   # 洗盤之前的區間最低價（逐根更新，避免重算）
+        low = bars[s]['l']
+        depth = (support - low) / support * 100
+        if depth < WY_SPRING_MIN_PCT or depth > WY_SPRING_MAX_PCT:
+            continue
+        rec = None
+        for k in range(s, min(e, s + WY_SPRING_RECOVER + 1)):
+            if bars[k]['c'] > support:
+                rec = k
+                break
+        if rec is None:
+            continue
+        if any(b['l'] < low for b in bars[s + 1:e]):
+            continue
+        ma = wy_vol_ma(bars, s)
+        best = {'i': s, 'low': low, 'support': support, 'depth': depth, 'recover_bars': rec - s,
+                'vol_mult': (bars[s]['v'] / ma) if ma else None}
+    return best
+
+
+def wy_ceiling_touches(bars, s0, e, ceiling):
+    touches, last = 0, -999
+    for i in range(s0 + 5, e):              # 區間最前面5根不算（避免把前面一段下跌的高點當成天花板）
+        if bars[i]['h'] >= ceiling * (1 - WY_CEIL_TOUCH_PCT / 100):
+            if i - last >= 5:
+                touches += 1
+            last = i
+    return touches
+
+
+def wy_valid_range(bars, s0, e):
+    """區間 [s0, e) 是否像一個有洗盤的橫盤；是就回傳 (ceiling, floor, spring)"""
+    if s0 < 55 or e - s0 < 20:
+        return None
+    seg = bars[s0:e]
+    ceiling = max(b['h'] for b in seg)
+    spring = wy_find_spring(bars, s0, e)
+    if not spring:
+        return None
+    floor = spring['support']
+    if floor <= 0 or (ceiling / floor - 1) * 100 > WY_MAX_HEIGHT_PCT:
+        return None
+    if wy_ceiling_touches(bars, s0, e, ceiling) < WY_MIN_CEIL_TOUCHES:
+        return None
+    return ceiling, floor, spring
+
+
+def wy_position(bars, s0):
+    """區間開始前的60天，是跌下來還是漲上來"""
+    if s0 < 61:
+        return '—'
+    chg = (bars[s0]['c'] / bars[s0 - 60]['c'] - 1) * 100
+    if chg <= -15:
+        return '跌後（吸籌）'
+    if chg >= 50:
+        return '漲後高位（小心出貨）'
+    return '中途整理'
+
+
+def wy_analyze(symbol, ddf):
+    """wy_analyze_core 外面加一層「資料足夠」檢查：有結果但歷史成交量是空的 → 改成 ⛔ 資料不足"""
+    r = wy_analyze_core(symbol, ddf)
+    if r:
+        ok, why = wy_data_check(cf_bars(ddf))   # KLSE：傳進來的已經全是收盤K
+        if not ok:
+            r['orig_stage'] = r['stage']
+            r['stage'] = 'nodata'
+            r['miss'] = ['nodata']
+            r['note'] = f'資料不足：{why}。量比（安靜／大聲／站穩）都會失真，不判斷，自己看圖。'
+    return r
+
+
+def wy_analyze_core(symbol, ddf):
+    """回傳一列結果或None。KLSE版：ddf＝只含已收盤日K的DataFrame（呼叫前已用closed_bars去掉今天還沒收完的K線）。"""
+    allbars = cf_bars(ddf)
+    bars = allbars                         # 全部都是已收盤的日K
+    dates = list(ddf.index)
+    n = len(bars)
+    if n < 120:
+        return None
+    T = n - 1
+    atr = cf_atr14(bars) or 0
+
+    def eval_bo(b, s0, ceiling, floor, spring):
+        """評估一次突破：回傳一列結果（stage＝green/orange/weak/fail）"""
+        quiet_ratio, quiet_i = wy_quiet(bars, b)
+        bo = bars[b]
+        ma_b = wy_vol_ma(bars, b)
+        loud_mult = bo['v'] / ma_b if ma_b else None
+        rng = bo['h'] - bo['l']
+        close_pos = (bo['c'] - bo['l']) / rng if rng > 0 else 1
+        quiet_ok = quiet_ratio is not None and quiet_ratio <= WY_QUIET_MAX
+        loud_big = loud_mult is not None and loud_mult > WY_LOUD_MAX
+        loud_ok = (loud_mult is not None and WY_LOUD_MIN <= loud_mult <= WY_LOUD_MAX
+                   and close_pos >= WY_LOUD_CLOSE_POS)
+        after = bars[b + 1:T + 1]
+        row = {'symbol': symbol, 'ceiling': ceiling, 'floor': floor, 'range_days': b - s0,
+               'range_from': dates[s0].strftime('%m/%d'), 'position': wy_position(bars, s0),
+               'spring_date': dates[spring['i']].strftime('%m/%d'), 'spring_low': spring['low'],
+               'spring_depth': spring['depth'], 'spring_vol': spring['vol_mult'],
+               'bo_date': dates[b].strftime('%m/%d'), 'bo_days_ago': T - b,
+               'quiet_ratio': quiet_ratio, 'quiet_ok': quiet_ok,
+               'quiet_from': dates[quiet_i].strftime('%m/%d') if quiet_i is not None else None,
+               'loud_mult': loud_mult, 'loud_close_pos': close_pos, 'loud_ok': loud_ok, 'loud_big': loud_big,
+               'retest_ok': False, 'price': bars[T]['c'], 'atr': atr, 'miss': []}
+        # 跌回區間＝假突破
+        if any(x['c'] < ceiling * (1 - WY_FAIL_CLOSE_PCT / 100) for x in after):
+            row['stage'] = 'fail'
+            row['note'] = '突破後收盤跌回天花板下面：假突破誘多。刪掉。'
+            return row
+        # 回踩：突破後的最低點有沒有回到天花板附近、收盤都守住
+        retest = None
+        if after:
+            ri = min(range(b + 1, T + 1), key=lambda i: bars[i]['l'])
+            rl = bars[ri]['l']
+            peak_i = max(range(b, ri + 1), key=lambda i: bars[i]['h'])
+            if rl <= ceiling * (1 + WY_RETEST_NEAR_PCT / 100) and rl >= ceiling * (1 - WY_RETEST_TOL_PCT / 100) and ri > peak_i:
+                pull = bars[peak_i + 1:ri + 1]
+                pull_vol = sum(x['v'] for x in pull) / len(pull) if pull else None
+                vol_ratio = pull_vol / bo['v'] if (pull_vol and bo['v']) else None
+                vol_ma_ratio = pull_vol / ma_b if (pull_vol and ma_b) else None
+                confirmed = ri < T                      # 回踩低點之後至少還有一根K線沒破低
+                peak_h = bars[peak_i]['h']
+                retest = {'i': ri, 'low': rl, 'vol_ratio': vol_ratio, 'vol_ma_ratio': vol_ma_ratio, 'confirmed': confirmed,
+                          'pierced': rl < ceiling, 'days': ri - b, 'peak': peak_h,
+                          'drop': (peak_h - rl) / peak_h * 100}
+        if retest:
+            row['retest_low'] = retest['low']
+            row['retest_date'] = dates[retest['i']].strftime('%m/%d')
+            row['retest_vol'] = retest['vol_ratio']
+            row['retest_vol_ma'] = retest['vol_ma_ratio']
+            row['retest_ok'] = (retest['confirmed']
+                                and retest['vol_ratio'] is not None and retest['vol_ratio'] <= WY_RETEST_VOL_MAX
+                                and retest['vol_ma_ratio'] is not None and retest['vol_ma_ratio'] <= WY_RETEST_VOL_MA_MAX)
+        if not (quiet_ok and loud_ok):
+            row['stage'] = 'weak'
+            miss = []
+            if not quiet_ok:
+                miss.append('突破前不夠安靜'); row['miss'].append('quiet')
+            if not loud_ok:
+                if loud_big:
+                    miss.append(f'突破當天爆量 {loud_mult:.0f} 倍（上限 {WY_LOUD_MAX:g} 倍），比較像消息或拉盤，不是健康的突破')
+                    row['miss'].append('loud_high')
+                elif (loud_mult or 0) < WY_LOUD_MIN:
+                    miss.append('突破時不夠大聲'); row['miss'].append('loud_low')
+                else:
+                    miss.append('突破當天收在K線下半部（上影線長）'); row['miss'].append('close_pos')
+            row['note'] = '、'.join(miss) + '。容易是假突破，只觀察。'
+            return row
+        # 回踩太晚或太深：不是「突破後小幅回頭測試」，而是整段漲幅吐回去
+        if retest and (retest['days'] > WY_RETEST_MAX_DAYS or retest['drop'] > WY_RETEST_MAX_DROP):
+            row['retest_ok'] = False
+            row['stage'] = 'weak'
+            why = []
+            if retest['drop'] > WY_RETEST_MAX_DROP:
+                row['miss'].append('retest_deep')
+                why.append(f'從突破後高點 {fmt_px(retest["peak"])} 回落了 {retest["drop"]:.0f}%（上限 {WY_RETEST_MAX_DROP:g}%）')
+            if retest['days'] > WY_RETEST_MAX_DAYS:
+                row['miss'].append('retest_late')
+                why.append(f'突破後第 {retest["days"]} 天才回到天花板（上限 {WY_RETEST_MAX_DAYS} 天）')
+            row['note'] = ('回踩太深／太晚：' + '、'.join(why) + '。比較像買盤高潮後的自動回落，不是回踩確認。'
+                           '等舊天花板附近重新縮量守住、形成新的結構再看。')
+            return row
+        if not retest and row['bo_days_ago'] > WY_RETEST_MAX_DAYS:
+            row['stage'] = 'weak'
+            row['miss'].append('no_retest')
+            row['note'] = f'突破已經 {row["bo_days_ago"]} 天還沒回踩（上限 {WY_RETEST_MAX_DAYS} 天）。之後再回到天花板，已經不算這次突破的回踩。'
+            return row
+        if not retest:
+            row['stage'] = 'orange'
+            row['note'] = f'已放量突破 {row["bo_days_ago"]} 天，還沒回踩到天花板附近。不追，等回踩。'
+            return row
+        if not row['retest_ok']:
+            row['stage'] = 'orange'
+            if not retest['confirmed']:
+                row['note'] = '回踩中，還沒確認守住（回踩低點後還沒有收盤K線）。'
+            else:
+                vr, vm = retest['vol_ratio'], retest['vol_ma_ratio']
+                row['note'] = (f'回踩到天花板，但回踩的量太大（突破當天量的 {(vr or 0):.0%}、平常量的 {(vm or 0):.1f} 倍；'
+                               f'要 ≤ {WY_RETEST_VOL_MAX:.0%} 而且 ≤ {WY_RETEST_VOL_MA_MAX:g} 倍），還不算站穩。')
+            return row
+        # 漲後高位的區間：可能是出貨，不給🟢
+        if row['position'].startswith('漲後'):
+            row['stage'] = 'weak'
+            row['miss'].append('high_pos')
+            row['note'] = '三個條件都過了，但區間在大漲之後（漲後高位），可能是出貨區。不給 🟢，只觀察。'
+            return row
+        # ---- 🟢：給 Entry / SL / 上方空間 ----
+        ri = retest['i']
+        bounce_high = max(x['h'] for x in bars[ri:T + 1])
+        entry = bounce_high * 1.005
+        sl = retest['low'] * 0.995
+        r1 = entry - sl
+        wall = bt_wall(bars, entry, include_recent=HEADROOM_RECENT)
+        pk = wall_pick(wall_levels(bars, entry), entry, entry - sl)
+        tps = sorted({bars[i]['h'] for i in cf_pivots(bars, 'h', HEADROOM_PIVOT_LEN, True) if bars[i]['h'] > entry})[:3]
+        row.update({'stage': 'green', 'entry': entry, 'sl': sl, 'r1': r1, 'wall': wall,
+                    'wall_r': (wall - entry) / r1 if (wall and r1 > 0) else None,
+                    'tps': tps, 'risk_atr': r1 / atr if atr else None,
+                    'wall_tier': pk['near']['tier'] if pk['near'] else '', 'wall_why': pk['near']['why'] if pk['near'] else '',
+                    'wallA': pk['a']['price'] if pk['a'] else None, 'wallA_r': pk['a_r']})
+        notes = ['回踩刺穿天花板後收回' if retest['pierced'] else '回踩守在天花板上面']
+        if row['wall_r'] is not None and row['wall_r'] < HEADROOM_MIN_R:
+            notes.append(f'上方空間只有 {row["wall_r"]:.2f}R，不到 {HEADROOM_MIN_R}R，' + ('不做' if HEADROOM_HARD else '參考：碰牆時看量，可考慮到牆先平一半'))
+        if row['risk_atr'] and row['risk_atr'] > WY_RISK_MAX_ATR:
+            notes.append(f'SL 距離 {row["risk_atr"]:.1f} 倍日線ATR，風險太大：改到 4H／1H 找 C 進場')
+        if bars[T]['c'] > entry:
+            notes.append('現價已在 Entry 上面，不追：等下一次回踩')
+        row['note'] = '；'.join(notes) + '。'
+        return row
+
+    # ---- A：最近 WY_RECENT_DAYS 天內「第一次收盤突破區間天花板」的日子（由舊到新） ----
+    cands = []
+    for b in range(max(T - WY_RECENT_DAYS, 60), T + 1):
+        if bars[b]['c'] <= max(x['h'] for x in bars[b - 20:b]):
+            continue                        # 連最近20天高點都沒站上，不可能是區間突破
+        for L in WY_RANGE_LENS:
+            s0 = b - L
+            r = wy_valid_range(bars, s0, b)
+            if r and bars[b]['c'] > r[0] and not (bars[b - 1]['c'] > r[0]):
+                cands.append((b, s0, r))
+                break
+    # 由舊到新評估：舊的突破如果已經失敗（跌回區間），就看之後有沒有新的突破；全部失敗就回報最後一次失敗
+    last_fail = None
+    for b, s0, (ceiling, floor, spring) in cands:
+        row = eval_bo(b, s0, ceiling, floor, spring)
+        if row['stage'] != 'fail':
+            return row
+        last_fail = row
+    if last_fail and last_fail['bo_days_ago'] <= 10:
+        return last_fail                   # 最近10天內的假突破才列出來提醒
+
+    # ---- B：還沒突破：區間裡有洗盤、最近量縮 → 🟡 ----
+    for L in WY_RANGE_LENS:
+        s0 = T + 1 - L
+        r = wy_valid_range(bars, s0, T + 1)
+        if not r:
+            continue
+        ceiling, floor, spring = r
+        if bars[T]['c'] > ceiling:
+            continue
+        if T - spring['i'] > 45:            # 洗盤太久以前，跟現在關係不大
+            continue
+        quiet_ratio, quiet_i = wy_quiet(bars, T + 1)
+        dist = (ceiling / bars[T]['c'] - 1) * 100
+        return {'symbol': symbol, 'stage': 'yellow', 'ceiling': ceiling, 'floor': floor, 'range_days': L,
+                'range_from': dates[s0].strftime('%m/%d'), 'position': wy_position(bars, s0),
+                'spring_date': dates[spring['i']].strftime('%m/%d'), 'spring_low': spring['low'],
+                'spring_depth': spring['depth'], 'spring_vol': spring['vol_mult'],
+                'quiet_ratio': quiet_ratio, 'quiet_ok': quiet_ratio is not None and quiet_ratio <= WY_QUIET_MAX,
+                'quiet_from': dates[quiet_i].strftime('%m/%d') if quiet_i is not None else None, 'miss': [],
+                'loud_ok': False, 'retest_ok': False, 'price': bars[T]['c'], 'dist_pct': dist, 'atr': atr,
+                'note': (f'離天花板 {dist:.1f}%。' + ('量在縮，' if (quiet_ratio or 9) <= WY_QUIET_MAX else '量還沒縮，')
+                         + '等放量收盤突破 ' + f'{fmt_px(ceiling)}。')}
+    return None
+
+
+# ---------------- KLSE 接線：跟著C系列主掃描一起跑，不另外抓Yahoo資料 ----------------
+wy_rows_pending = []
+
+def send_telegram_plain(text):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+    try:
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                      json={'chat_id': TELEGRAM_CHAT_ID, 'text': text, 'disable_web_page_preview': True}, timeout=10)
+        return True
+    except Exception as e:
+        log.warning(f"🧱 威科夫 Telegram 發送失敗：{e}")
+        return False
+
+def wy_alert_once(sym, kind, text):
+    key = (sym, kind, datetime.now(MY_TZ).strftime('%Y-%m-%d'))
+    if key in WY_ALERTED:
+        return
+    WY_ALERTED[key] = True
+    if WY_TG_ON:
+        send_telegram_plain(text)
+
+def _wy_label(r):
+    code = r['symbol'].replace('.KL', '')
+    return f"{r.get('name') or code}({code})"
+
+def wy_scan_begin():
+    wy_rows_pending.clear()
+    with WY_LOCK:
+        WY_STATE.update({'status': 'running', 'progress': '跟著C系列掃描中', 'errors': []})
+
+def wy_process_symbol(meta, df_daily):
+    """scan_symbol()抓到日線後呼叫：1)用已收盤日K判斷階段 2)今天K線還沒收完時，順便盯盤（每小時一次）"""
+    sym = meta['symbol']
+    try:
+        closed = closed_bars(df_daily, '1D')
+        if len(closed) < 121:
+            return
+        ddf = closed.tail(500)                     # 跟加密版一樣用最近500根日K
+        r = wy_analyze(sym, ddf)
+        if not r:
+            return
+        try:
+            st, _, _ = get_stage(ddf)
+        except Exception:
+            st = 0
+        r['day_stage'] = STAGE_LABEL_MAP.get(st, '--')
+        r['redist'] = (st == 4 and r['position'] == '中途整理')
+        if r['redist']:
+            r['note'] = '⚠️ 日線S4、下跌途中的橫盤，小心是再派發（中途再出一次貨，之後繼續跌）。' + r.get('note', '')
+        r['focus'] = (r['stage'] == 'yellow' and r.get('dist_pct', 99) <= WY_NEAR_CEIL_PCT
+                      and r.get('quiet_ok') and not r['redist'])
+        r.update({'name': meta.get('name'), 'sector': meta.get('sector'), 'tv_symbol': meta.get('tv_symbol')})
+        wy_rows_pending.append(r)
+        if len(df_daily) > len(closed):            # 今天的日K還沒收完 → 盯盤
+            wy_monitor_row(r, df_daily)
+    except Exception as e:
+        with WY_LOCK:
+            WY_STATE['errors'].append(f'{sym}: {type(e).__name__}: {e}')
+
+def wy_monitor_row(r, df_daily):
+    """跟加密版 wy_monitor_once 同一套提醒，只是一次看一檔、用主掃描已經抓好的日線"""
+    if not (r['stage'] in ('green', 'orange') or (r['stage'] == 'yellow' and r.get('focus'))):
+        return
+    bars = cf_bars(df_daily.tail(60))
+    if len(bars) < 52:
+        return
+    today = bars[-1]
+    ma50 = wy_vol_ma(bars, len(bars) - 1)
+    vol_mult = today['v'] / ma50 if ma50 else 0
+    px = today['c']
+    c = r['ceiling']
+    sym = r['symbol']; lab = _wy_label(r)
+    if r['stage'] == 'yellow' and px > c:
+        wy_alert_once(sym, 'breaking', f'🟡→ {lab} 正在突破天花板 {fmt_px(c)}（現價 {fmt_px(px)}，今天量已是均量 {vol_mult:.1f} 倍）。'
+                                       f'K線還沒收完，等日線收盤確認：要收在天花板上面、量 ≥ {WY_LOAD_TEXT}。')
+    elif r['stage'] == 'orange' and today['l'] <= c * (1 + WY_RETEST_NEAR_PCT / 100) and r.get('loud_ok'):
+        wy_alert_once(sym, 'retest', f'🟠 {lab} 回踩到天花板 {fmt_px(c)} 附近（今天低點 {fmt_px(today["l"])}）。'
+                                     f'去看小時圖：縮量守住、不收回區間裡，才算站得穩。')
+    elif r['stage'] == 'green':
+        if today['h'] >= r['entry']:
+            wy_alert_once(sym, 'entry', f'🟢 {lab} 觸發 Entry {fmt_px(r["entry"])}（SL {fmt_px(r["sl"])}）。下單前用 checklist 再確認一次。')
+        if today['l'] <= r['sl']:
+            wy_alert_once(sym, 'stop', f'❌ {lab} 跌破 SL {fmt_px(r["sl"])}（回踩低點 −0.5%）：「回頭站得穩」不成立。掛單取消，持倉照計劃出場。')
+
+def wy_scan_finish():
+    """主掃描跑完後：整理名單、跟上一次比較，新變成🟢／🟠的推Telegram（跟加密版每日摘要一樣）"""
+    rows = list(wy_rows_pending)
+    order = {'green': 0, 'orange': 1, 'yellow': 2, 'weak': 3, 'fail': 4, 'nodata': 5}
+    rows.sort(key=lambda r: (order[r['stage']], not r.get('focus'), r.get('dist_pct', 0) if r['stage'] == 'yellow' else -(r.get('loud_mult') or 0)))
+    with WY_LOCK:
+        if WY_STATE['rows']:
+            prev, have_prev = {r['symbol']: r['stage'] for r in WY_STATE['rows']}, True
+        else:
+            saved = wy_load_stages()
+            prev, have_prev = (saved or {}), saved is not None
+        WY_STATE.update({'rows': rows, 'status': 'done', 'progress': '',
+                         'last_update': datetime.now(MY_TZ).strftime('%Y-%m-%d %H:%M'),
+                         'run_date': datetime.now(MY_TZ).strftime('%Y-%m-%d')})
+    new_green = [r for r in rows if r['stage'] == 'green' and prev.get(r['symbol']) != 'green']
+    new_orange = [r for r in rows if r['stage'] == 'orange' and prev.get(r['symbol']) not in ('orange', 'green')]
+    wy_save_stages({r['symbol']: r['stage'] for r in rows})
+    if not have_prev and (new_green or new_orange):
+        log.info(f'🧱 威科夫：沒有上一次的紀錄（第一次使用），這次只記錄、不推播（🟢{len(new_green)} 🟠{len(new_orange)}）')
+    if have_prev and WY_TG_ON and (new_green or new_orange):
+        lines = ['【大馬威科夫 洗盤→真突破】']
+        for r in new_green:
+            wr = f'{r["wall_r"]:.2f}R' if r.get('wall_r') is not None else '藍天'
+            lines.append(f'🟢 {_wy_label(r)}  Entry {fmt_px(r["entry"])}  SL {fmt_px(r["sl"])}  上方空間 {wr}')
+        for r in new_orange:
+            lines.append(f'🟠 {_wy_label(r)}  {r["bo_date"]} 放量突破 {fmt_px(r["ceiling"])}（{r["loud_mult"]:.1f}倍量），等回踩')
+        send_telegram_plain('\n'.join(lines))
+
+
+def wy_funnel_html(rows):
+    """卡關統計：⚪ 和 ⛔ 各卡在哪一關（一隻幣可能同時卡好幾關）"""
+    if not rows:
+        return ''
+    cnt = {}
+    for r in rows:
+        if r['stage'] in ('weak', 'nodata'):
+            for k in r.get('miss') or []:
+                cnt[k] = cnt.get(k, 0) + 1
+    stages = {k: sum(1 for r in rows if r['stage'] == k) for k in WY_STAGE_META}
+    fmt = {'loud_low': WY_LOUD_MIN, 'loud_high': WY_LOUD_MAX, 'retest_late': WY_RETEST_MAX_DAYS,
+           'retest_deep': WY_RETEST_MAX_DROP, 'no_retest': WY_RETEST_MAX_DAYS}
+    items = []
+    for k, label in WY_MISS_LABELS.items():
+        if cnt.get(k):
+            items.append(f'{label % fmt[k] if k in fmt else label}：<b>{cnt[k]}</b>')
+    head = '｜'.join(f'{WY_STAGE_META[k][0].split(" ")[0]} {v}' for k, v in stages.items())
+    body = '、'.join(items) if items else '沒有'
+    return (f'<p class=note style="background:#22223f;padding:8px 12px;border-radius:6px">📊 <b>卡關統計</b>　{head}<br>'
+            f'⚪／⛔ 卡在哪一關（一隻幣可能卡好幾關）：{body}</p>')
+
+
+def wy_green_rules_html():
+    """🟢 的完整條件（數字直接讀目前的門檻設定，改了Railway變數這裡會跟著變）"""
+    return (
+        '<div class=note style="background:#1f2b22;border:1px solid #2e5a3a;padding:10px 14px;border-radius:6px;margin:4px 0 10px">'
+        '<b>🟢 要全部符合：</b><ol style="margin:6px 0 0;padding-left:20px">'
+        f'<li><b>前提：有區間、有洗盤</b>：橫盤 20～120 天、天花板被碰過 ≥ {WY_MIN_CEIL_TOUCHES} 次、高度 ≤ {WY_MAX_HEIGHT_PCT:g}%；'
+        f'區間後段有一次假跌破，刺穿地板 {WY_SPRING_MIN_PCT:g}～{WY_SPRING_MAX_PCT:g}%，{WY_SPRING_RECOVER} 根K線內收盤收回地板上方，之後沒再破低。</li>'
+        f'<li><b>突破前安靜</b>：突破前 {WY_QUIET_WIN} 天裡最安靜的連續 {WY_QUIET_RUN} 天，均量 ≤ {WY_QUIET_MAX:g} × 50日均量。</li>'
+        f'<li><b>突破時大聲</b>：日線收盤站上天花板，當天量 {WY_LOUD_MIN:g}～{WY_LOUD_MAX:g} × 50日均量，收在K線上半部'
+        f'（超過 {WY_LOUD_MAX:g} 倍＝爆量異常，像消息或拉盤）。</li>'
+        f'<li><b>回頭站得穩</b>：突破後 {WY_RETEST_MAX_DAYS} 天內回踩到天花板上方 {WY_RETEST_NEAR_PCT:g}% 以內'
+        f'（容許刺穿 {WY_RETEST_TOL_PCT:g}%，看收盤）、從突破後高點回落 ≤ {WY_RETEST_MAX_DROP:g}%、'
+        f'回踩量 ≤ 突破當天 {WY_RETEST_VOL_MAX:.0%} 而且 ≤ 平常量 {WY_RETEST_VOL_MA_MAX:g} 倍、回踩低點之後至少一根K線沒再破低。</li>'
+        '<li><b>不是「漲後高位」</b>：區間開始前 60 天漲超過 50% 的，三個條件都過也只放 ⚪（可能是出貨區）。</li>'
+        '</ol>'
+        '<div style="margin-top:8px"><b>變 🟢 之後，動手前再看：</b>'
+        'Entry＝回踩後反彈高點 +0.5%、SL＝回踩低點 −0.5%；'
+        f'上方空間 ≥ {HEADROOM_MIN_R:g}R（參考）；SL 距離 ≤ {WY_RISK_MAX_ATR:g} 倍日線ATR（太寬就改到 4H／1H 找 C 進場）；'
+        '現價已經過了 Entry 就不追，等下一次回踩。日線S4的吸籌突破，大趨勢還沒確認，倉位要小。</div>'
+        '</div>')
+
 load_cards()
 
 app = Flask(__name__)
@@ -3460,7 +4129,7 @@ HTML = """<!DOCTYPE html>
 </style></head><body>
 <h2>&#x1F1F2;&#x1F1FE; 大馬莊家思維掃描器</h2>
 <div class="subtitle">KLSE股票 · 操盤跟莊（邏輯已對齊 莊家思維 Contraction V53）</div>
-<div class="nav"><a class="nav-on" href="/">📊 C系列總表</a><a href="/cards">🃏 突破卡片</a><a href="/backtest">🧪 C1門檻回測</a><a href="/exit_backtest">🚪 出場回測</a></div>
+<div class="nav"><a class="nav-on" href="/">📊 C系列總表</a><a href="/cards">🃏 突破卡片</a><a href="/wyckoff">🧱 威科夫突破</a><a href="/backtest">🧪 C1門檻回測</a><a href="/exit_backtest">🚪 出場回測</a></div>
 SCANNING_BANNER
 <div class="ctrl-bar">
   <button class="btn btn-blue" onclick="startRefresh()" id="refreshBtn">&#x1F504; 重新掃描</button>
@@ -3678,6 +4347,12 @@ table.st th{background:#333;color:#fff} table.st td.g{color:#8b949e;text-align:l
 .warnbox{background:#5a3a00;color:#ffb74d;padding:10px 14px;border-radius:6px;font-size:13px;margin-bottom:12px;max-width:1150px}
 .scanning-banner{background:#1565c0;color:#fff;padding:10px 16px;border-radius:6px;margin-bottom:12px;font-size:14px;font-weight:bold;max-width:1150px}
 .foot{color:#666;font-size:11px;margin-top:28px;max-width:1150px;line-height:1.6}
+.flow{background:#22223a;border:1px solid #3a3a55;border-radius:6px;padding:9px 12px;font-size:12px;color:#ccc;margin-top:12px;max-width:1150px;line-height:1.7}
+.flow b{color:#ffb74d}
+details.help{max-width:1150px;margin:-4px 0 10px;font-size:12px}
+details.help summary{cursor:pointer;color:#7ab3ff}
+details.help div{background:#22223a;border:1px solid #3a3a55;border-radius:6px;padding:9px 12px;margin-top:6px;line-height:1.8;color:#ccc}
+details.help b{color:#fff}
 """
 
 def _h(s):
@@ -3808,22 +4483,49 @@ def build_cards_html(tf):
 <title>🃏 大馬突破卡片</title><style>{CARDS_CSS}</style></head><body>
 <h2>&#x1F1F2;&#x1F1FE; 大馬莊家思維 ・ 突破卡片</h2>
 <div class="subtitle">BO = 最後一個C高點+緩衝（收盤確認）・ SL = 最後一個C低點−緩衝（天圖1%、時圖0.5%）・ 目標 1:1.5 / 1:2 ・ 至少C2、只看多頭</div>
-<div class="nav"><a href="/">📊 C系列總表</a><a class="nav-on" href="/cards?tf={tf}">🃏 突破卡片</a><a href="/backtest">🧪 C1門檻回測</a><a href="/exit_backtest">🚪 出場回測</a></div>
+<div class="nav"><a href="/">📊 C系列總表</a><a class="nav-on" href="/cards?tf={tf}">🃏 突破卡片</a><a href="/wyckoff">🧱 威科夫突破</a><a href="/backtest">🧪 C1門檻回測</a><a href="/exit_backtest">🚪 出場回測</a></div>
 {warn}{banner}
 <div class="tfbar">{tfbar}</div>
 <div class="ctrl"><select id="sec" onchange="f()"><option value="">全部板塊</option>{sector_opts}</select>
 <input class="search-box" id="q" placeholder="搜尋代碼或名稱..." oninput="f()"></div>
 <div style="color:#8b949e;font-size:12px">更新：{last}</div>
 
-<div class="sec"><h3>📈 快突破（{len(quick)}）</h3>
-<div class="desc">還沒收盤站上BO、現價離BO {QUICK_BO_PCT:.0f}% 以內的觀察名單。目標用BO當進場價計算。</div>
+<div class="flow">流程：C系列形態成形 → <b>① 快突破</b>（等它突破）→ 某天收盤站上BO → <b>② 已突破、進行中</b>（追蹤結果）→ 碰SL／達1:1.5／過{MAX_HOLD_BARS}根 → <b>③ 最近結束</b>（記錄成績）</div>
+
+<div class="sec"><h3>📈 ① 快突破（{len(quick)}）</h3>
+<div class="desc">快要突破了，先放進觀察名單：形態已成形，但還沒收盤站上BO，現價離BO {QUICK_BO_PCT:.0f}% 以內。</div>
+<details class="help"><summary>📖 詳細說明</summary><div>
+・<b>條件</b>：C系列至少到C2、MA多頭排列；還沒有任何一根K線「收盤」站上BO；現價離BO ≤ {QUICK_BO_PCT:.0f}%。<br>
+・<b>用途</b>：提前準備——先看圖、決定要不要做，可以在券商預先設好觸價單。<br>
+・<b>BO（Trigger／進場點）</b>= 最後一個C的高點 + 緩衝（天圖1%、時圖0.5%）。<br>
+・<b>SL</b> = 最後一個C的低點 − 緩衝（天圖1%、時圖0.5%）。<br>
+・<b>1:1.5 / 1:2</b>：假設在BO價格進場來計算；括號裡的%是相對BO的距離。「差 x%」= 現價還要漲多少才到BO。<br>
+・<b>接下來</b>：哪天收盤 ≥ BO → 移到 ②；還沒突破就先跌破SL → 形態失敗，直接從名單消失（不會進 ③）。
+</div></details>
 {grid([p for _, p in quick], _render_pending, f"{tf}：目前沒有快突破的。")}</div>
 
-<div class="sec"><h3>🚀 已突破、進行中（{len(act)}）</h3>
-<div class="desc">已經收盤站上BO、還沒碰到SL或1:1.5的案例；碰到其中一個、或超過{MAX_HOLD_BARS}根K線就移到「最近結束」。目標用確認收盤價計算。</div>
+<div class="sec"><h3>🚀 ② 已突破、進行中（{len(act)}）</h3>
+<div class="desc">已經收盤站上BO，正在追蹤結果：還沒碰到SL、也還沒到1:1.5，最多追蹤{MAX_HOLD_BARS}根K線。</div>
+<details class="help"><summary>📖 詳細說明</summary><div>
+・<b>條件</b>：某一根K線「收盤價」≥ BO，系統就把那根的收盤價當成進場價，開始追蹤。<br>
+・<b>為什麼要收盤才算</b>：盤中衝過BO、收盤又跌回來是常見的假突破，等收盤確認可以過濾一部分。<br>
+・<b>確認價（進場）</b>= 突破那根K線的收盤價；1:1.5 / 1:2 改用確認價重新計算（括號%是相對確認價）。<br>
+・<b>現價（±R）</b>= 如果在確認價進場，現在賺／虧幾R（R = 確認價 − SL）。<br>
+・<b>已過 x/{MAX_HOLD_BARS} 根</b>= 突破後過了幾根K線。<br>
+・<b>⚠️不追</b>= 確認價比BO高超過{CHASE_MAX_PCT:.0f}%（突破那天漲太多，追進去SL會很遠）。<b>回補</b>= 第一次部署時回放最近{BACKFILL_BARS}根K線補抓的案例。<br>
+・<b>注意</b>：如果你實際在BO掛觸價買單，盤中一突破就成交，進場價會比確認價低、R會比卡片算的好。<br>
+・<b>接下來</b>：碰到SL、或達1:1.5、或過了{MAX_HOLD_BARS}根 → 移到 ③。
+</div></details>
 {grid(act, _render_active, f"{tf}：目前沒有進行中的突破。")}</div>
 
-<div class="sec"><h3>🏁 最近結束（{len(recent)}）</h3>
+<div class="sec"><h3>🏁 ③ 最近結束（{len(recent)}）</h3>
+<div class="desc">已經有結果的案例，記錄下來算戰績（顯示最近24筆）。</div>
+<details class="help"><summary>📖 詳細說明</summary><div>
+・<b>✅ 達1:1.5</b>：碰到第一個目標，記 +1.5R。<br>
+・<b>❌ 止損</b>：跌破SL，記 −1R（同一根K線同時碰到SL和目標，保守算止損）。<br>
+・<b>⏱ {MAX_HOLD_BARS}根到期</b>：{MAX_HOLD_BARS}根K線內兩個都沒碰到，用當時收盤價算R（可能小賺或小虧）。<br>
+・下方的<b>戰績統計</b>就是用這一區所有案例計算的（存在Volume，不會因部署消失）。
+</div></details>
 {grid(recent, _render_done, f"{tf}：還沒有結束的案例。")}</div>
 
 <div class="sec"><h3>📊 戰績統計（{tf}・共{len(done)}筆）</h3>
@@ -3935,7 +4637,7 @@ details{{background:#22223a;border:1px solid #3a3a55;border-radius:6px;padding:8
 summary{{cursor:pointer;color:#ffb74d}} .lst{{font-size:12px;line-height:1.8;margin-top:6px}}</style></head><body>
 <h2>&#x1F1F2;&#x1F1FE; 大馬莊家思維 ・ C1跌幅門檻回測</h2>
 <div class="subtitle">用歷史K線重播突破卡片的完整規則（BO/SL/1:1.5/20根到期），只改C1跌幅門檻，比較哪一種比較好。正式掃描完全不受影響。</div>
-<div class="nav"><a href="/">📊 C系列總表</a><a href="/cards">🃏 突破卡片</a><a class="nav-on" href="/backtest">🧪 C1門檻回測</a><a href="/exit_backtest">🚪 出場回測</a></div>
+<div class="nav"><a href="/">📊 C系列總表</a><a href="/cards">🃏 突破卡片</a><a href="/wyckoff">🧱 威科夫突破</a><a class="nav-on" href="/backtest">🧪 C1門檻回測</a><a href="/exit_backtest">🚪 出場回測</a></div>
 {status_html}
 <div class="tfbar">{runbar}</div>
 <div class="tfbar">{tfbar}</div>
@@ -3944,6 +4646,133 @@ summary{{cursor:pointer;color:#ffb74d}} .lst{{font-size:12px;line-height:1.8;mar
 ATR% = 14根平均真實波幅 ÷ 收盤價；「3×ATR%」= C1跌幅要超過候選高點那根的ATR%的3倍（波動大的股票門檻自動變高）。<br>
 注意：回測沒算手續費和滑價；同一檔可能同時出現多筆；樣本少於30筆的結果參考就好。</div>
 </body></html>'''
+
+def generate_wyckoff_html():
+    """跟加密版 /wyckoff 同一個版面（表格欄位、階段、說明文字），只換成馬股的顯示方式"""
+    with WY_LOCK:
+        st = {k: v for k, v in WY_STATE.items() if k != 'rows'}
+        rows = list(WY_STATE['rows'])
+    with scan_state['lock']:
+        scanning = scan_state['status'] == 'scanning'
+    f = lambda v: '—' if v is None else fmt_px(v)
+    x = lambda v: '—' if v is None else f'{v:.1f}x'
+    ok = lambda b: '<span style="color:#4cc28e">✓</span>' if b else '<span style="color:#ee7373">✗</span>'
+    css = ('table.wy{border-collapse:collapse;font-size:13px;min-width:900px}table.wy th,table.wy td{border:1px solid #444;padding:5px 8px;vertical-align:top}'
+           'table.wy th{background:#26264a;position:sticky;top:0}table.wy td.c{text-align:center}table.wy a{color:#84aedb;text-decoration:none}'
+           '.note{color:#aab;font-size:13px;max-width:1100px;line-height:1.6}.wrap{overflow-x:auto}.small{font-size:12px;color:#bbb}'
+           'h3.wyh{margin:20px 0 6px;font-size:16px}details summary{cursor:pointer}')
+    autopoll = ('<script>(function p(){fetch("/status").then(r=>r.json()).then(d=>{if(d.status==="done")location.reload();'
+                'else setTimeout(p,15000)}).catch(()=>setTimeout(p,20000))})();</script>') if scanning else ''
+    banner = '<div class="scanning-banner">⏳ C系列掃描進行中，威科夫名單會在掃完後自動更新...</div>' if scanning else ''
+    html = (f'<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+            f'<title>🧱 大馬威科夫</title><style>{CARDS_CSS}{css}</style></head><body>'
+            '<h2>&#x1F1F2;&#x1F1FE; 大馬莊家思維 ・ 威科夫：洗盤 → 真突破（日線）</h2>'
+            '<div class="nav"><a href="/">📊 C系列總表</a><a href="/cards">🃏 突破卡片</a><a class="nav-on" href="/wyckoff">🧱 威科夫突破</a>'
+            '<a href="/backtest">🧪 C1門檻回測</a><a href="/exit_backtest">🚪 出場回測</a></div>'
+            f'{banner}'
+            f'<p class=note>最後更新 {st["last_update"] or "—"}｜跟著C系列掃描一起跑：開市時間每小時一次＋17:40收盤後一次。'
+            '階段只用「已收盤」的日K判斷（收盤後才會變）；重點名單／🟠／🟢 在開市時間每小時盯盤，有事推 Telegram。</p>'
+            f'<p class=note>三個條件：<b>突破前安靜</b>（突破前 {WY_QUIET_WIN} 天裡最安靜的連續 {WY_QUIET_RUN} 天，均量 ≤ {WY_QUIET_MAX:g}×50日均量）、'
+            f'<b>突破時大聲</b>（{WY_LOUD_MIN:g}～{WY_LOUD_MAX:g}× 均量、收在K線上半部；超過 {WY_LOUD_MAX:g} 倍＝爆量異常，像拉盤）、'
+            f'<b>回頭站得穩</b>（突破後 {WY_RETEST_MAX_DAYS} 天內回踩到天花板、從高點回落 ≤ {WY_RETEST_MAX_DROP:g}%、收盤守住、'
+            f'回踩量 ≤ 突破當天 {WY_RETEST_VOL_MAX:.0%} 而且 ≤ 平常量 {WY_RETEST_VOL_MA_MAX:g} 倍）。'
+            '「漲後高位」的區間就算三個條件都過，也只放在 ⚪。成交量資料不夠（零成交日太多）放在 ⛔，不判斷。'
+            '前提：區間裡要先有一次假跌破洗盤。這是找圖的漁網，故事和上方的牆還是要自己看。</p>'
+            + wy_funnel_html(rows))
+
+    def table(sub, stage):
+        h = ('<div class=wrap><table class=wy><tr><th>股票</th><th>日線</th><th>位置</th><th>區間</th><th>洗盤</th>'
+             '<th>安靜</th><th>大聲</th><th>站穩</th>')
+        h += '<th>Entry / SL / 上方空間</th>' if stage == 'green' else ''
+        h += '<th>說明</th></tr>'
+        for r in sub:
+            code = r['symbol'].replace('.KL', '')
+            tv = f"{tv_chart_base()}?symbol={r.get('tv_symbol') or 'MYX:' + code}&interval=D"
+            rng = f'{r["range_from"]} 起 {r["range_days"]} 天<br><span class=small>天花板 {f(r["ceiling"])}<br>地板 {f(r["floor"])}</span>'
+            spring = f'{r["spring_date"]} 刺穿 {r["spring_depth"]:.1f}%<br><span class=small>低點 {f(r["spring_low"])}，量 {x(r.get("spring_vol"))}</span>'
+            quiet = f'{ok(r["quiet_ok"])} {x(r.get("quiet_ratio"))}'
+            if r.get('quiet_from'):
+                quiet += f'<br><span class=small>{r["quiet_from"]} 起{WY_QUIET_RUN}天</span>'
+            loud = (f'{ok(r["loud_ok"])} {r["bo_date"]} {x(r.get("loud_mult"))}<br><span class=small>收盤位置 {r["loud_close_pos"]:.2f}</span>'
+                    if r.get('bo_date') else '—')
+            if r.get('retest_date'):
+                vm = r.get('retest_vol_ma')
+                vm_txt = f'，平常量 {vm:.1f}x' if vm is not None else ''
+                hold = (f'{ok(r["retest_ok"])} {r["retest_date"]}<br><span class=small>低點 {f(r["retest_low"])}，'
+                        f'突破量的 {(r["retest_vol"] or 0):.0%}{vm_txt}</span>')
+            else:
+                hold = '—'
+            h += (f'<tr><td><a href="{tv}" target="_blank"><b>{code}</b></a> <span class=small>{_h(r.get("name") or "")}</span>'
+                  f'<br><span class=small>{_h(r.get("sector") or "")}・{f(r["price"])}</span></td>'
+                  f'<td class=c>{r.get("day_stage", "--")}</td><td>{r["position"]}</td><td>{rng}</td><td>{spring}</td>'
+                  f'<td class=c>{quiet}</td><td>{loud}</td><td>{hold}</td>')
+            if stage == 'green':
+                wr = r.get('wall_r')
+                wr_txt = '藍天（上方沒有日線牆）' if r.get('wall') is None else f'{wr:.2f}R（{r.get("wall_tier") or ""}級牆 {f(r["wall"])}）'
+                if r.get('wall') is not None and r.get('wall_tier') == 'B':
+                    ar = r.get('wallA_r')
+                    wr_txt += '<br><span class=small>' + (f'最近A級牆 {f(r["wallA"])}：{ar:.2f}R' if r.get('wallA') else '上方沒有A級牆') + '</span>'
+                col = '#4cc28e' if (wr is None or wr >= HEADROOM_MIN_R) else '#ee7373'
+                tps = '、'.join(f(t) for t in r.get('tps') or []) or '—'
+                h += (f'<td>Entry <b>{f(r["entry"])}</b><br>SL <b>{f(r["sl"])}</b>（1R {f(r["r1"])}）<br>'
+                      f'<span style="color:{col}">上方空間 {wr_txt}</span><br><span class=small>TP參考：{tps}</span></td>')
+            h += f'<td class=small>{r.get("note", "")}</td></tr>'
+        return h + '</table></div>'
+
+    if not rows and st['status'] != 'done':
+        html += '<div class="empty">還沒有威科夫結果：等這一輪C系列掃描跑完（約10分鐘）就會出現。</div>'
+    for stage in ('green', 'orange', 'yellow', 'weak', 'fail', 'nodata'):
+        sub = [r for r in rows if r['stage'] == stage]
+        label, bg = WY_STAGE_META[stage]
+        if stage == 'nodata':
+            if sub:
+                html += (f'<details><summary class=note style="border-left:6px solid {bg};padding-left:8px">'
+                         f'{label}（{len(sub)}）— 點這裡展開</summary>' + table(sub, stage) + '</details>')
+            continue
+        html += f'<h3 class=wyh style="border-left:6px solid {bg};padding-left:8px">{label}（{len(sub)}）</h3>'
+        if stage == 'green':
+            html += wy_green_rules_html()
+        if not sub:
+            html += '<p class=note>沒有。</p>'
+            continue
+        if stage == 'yellow':
+            focus = [r for r in sub if r.get('focus')]
+            rest = [r for r in sub if not r.get('focus')]
+            html += (f'<p class=note><b>重點名單（{len(focus)}）</b>：離天花板 ≤ {WY_NEAR_CEIL_PCT:g}%、安靜 ✓、不是「S4＋中途整理」。'
+                     '這些股票在開市時間每小時盯盤，正在突破時會推 Telegram。</p>')
+            html += table(focus, stage) if focus else '<p class=note>今天沒有。</p>'
+            if rest:
+                html += (f'<details><summary class=note>其他 {len(rest)} 個（離天花板太遠、量還沒縮，或下跌途中的橫盤）'
+                         '— 點這裡展開</summary>' + table(rest, stage) + '</details>')
+            continue
+        html += table(sub, stage)
+    if st['errors']:
+        html += ('<details><summary class=note>錯誤 ' + str(len(st['errors'])) + ' 筆</summary><pre>'
+                 + _h('\n'.join(st['errors'][:50])) + '</pre></details>')
+    return html + autopoll + '</body></html>'
+
+@app.route('/wyckoff')
+def wyckoff_page():
+    try:
+        return Response(generate_wyckoff_html(), mimetype='text/html')
+    except Exception as e:
+        log.error(f"wyckoff page error: {e}")
+        return f"<html><body style='background:#1a1a2e;color:#eee;font-family:monospace;padding:40px'>🧱 威科夫頁錯誤：{_h(e)}</body></html>", 200
+
+@app.route('/debug_wyckoff')
+def debug_wyckoff():
+    """診斷用：/debug_wyckoff?symbol=0128"""
+    sym = request.args.get('symbol', '0128').upper()
+    if not sym.endswith('.KL'):
+        sym += '.KL'
+    try:
+        df = fetch_ohlcv(sym, '1D')
+        closed = closed_bars(df, '1D').tail(500)
+        r = wy_analyze(sym, closed) if len(closed) >= 121 else None
+        out = {'symbol': sym, 'bars': len(closed), 'last_closed': str(closed.index[-1]) if len(closed) else None, 'result': r}
+    except Exception as e:
+        out = {'error': f'{type(e).__name__}: {e}'}
+    return Response(json.dumps(out, ensure_ascii=False, indent=2, default=str), mimetype='application/json')
 
 @app.route('/exit_backtest')
 def exit_backtest_page():
@@ -4021,7 +4850,7 @@ details{{background:#22223a;border:1px solid #3a3a55;border-radius:6px;padding:8
 summary{{cursor:pointer;color:#ffb74d}} .lst{{font-size:12px;line-height:1.8;margin-top:6px}}</style></head><body>
 <h2>&#x1F1F2;&#x1F1FE; 大馬莊家思維 ・ 出場規則回測</h2>
 <div class="subtitle">同一批進場（突破卡片規則：收盤站上BO進場、SL在最後一個C低點下方），只換出場方式，看哪一種總R最好。正式掃描完全不受影響。</div>
-<div class="nav"><a href="/">📊 C系列總表</a><a href="/cards">🃏 突破卡片</a><a href="/backtest">🧪 C1門檻回測</a><a class="nav-on" href="/exit_backtest">🚪 出場回測</a></div>
+<div class="nav"><a href="/">📊 C系列總表</a><a href="/cards">🃏 突破卡片</a><a href="/wyckoff">🧱 威科夫突破</a><a href="/backtest">🧪 C1門檻回測</a><a class="nav-on" href="/exit_backtest">🚪 出場回測</a></div>
 {status_html}
 <div class="tfbar">{runbar}</div>
 <div class="tfbar">{viewbar}</div>
