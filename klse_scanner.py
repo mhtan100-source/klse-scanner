@@ -3181,7 +3181,7 @@ def _bt_agg(cases):
 
 def run_c1_backtest(tf='1D', bars=None, limit=None):
     with bt_state['lock']:
-        if bt_state['status'] == 'running':
+        if bt_state['status'] == 'running' or ex_state['status'] == 'running':   # 一次只跑一個回測
             return
         bt_state.update({'status': 'running', 'tf': tf, 'done': 0, 'error': None, 'results': None,
                          'started': datetime.now(MY_TZ).strftime('%Y-%m-%d %H:%M'), 'finished': None})
@@ -3255,6 +3255,159 @@ def load_bt_result(tf):
     except Exception:
         return None
 
+# ============================================================
+# 🚪 出場規則回測：同一批進場（突破卡片規則），只換出場方式比較
+# 進場 = 收盤站上BO那根的收盤價；初始SL = 最後一個C低點−緩衝（跟卡片一樣）
+# 跳空低開到SL下方 → 用開盤價出場（比較接近實際）；同一根同時碰SL和目標 → 保守算SL
+# ============================================================
+EXIT_RULES = [
+    # (名稱, 目標R(None=不設目標), 最多持有根數, 1R後移保本, 收盤跌破MA20出場)
+    ('1.5R / 20根（現在）',          1.5, 20,  False, False),
+    ('1.5R / 40根',                 1.5, 40,  False, False),
+    ('1R / 20根',                   1.0, 20,  False, False),
+    ('2R / 40根',                   2.0, 40,  False, False),
+    ('1.5R / 20根 + 1R後保本',       1.5, 20,  True,  False),
+    ('不設目標：1R後保本＋跌破MA20走（最多60根）', None, 60, True, True),
+    ('只看SL或1.5R（不限時間，最多120根）', 1.5, 120, False, False),
+]
+ex_state = {'status': 'idle', 'tf': None, 'c1': None, 'done': 0, 'total': 0, 'started': None,
+            'finished': None, 'error': None, 'lock': threading.Lock()}
+
+def _ex_file(tf, c1):
+    return os.path.join(DATA_DIR, f'exit_bt_{tf}_c{int(c1)}.json')
+
+def _simulate_exit(df, e_idx, entry, sl0, rule, ma20):
+    """回傳 (R倍數, 出場原因, 持有根數, MFE) ；資料不夠走完回傳 None"""
+    name, tgt, max_bars, be, ma_exit = rule
+    r = entry - sl0
+    if r <= 0: return None
+    o = df['open'].values; h = df['high'].values; l = df['low'].values; c = df['close'].values
+    sl = sl0; be_on = False; mfe = 0.0
+    tp = entry + tgt * r if tgt is not None else None
+    n = len(df)
+    for k in range(1, max_bars + 1):
+        i = e_idx + k
+        if i >= n:
+            return None
+        if l[i] <= sl:
+            px = o[i] if o[i] < sl else sl
+            return ((px - entry) / r, '保本' if be_on and abs(sl - entry) < 1e-12 else 'SL', k, mfe)
+        if tp is not None and h[i] >= tp:
+            return (tgt, 'TP', k, max(mfe, tgt))
+        mfe = max(mfe, (h[i] - entry) / r)
+        if be and not be_on and h[i] >= entry + r:
+            be_on = True; sl = max(sl, entry)
+        if ma_exit and be_on and not pd.isna(ma20[i]) and c[i] < ma20[i]:
+            return ((c[i] - entry) / r, 'MA20', k, mfe)
+        if k == max_bars:
+            return ((c[i] - entry) / r, '到期', k, mfe)
+    return None
+
+def _ex_agg(rows):
+    n = len(rows)
+    if not n:
+        return {'n': 0, 'win': 0, 'loss': 0, 'flat': 0, 'winrate': None, 'avg_r': None, 'total_r': 0.0,
+                'avg_bars': None, 'tp': 0, 'sl': 0, 'other': 0}
+    w = sum(1 for x in rows if x['r'] > 0.05); lo = sum(1 for x in rows if x['r'] < -0.05)
+    tot = sum(x['r'] for x in rows)
+    return {'n': n, 'win': w, 'loss': lo, 'flat': n - w - lo,
+            'winrate': round(w / n * 100, 1), 'avg_r': round(tot / n, 3), 'total_r': round(tot, 1),
+            'avg_bars': round(sum(x['bars'] for x in rows) / n, 1),
+            'tp': sum(1 for x in rows if x['why'] == 'TP'), 'sl': sum(1 for x in rows if x['why'] == 'SL'),
+            'other': sum(1 for x in rows if x['why'] not in ('TP', 'SL'))}
+
+def run_exit_backtest(tf='1D', c1=10, bars=None, limit=None):
+    with ex_state['lock']:
+        if ex_state['status'] == 'running' or bt_state['status'] == 'running':
+            return
+        ex_state.update({'status': 'running', 'tf': tf, 'c1': c1, 'done': 0, 'error': None, 'finished': None,
+                         'started': datetime.now(MY_TZ).strftime('%Y-%m-%d %H:%M')})
+    bars = bars or BT_DEFAULT_BARS.get(tf, 500)
+    cfg = {} if float(c1) == MIN_DROP_PCT else {'min_drop': float(c1)}
+    seen = set()
+    syms = [s for s in SYMBOLS if s not in seen and not seen.add(s)]
+    if limit: syms = syms[:limit]
+    ex_state['total'] = len(syms)
+    per_rule = {rule[0]: [] for rule in EXIT_RULES}
+    entries_n = 0; open_n = {rule[0]: 0 for rule in EXIT_RULES}; mfes = []
+    first_date = last_date = None
+    try:
+        for si, sym in enumerate(syms):
+            meta = {'symbol': sym, 'name': NAMES.get(sym, sym.replace('.KL', '')),
+                    'sector': SECTORS.get(sym, '其他'), 'tv_symbol': f"MYX:{sym.replace('.KL', '')}"}
+            try:
+                daily = fetch_ohlcv(sym, '1D')
+                df = daily if tf == '1D' else fetch_ohlcv(sym, tf)
+                if df.empty or len(df) < 300 or daily.empty:
+                    continue
+                daily_dates = [pd.Timestamp(x).date() for x in daily.index]
+                n = len(df)
+                start = max(260, n - bars)
+                d0 = str(df.index[start])[:10]; d1 = str(df.index[-1])[:10]
+                first_date = d0 if first_date is None or d0 < first_date else first_date
+                last_date = d1 if last_date is None or d1 > last_date else last_date
+                st = {'pending': {}, 'active': {}, 'done': [], 'used': {}, 'events': []}
+                for t in list(range(start, n, BT_STEP)) + [n]:
+                    d = df.iloc[:t]
+                    dd = d if tf == '1D' else daily.iloc[:bisect_right(daily_dates, pd.Timestamp(d.index[-1]).date())]
+                    _card_step(meta, tf, d, d, analyze(d, dd, cfg), backfill=True, st=st)
+                entries = st['done'] + list(st['active'].values())
+                ma20 = calc_sma(df['close'], 20).values
+                pos_of = {_iso(t): i for i, t in enumerate(df.index)}
+                for e in entries:
+                    e_idx = pos_of.get(e['confirm_time'])
+                    if e_idx is None: continue
+                    entries_n += 1
+                    for rule in EXIT_RULES:
+                        out = _simulate_exit(df, e_idx, e['entry'], e['sl'], rule, ma20)
+                        if out is None:
+                            open_n[rule[0]] += 1; continue
+                        rm, why, k, mfe = out
+                        per_rule[rule[0]].append({'symbol': sym, 'name': meta['name'], 'confirm_time': e['confirm_time'],
+                                                  'entry': e['entry'], 'sl': e['sl'], 'r': round(float(rm), 3), 'why': why,
+                                                  'bars': k, 'stage': e.get('stage'), 'chase': bool(e.get('chase')),
+                                                  'mfe': round(float(mfe), 2)})
+            except Exception as ex:
+                log.warning(f"🚪 exit backtest {sym}: {ex}")
+            ex_state['done'] = si + 1
+            time.sleep(0.2)
+
+        # MFE分布：用「不限時間」那條規則之外的20根版本看突破後20根內最多漲到幾R
+        base = per_rule[EXIT_RULES[0][0]]
+        mfe_bins = {'<0.5R': 0, '0.5~1R': 0, '1~1.5R': 0, '≥1.5R': 0}
+        for x in base:
+            m = x['mfe']
+            k = '<0.5R' if m < 0.5 else ('0.5~1R' if m < 1 else ('1~1.5R' if m < 1.5 else '≥1.5R'))
+            mfe_bins[k] += 1
+        results = {'tf': tf, 'c1': c1, 'bars': bars, 'symbols': len(syms), 'entries': entries_n,
+                   'period': [first_date, last_date], 'mfe_bins_20': mfe_bins,
+                   'finished': datetime.now(MY_TZ).strftime('%Y-%m-%d %H:%M'), 'rules': []}
+        for rule in EXIT_RULES:
+            rows = per_rule[rule[0]]
+            results['rules'].append({
+                'name': rule[0], 'open': open_n[rule[0]],
+                'all': _ex_agg(rows),
+                'nochase': _ex_agg([x for x in rows if not x['chase']]),
+                's2': _ex_agg([x for x in rows if x.get('stage') == 2]),
+                'cases': sorted(rows, key=lambda x: x['confirm_time'], reverse=True)[:40],
+            })
+        with open(_ex_file(tf, c1), 'w', encoding='utf-8') as f:
+            json.dump(results, f, ensure_ascii=False, default=str)
+        with ex_state['lock']:
+            ex_state.update({'status': 'done', 'finished': results['finished']})
+        log.info(f"🚪 出場規則回測完成 {tf} C1={c1}%：{entries_n}筆進場")
+    except Exception as ex:
+        log.error(f"🚪 exit backtest error: {ex}")
+        with ex_state['lock']:
+            ex_state.update({'status': 'error', 'error': str(ex)})
+
+def load_ex_result(tf, c1):
+    try:
+        with open(_ex_file(tf, c1), 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return None
+
 load_cards()
 
 app = Flask(__name__)
@@ -3303,7 +3456,7 @@ HTML = """<!DOCTYPE html>
 </style></head><body>
 <h2>&#x1F1F2;&#x1F1FE; 大馬莊家思維掃描器</h2>
 <div class="subtitle">KLSE股票 · 操盤跟莊（邏輯已對齊 莊家思維 Contraction V53）</div>
-<div class="nav"><a class="nav-on" href="/">📊 C系列總表</a><a href="/cards">🃏 突破卡片</a><a href="/backtest">🧪 C1門檻回測</a></div>
+<div class="nav"><a class="nav-on" href="/">📊 C系列總表</a><a href="/cards">🃏 突破卡片</a><a href="/backtest">🧪 C1門檻回測</a><a href="/exit_backtest">🚪 出場回測</a></div>
 SCANNING_BANNER
 <div class="ctrl-bar">
   <button class="btn btn-blue" onclick="startRefresh()" id="refreshBtn">&#x1F504; 重新掃描</button>
@@ -3651,7 +3804,7 @@ def build_cards_html(tf):
 <title>🃏 大馬突破卡片</title><style>{CARDS_CSS}</style></head><body>
 <h2>&#x1F1F2;&#x1F1FE; 大馬莊家思維 ・ 突破卡片</h2>
 <div class="subtitle">BO = 最後一個C高點+緩衝（收盤確認）・ SL = 最後一個C低點−緩衝（天圖1%、時圖0.5%）・ 目標 1:1.5 / 1:2 ・ 至少C2、只看多頭</div>
-<div class="nav"><a href="/">📊 C系列總表</a><a class="nav-on" href="/cards?tf={tf}">🃏 突破卡片</a><a href="/backtest">🧪 C1門檻回測</a></div>
+<div class="nav"><a href="/">📊 C系列總表</a><a class="nav-on" href="/cards?tf={tf}">🃏 突破卡片</a><a href="/backtest">🧪 C1門檻回測</a><a href="/exit_backtest">🚪 出場回測</a></div>
 {warn}{banner}
 <div class="tfbar">{tfbar}</div>
 <div class="ctrl"><select id="sec" onchange="f()"><option value="">全部板塊</option>{sector_opts}</select>
@@ -3778,7 +3931,7 @@ details{{background:#22223a;border:1px solid #3a3a55;border-radius:6px;padding:8
 summary{{cursor:pointer;color:#ffb74d}} .lst{{font-size:12px;line-height:1.8;margin-top:6px}}</style></head><body>
 <h2>&#x1F1F2;&#x1F1FE; 大馬莊家思維 ・ C1跌幅門檻回測</h2>
 <div class="subtitle">用歷史K線重播突破卡片的完整規則（BO/SL/1:1.5/20根到期），只改C1跌幅門檻，比較哪一種比較好。正式掃描完全不受影響。</div>
-<div class="nav"><a href="/">📊 C系列總表</a><a href="/cards">🃏 突破卡片</a><a class="nav-on" href="/backtest">🧪 C1門檻回測</a></div>
+<div class="nav"><a href="/">📊 C系列總表</a><a href="/cards">🃏 突破卡片</a><a class="nav-on" href="/backtest">🧪 C1門檻回測</a><a href="/exit_backtest">🚪 出場回測</a></div>
 {status_html}
 <div class="tfbar">{runbar}</div>
 <div class="tfbar">{tfbar}</div>
@@ -3786,6 +3939,92 @@ summary{{cursor:pointer;color:#ffb74d}} .lst{{font-size:12px;line-height:1.8;mar
 <div class="foot">勝率 = ✅ ÷（✅+❌）；⏱ = 20根到期（不算勝負，但計入平均R和總R）。「總R」= 每筆都冒1R風險時累積的結果，比勝率更能看出整體賺不賺。<br>
 ATR% = 14根平均真實波幅 ÷ 收盤價；「3×ATR%」= C1跌幅要超過候選高點那根的ATR%的3倍（波動大的股票門檻自動變高）。<br>
 注意：回測沒算手續費和滑價；同一檔可能同時出現多筆；樣本少於30筆的結果參考就好。</div>
+</body></html>'''
+
+@app.route('/exit_backtest')
+def exit_backtest_page():
+    """🚪 出場規則回測。?run=1D&c1=10 開始（背景執行），可加 &limit=50 先試"""
+    run_tf = request.args.get('run', '').upper()
+    c1 = request.args.get('c1', '10')
+    c1 = int(c1) if c1.isdigit() and 1 <= int(c1) <= 30 else 10
+    if run_tf in TF_LABELS:
+        limit = request.args.get('limit')
+        limit = int(limit) if limit and limit.isdigit() else None
+        threading.Thread(target=run_exit_backtest, args=(run_tf, c1, None, limit), daemon=True).start()
+        time.sleep(0.5)
+        return redirect(f'/exit_backtest?tf={run_tf}&c1={c1}')
+    view_tf = request.args.get('tf', ex_state.get('tf') or '1D').upper()
+    if view_tf not in TF_LABELS: view_tf = '1D'
+
+    with ex_state['lock']:
+        st = {k: v for k, v in ex_state.items() if k != 'lock'}
+    busy_c1 = bt_state['status'] == 'running'
+    res = load_ex_result(view_tf, c1)
+
+    if st['status'] == 'running':
+        pct = st['done'] / st['total'] * 100 if st['total'] else 0
+        status_html = (f'<div class="scanning-banner">⏳ 出場回測中（{st["tf"]}・C1 {st["c1"]}%）：{st["done"]}/{st["total"]} 檔（{pct:.0f}%）・'
+                       f'開始於 {st["started"]}・頁面每30秒自動更新</div>'
+                       '<script>setTimeout(function(){location.reload()},30000)</script>')
+    elif st['status'] == 'error':
+        status_html = f'<div class="warnbox">❌ 回測出錯：{_h(st["error"])}</div>'
+    elif busy_c1:
+        status_html = '<div class="warnbox">🧪 C1門檻回測正在跑，等它跑完才能開始出場回測。</div>'
+    else:
+        status_html = ''
+
+    runbar = ''.join(
+        f'<a href="/exit_backtest?run={t}&c1={c}" onclick="return confirm(\'開始跑 {t}（C1 {c}%）出場回測？\')">▶ 跑 {t}・C1 {c}%</a>'
+        for t in ('1D', '4H') for c in (10, 7))
+    viewbar = ''.join(
+        f'<a class="{"on" if (t == view_tf and c == c1) else ""}" href="/exit_backtest?tf={t}&c1={c}">{t}・C1 {c}% 結果</a>'
+        for t in ('1D', '4H', '1H') for c in (10, 7))
+
+    if res:
+        def cells(s):
+            wr = f'{s["winrate"]:.0f}%' if s['winrate'] is not None else '-'
+            ar = f'{s["avg_r"]:+.2f}R' if s['avg_r'] is not None else '-'
+            ab = f'{s["avg_bars"]}' if s['avg_bars'] is not None else '-'
+            return (f'<td>{s["n"]}</td><td>{s["tp"]}</td><td>{s["sl"]}</td><td>{s["other"]}</td>'
+                    f'<td>{wr}</td><td>{ar}</td><td><b>{s["total_r"]:+.1f}R</b></td><td>{ab}</td>')
+        rows = ''
+        for rl in res['rules']:
+            rows += f'<tr><td class="g"><b>{_h(rl["name"])}</b></td><td class="g">全部</td>{cells(rl["all"])}<td>{rl["open"]}</td></tr>'
+            rows += f'<tr><td></td><td class="g">排除⚠️不追</td>{cells(rl["nochase"])}<td></td></tr>'
+            rows += f'<tr><td></td><td class="g">只看日線S2</td>{cells(rl["s2"])}<td></td></tr>'
+        mb = res.get('mfe_bins_20', {})
+        mtot = sum(mb.values()) or 1
+        mfe_html = '・'.join(f'{k}：{v}筆（{v / mtot * 100:.0f}%）' for k, v in mb.items())
+        lists = ''
+        for rl in res['rules']:
+            li = ''.join(
+                f'<div>{_fmt_time(x["confirm_time"], res["tf"])} <b>{_h(x["symbol"].replace(".KL", ""))}</b> {_h(x.get("name") or "")} '
+                f'進場{fmt_px(x["entry"])} SL{fmt_px(x["sl"])} → {x["why"]} 第{x["bars"]}根 '
+                f'<span class="{"pos" if x["r"] > 0 else "neg"}">{x["r"]:+.2f}R</span>（最多漲到{x["mfe"]:.1f}R）</div>'
+                for x in rl['cases'][:15])
+            lists += f'<details><summary>{_h(rl["name"])}：最近15筆</summary><div class="lst">{li or "沒有案例"}</div></details>'
+        body = f'''
+<div class="desc">期間 {res["period"][0]} ～ {res["period"][1]}・{res["symbols"]}檔・進場共 {res["entries"]} 筆（C1門檻 {res["c1"]}%）・完成於 {res["finished"]}</div>
+<div class="desc">📏 突破後20根內「最多漲到幾R」（MFE）：{mfe_html}</div>
+<table class="st"><tr><th>出場規則</th><th>範圍</th><th>筆數</th><th>🎯達標</th><th>❌SL</th><th>其他出場</th><th>賺錢比例</th><th>平均R</th><th>總R</th><th>平均持有根數</th><th>未走完</th></tr>{rows}</table>
+<div class="sec"><h3>🔍 抽查案例</h3>{lists}</div>'''
+    else:
+        body = f'<div class="empty">{view_tf}・C1 {c1}%：還沒有出場回測結果。按上面的「▶ 跑」開始。</div>'
+
+    return f'''<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>🚪 出場規則回測</title><style>{CARDS_CSS}
+details{{background:#22223a;border:1px solid #3a3a55;border-radius:6px;padding:8px 12px;margin-bottom:6px;max-width:1150px}}
+summary{{cursor:pointer;color:#ffb74d}} .lst{{font-size:12px;line-height:1.8;margin-top:6px}}</style></head><body>
+<h2>&#x1F1F2;&#x1F1FE; 大馬莊家思維 ・ 出場規則回測</h2>
+<div class="subtitle">同一批進場（突破卡片規則：收盤站上BO進場、SL在最後一個C低點下方），只換出場方式，看哪一種總R最好。正式掃描完全不受影響。</div>
+<div class="nav"><a href="/">📊 C系列總表</a><a href="/cards">🃏 突破卡片</a><a href="/backtest">🧪 C1門檻回測</a><a class="nav-on" href="/exit_backtest">🚪 出場回測</a></div>
+{status_html}
+<div class="tfbar">{runbar}</div>
+<div class="tfbar">{viewbar}</div>
+{body}
+<div class="foot">「賺錢比例」= R > 0 的筆數 ÷ 全部（保本出場算打平，不算賺也不算虧）。「總R」= 每筆冒1R風險時累積的結果，最能看出整體賺不賺。<br>
+「保本」= 漲到1R後把SL移到進場價。「跌破MA20走」= 保本啟動後，收盤跌破20根均線就用收盤價出場。<br>
+跳空低開到SL下方用開盤價計算；同一根同時碰SL和目標保守算SL；沒算手續費和滑價；「未走完」= 資料到今天還沒出場的筆數，不計入統計。</div>
 </body></html>'''
 
 @app.route('/backtest_json')
