@@ -1806,7 +1806,10 @@ def tv_chart_base():
 # ============================================================
 # C系列參數（對齊 莊家思維 Contraction V53 / scannerrailway.py）
 # ============================================================
-MIN_DROP_PCT       = 10.0   # C1最小跌幅%，跟Pine的minDropPct一致；股票波動比crypto小，如果訊號太少可調低
+# C1最小跌幅%（MH自訂，非老師SOP）。2026-10-26回測後決定：股票用7%、加密貨幣維持10%。
+# TradingView看馬股時，莊家思維指標的minDropPct也要設成7，圖和scanner才會一致。
+# 可用Railway環境變數 MIN_DROP_PCT 覆寫。
+MIN_DROP_PCT       = float(os.environ.get('MIN_DROP_PCT', '7'))
 SLOPE_THRESHOLD_PCT = 0.05  # 走平判定閾值(%)，跟Pine的slopeThreshold一致
 S3_LOOKBACK_BARS    = 90    # S3判斷「是否曾向上」回看根數
 
@@ -3153,9 +3156,9 @@ def send_card_telegram():
 from bisect import bisect_right
 
 BT_CONFIGS = [
-    ('固定10%（現在）', {}),
-    ('固定7%',         {'min_drop': 7}),
-    ('固定5%',         {'min_drop': 5}),
+    ('固定10%', {'min_drop': 10}),
+    ('固定7%',  {'min_drop': 7}),
+    ('固定5%',  {'min_drop': 5}),
     ('3×ATR%',        {'atr_mult': 3}),
     ('4×ATR%',        {'atr_mult': 4}),
 ]
@@ -3230,10 +3233,11 @@ def run_c1_backtest(tf='1D', bars=None, limit=None):
                    'finished': datetime.now(MY_TZ).strftime('%Y-%m-%d %H:%M'), 'configs': []}
         for name, cfg in BT_CONFIGS:
             cases = per[name]['cases']
+            label = name + ('（現在）' if cfg.get('min_drop') == MIN_DROP_PCT else '')
             s2 = [c for c in cases if c.get('stage') == 2]
             nochase = [c for c in cases if not c.get('chase')]
             results['configs'].append({
-                'name': name, 'cfg': cfg, 'open': per[name]['open'],
+                'name': label, 'cfg': cfg, 'open': per[name]['open'],
                 'all': _bt_agg(cases), 's2': _bt_agg(s2), 'nochase': _bt_agg(nochase),
                 'stocks': len({c['symbol'] for c in cases}),
                 'cases': sorted(cases, key=lambda c: c.get('confirm_time') or '', reverse=True),
