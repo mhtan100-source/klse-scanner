@@ -1,6 +1,9 @@
 """
-莊家思維 大馬股票掃描器 (KLSE)
-- 數據來源：yfinance (.KL)
+莊家思維 股票掃描器（多市場：🇲🇾 KLSE ＋ 🇺🇸 美股）
+- 2026-10-27：美股併進這個服務。同一份程式在同一個Railway服務裡載入兩次（KLSE一份、美股一份），
+  兩個市場的狀態、資料檔、排程完全分開；美股網頁在 /us 底下。之後新加坡／港股／A股照同樣方式加。
+- 環境變數 MARKETS 決定開哪些市場（預設 KLSE,US）。美股專用的設定加前綴 US_（例：US_TG_MIN_TURNOVER）。
+- 數據來源：yfinance (.KL / 美股代碼)
 - 邏輯：C系列收縮（對齊 莊家思維 Contraction V53 / scannerrailway.py 核心演算法）
 - 通知：Telegram
 - 界面：Flask Web（視覺風格對齊 crypto 版 scannerrailway.py）
@@ -17,6 +20,8 @@ import numpy as np
 from datetime import datetime, timedelta
 from flask import Flask, jsonify, Response, request, redirect
 import pytz
+import re
+import json
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger(__name__)
@@ -24,6 +29,65 @@ log = logging.getLogger(__name__)
 TELEGRAM_TOKEN   = os.environ.get('TELEGRAM_TOKEN', '')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
 MY_TZ = pytz.timezone('Asia/Kuala_Lumpur')
+
+# ============================================================
+# 🌏 市場設定：每個市場一份。SCANNER_MARKET 決定這一份程式是哪個市場（由啟動程式設定）
+# ============================================================
+MKT_CFG = {
+    'KLSE': {
+        'flag': '🇲🇾', 'flag_html': '&#x1F1F2;&#x1F1FE;', 'name': '大馬', 'short': 'KLSE', 'tab': '🇲🇾 馬股',
+        'base': '', 'env_prefix': '', 'tz': 'Asia/Kuala_Lumpur',
+        'open': (9, 0), 'close': (17, 0), 'daily_close': (17, 5), 'post_close': (17, 40), 'post_close_end': (19, 0),
+        'scan_every_min': 60, 'currency': 'RM', 'suffix': '.KL', 'tv_prefix': 'MYX:',
+        'auto_adjust': True, 'rs_benchmark': '', 'turnover_env': 'TG_MIN_TURNOVER_MYR', 'default_sym': '1155.KL',
+        'data_sub': '', 'tg_tfs': '1D', 'html_replace': [],
+    },
+    'US': {
+        'flag': '🇺🇸', 'flag_html': '&#x1F1FA;&#x1F1F8;', 'name': '美股', 'short': 'US', 'tab': '🇺🇸 美股',
+        'base': '/us', 'env_prefix': 'US_', 'tz': 'America/New_York',
+        'open': (9, 30), 'close': (16, 0), 'daily_close': (16, 5), 'post_close': (16, 20), 'post_close_end': (18, 0),
+        'scan_every_min': 30, 'currency': 'US$', 'suffix': '', 'tv_prefix': '',
+        # 美股沿用舊us_scanner.py的資料設定：只做拆股調整、不做股息調整（跟TradingView預設一致）、4H對齊美東開盤
+        'auto_adjust': False, 'rs_benchmark': 'SPY', 'turnover_env': 'US_TG_MIN_TURNOVER', 'default_sym': 'AAPL',
+        'data_sub': 'us', 'tg_tfs': '1D,4H,1H',   # MH 2026-10-27：美股可開單／突破卡片推 1D、4H、1H
+        'html_replace': [('&#x1F1F2;&#x1F1FE;', '&#x1F1FA;&#x1F1F8;'), ('🇲🇾', '🇺🇸'), ('大馬', '美股'),
+                         ('KLSE股票', '美股'), ('板塊', '行業'),
+                         ('開市時間每小時一次＋17:40收盤後一次', '開盤時間每30分鐘一次＋收盤後一次（美東16:20，大馬時間清晨）'),
+                         ('每小時盯盤', '每30分鐘盯盤'), ('17:05後', '美東16:05後')],
+    },
+}
+MARKET     = os.environ.get('SCANNER_MARKET', 'KLSE').upper()
+if MARKET not in MKT_CFG:
+    MARKET = 'KLSE'
+M          = MKT_CFG[MARKET]
+MKT_TZ     = pytz.timezone(M['tz'])
+BASE       = M['base']                     # 網址前綴：KLSE是 ''，美股是 '/us'
+SUFFIX     = M['suffix']
+ACTIVE_MARKETS = [MARKET]                  # 啟動程式會改成實際開的全部市場（網頁上方切換按鈕用）
+GLOBAL_SCAN_LOCK = threading.Lock()        # 啟動程式會換成全部市場共用的同一把鎖：一次只掃一個市場，避免Yahoo限流
+
+def menv(name, default):
+    """市場專用環境變數：KLSE讀原本的名字（舊設定不用改），美股讀 US_ 前綴"""
+    return os.environ.get(M['env_prefix'] + name, default)
+
+def sym_code(sym):
+    return sym[:-len(SUFFIX)] if SUFFIX and sym.endswith(SUFFIX) else sym
+
+def tv_sym(sym):
+    return f"{M['tv_prefix']}{sym_code(sym)}"
+
+def norm_sym(raw):
+    """使用者輸入的代碼 → 程式內部代碼（KLSE補.KL；美股去掉 NASDAQ: 這類前綴、BRK.B→BRK-B）"""
+    s = (raw or '').strip().upper()
+    if ':' in s:
+        s = s.split(':')[-1]
+    if SUFFIX:
+        return s if s.endswith(SUFFIX) else s + SUFFIX
+    return s.replace('.', '-')
+
+def label_of(name, sym):
+    code = sym_code(sym)
+    return code if (not name or name == code) else f'{name}({code})'
 
 SYMBOLS = [
     '1155.KL',
@@ -1794,11 +1858,57 @@ TV_SYMBOLS = {
     '0310.KL': 'UUE',
 }
 
+# ============================================================
+# 🇺🇸 美股股票清單（從舊 us_scanner.py 搬過來，依行業分組；程式會自動去重）
+# 2026-09 清理：SQ→XYZ、GOLD→B、PARA→PSKY、L3H(錯誤代碼)→LHX；移除已下市：DFS、PXD、HES、MRO、X
+# 有代碼抓不到資料時，打開 /us/debug_missing 看是哪幾隻
+# ============================================================
+US_SECTOR_SYMBOLS = {
+    '指數ETF': ['SPY','QQQ','DIA','IWM','SMH','ARKK','GLD',
+               'XLK','XLF','XLE','XLV','XLI','XLC','XLY','XLP','XLB','XLRE','XLU'],
+    '科技': ['AAPL','MSFT','GOOGL','META','AMZN','ORCL','CRM','ADBE','NOW','INTU',
+            'WDAY','NFLX','PYPL','UBER','SNOW','PLTR','XYZ','SHOP','NET','DDOG',
+            'ZS','CRWD','PANW','OKTA','TWLO','MDB','ABNB','DASH','RBLX','U',
+            'LYFT','SNAP','PINS','RDDT','APP','TTD','SPOT','DUOL','TOST','DELL',
+            'HPE','ANET','IONQ','CRWV','NBIS'],
+    '半導體': ['NVDA','AMD','INTC','TSM','AVGO','QCOM','TXN','MU','AMAT','LRCX',
+             'KLAC','MRVL','MCHP','ON','SWKS','MPWR','ENTG','WOLF','SMCI','ARM',
+             'ASML','ALAB'],
+    '金融': ['JPM','BAC','GS','MS','WFC','C','BLK','V','MA','AXP',
+            'COF','SCHW','IBKR','MET','PRU','AFL','TRV','PGR','CB',
+            'COIN','HOOD','AFRM','SOFI','NU','MSTR'],
+    '醫療': ['JNJ','UNH','PFE','ABBV','MRK','LLY','TMO','ABT','DHR','AMGN',
+            'GILD','BIIB','REGN','VRTX','ISRG','BSX','SYK','MDT','ZBH','EW',
+            'NVO','HIMS'],
+    '消費': ['WMT','HD','MCD','NKE','SBUX','TGT','COST','LOW','TJX','DG',
+            'BKNG','MAR','HLT','CMG','YUM','DPZ','WYNN','MGM','LVS',
+            'DECK','ONON','ELF','CELH','CAVA','CVNA','MELI','SE'],
+    '能源': ['XOM','CVX','COP','SLB','EOG','MPC','PSX','VLO','HAL','BKR',
+            'OXY','DVN','FANG','APA','NOG'],
+    '工業': ['BA','CAT','GE','MMM','HON','LMT','RTX','DE','UPS','FDX',
+            'NOC','GD','LHX','TDG','EMR','ETN','ROK','PH','AME','FAST',
+            'GEV','VRT','PWR','AXON','RKLB'],
+    '通訊媒體': ['T','VZ','TMUS','CMCSA','DIS','CHTR','WBD','PSKY','FOX'],
+    '原材料': ['NEM','FCX','AA','CLF','NUE','B','RS','ATI'],
+    '房地產': ['AMT','PLD','EQIX','CCI','SPG','O','WPC','VICI','IRM','WELL'],
+    '公用事業': ['CEG','VST'],
+    'EV/新能源': ['TSLA','RIVN','LCID','NIO','XPEV','LI','F','GM','STLA',
+                'ENPH','SEDG','RUN','ARRY','BE','FCEL','PLUG'],
+}
+
+if MARKET == 'US':
+    SYMBOLS, NAMES, SECTORS, TV_SYMBOLS = [], {}, {}, {}
+    for _sec, _lst in US_SECTOR_SYMBOLS.items():
+        for _s in _lst:
+            if _s not in SECTORS:
+                SECTORS[_s] = _sec
+                SYMBOLS.append(_s)
+
 TF_LABELS = ['1D', '4H', '1H']   # 由高到低（跟crypto版TF_LABELS的順序相反，這裡直接就是高到低）
 TV_INTERVAL  = {'1H': '60', '4H': '240', '1D': 'D'}
 # 跟crypto版(scannerrailway.py)共用同一個TradingView Layout（莊家思維指標已經加在上面），
 # 預設值bd3vZUwt是crypto版目前使用的Layout代碼；可用環境變數TV_LAYOUT_ID覆寫
-TV_LAYOUT_ID = os.environ.get('TV_LAYOUT_ID', 'bd3vZUwt')
+TV_LAYOUT_ID = os.environ.get('TV_LAYOUT_ID', 'bd3vZUwt')   # 美股也用同一個Layout（莊家思維指標在上面）
 
 def tv_chart_base():
     return f"https://www.tradingview.com/chart/{TV_LAYOUT_ID}/" if TV_LAYOUT_ID else "https://www.tradingview.com/chart/"
@@ -1809,7 +1919,7 @@ def tv_chart_base():
 # C1最小跌幅%（MH自訂，非老師SOP）。2026-10-26回測後決定：股票用7%、加密貨幣維持10%。
 # TradingView看馬股時，莊家思維指標的minDropPct也要設成7，圖和scanner才會一致。
 # 可用Railway環境變數 MIN_DROP_PCT 覆寫。
-MIN_DROP_PCT       = float(os.environ.get('MIN_DROP_PCT', '7'))
+MIN_DROP_PCT       = float(menv('MIN_DROP_PCT', '7'))   # 美股可用 US_MIN_DROP_PCT 另外設定（預設同樣7%）
 SLOPE_THRESHOLD_PCT = 0.05  # 走平判定閾值(%)，跟Pine的slopeThreshold一致
 S3_LOOKBACK_BARS    = 90    # S3判斷「是否曾向上」回看根數
 
@@ -1852,7 +1962,7 @@ MISSING_INFO_SYMBOLS = [
     '7112.KL', '7120.KL', '7123.KL', '7140.KL', '7164.KL', '7173.KL', '7213.KL', '7215.KL',
     '7219.KL', '7315.KL', '7439.KL', '7854.KL', '8699.KL', '8826.KL', '8893.KL', '9148.KL',
     '9237.KL', '9288.KL', '9334.KL', '9881.KL',
-]
+] if MARKET == 'KLSE' else []
 missing_audit_state = {'status': 'idle', 'checked': 0, 'total': 0, 'results': [], 'lock': threading.Lock()}
 
 def run_missing_audit():
@@ -1953,12 +2063,42 @@ def run_name_audit():
     log.info(f"股票代碼核對完成：共{len(SYMBOLS)}檔，發現{len(audit_state['mismatches'])}個疑似錯置")
 
 def is_market_hours():
-    now = datetime.now(MY_TZ)
+    now = datetime.now(MKT_TZ)
     if now.weekday() >= 5:
         return False
-    open_t  = now.replace(hour=9,  minute=0,  second=0, microsecond=0)
-    close_t = now.replace(hour=17, minute=0,  second=0, microsecond=0)
+    open_t  = now.replace(hour=M['open'][0],  minute=M['open'][1],  second=0, microsecond=0)
+    close_t = now.replace(hour=M['close'][0], minute=M['close'][1], second=0, microsecond=0)
     return open_t <= now <= close_t
+
+def _clean_ohlcv(df):
+    if df is None or df.empty:
+        return pd.DataFrame()
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    df.columns = [str(c).lower() for c in df.columns]
+    need = ['open', 'high', 'low', 'close', 'volume']
+    if not all(c in df.columns for c in need):
+        return pd.DataFrame()
+    df = df[need].dropna(subset=['open', 'high', 'low', 'close'])
+    df = df[df['high'] > 0]
+    return df
+
+def resample_4h_us(df_1h):
+    """美股4H：對齊TradingView，每天兩根（美東 09:30-13:30、13:30-16:00），用「日期+上下半場」分組，夏令/冬令都不會錯位"""
+    if df_1h.empty:
+        return df_1h
+    idx = df_1h.index
+    local = idx.tz_convert(MKT_TZ) if getattr(idx, 'tz', None) is not None else idx
+    mins = local.hour * 60 + local.minute
+    half = np.where(mins >= 13 * 60 + 30, 1, 0)
+    tmp = df_1h.copy()
+    tmp['_k'] = [f"{d}_{h}" for d, h in zip(local.date, half)]
+    tmp['_ts'] = idx
+    g = tmp.groupby('_k', sort=False).agg(open=('open', 'first'), high=('high', 'max'), low=('low', 'min'),
+                                          close=('close', 'last'), volume=('volume', 'sum'), ts=('_ts', 'first'))
+    g = g.set_index('ts').sort_index()
+    g.index.name = None
+    return g[['open', 'high', 'low', 'close', 'volume']].astype(float)
 
 def _fetch_1h_raw(symbol, retries=2):
     """抓取原始1小時K線（730天，yfinance 60m interval上限）。
@@ -1966,17 +2106,18 @@ def _fetch_1h_raw(symbol, retries=2):
     帶簡單重試，因為批次掃描時intraday端點比daily端點更容易被限流/逾時。"""
     for attempt in range(retries):
         try:
-            df = yf.download(symbol, period='730d', interval='1h', progress=False, auto_adjust=True)
+            df = yf.download(symbol, period='730d', interval='1h', progress=False,
+                             auto_adjust=M['auto_adjust'], prepost=False)
         except Exception as e:
             log.warning(f"fetch {symbol} 1H raw attempt{attempt+1}: {e}")
             df = pd.DataFrame()
+        df = _clean_ohlcv(df)
         if not df.empty:
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-            df.columns = [c.lower() for c in df.columns]
-            df = df.dropna()
-            if not df.empty:
-                return df
+            if getattr(df.index, 'tz', None) is None:
+                df.index = df.index.tz_localize('UTC').tz_convert(MKT_TZ)
+            else:
+                df.index = df.index.tz_convert(MKT_TZ)
+            return df
         if attempt < retries - 1:
             time.sleep(1.0)
     return pd.DataFrame()
@@ -1987,15 +2128,17 @@ def fetch_ohlcv(symbol, timeframe, raw_1h=None):
     raw_1h: 可選，傳入已抓好的1H原始資料，4H/1H會直接沿用，不重複下載。"""
     try:
         if timeframe == '1D':
-            df = yf.download(symbol, period='5y', interval='1d', progress=False, auto_adjust=True)
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-            df.columns = [c.lower() for c in df.columns]
-            return df.dropna()
+            df = _clean_ohlcv(yf.download(symbol, period='5y', interval='1d', progress=False,
+                                          auto_adjust=M['auto_adjust'], prepost=False))
+            if not df.empty and getattr(df.index, 'tz', None) is not None:
+                df.index = df.index.tz_localize(None)
+            return df
         elif timeframe == '4H':
             base = raw_1h if raw_1h is not None else _fetch_1h_raw(symbol)
             if base.empty:
                 return pd.DataFrame()
+            if MARKET == 'US':
+                return resample_4h_us(base)
             return base.resample('4h').agg({'open':'first','high':'max','low':'min','close':'last','volume':'sum'}).dropna()
         elif timeframe == '1H':
             return raw_1h if raw_1h is not None else _fetch_1h_raw(symbol)
@@ -2628,20 +2771,24 @@ def analyze(df: pd.DataFrame, df_daily: pd.DataFrame, c1_cfg=None) -> dict:
     last_pct = round(c_list[-1]['pct'], 1) if c_list else None
 
     # 突破卡片需要最後一個C的高低點（BO=C高×1.01、SL=C低−0.5%），原有欄位完全不變
+    provisional = False
+    if c_list:   # ⏳：最後一個C的極值之後，確認K線不到2根（跟crypto版、舊美股版同一個定義）
+        _ext = c_list[-1]['hb'] if is_bear else c_list[-1]['lb']
+        provisional = ((len(df) - 3) - int(_ext)) < 2
     return {'stage': stage, 's1_strong': s1_strong, 'divergence': divergence, 'has_c': has_c, 'c_count': c_count,
             'base': base, 'entry_zone': entry_zone, 'ready': ready, 'is_bear': is_bear, 'last_pct': last_pct,
-            'last_c': (c_list[-1] if c_list else None)}
+            'last_c': (c_list[-1] if c_list else None), 'provisional': provisional}
 
 # ============================================================
 # 掃描單一股票
 # ============================================================
 def scan_symbol(symbol):
     result = {'symbol': symbol}
-    result['name'] = NAMES.get(symbol, symbol.replace('.KL',''))
+    result['name'] = NAMES.get(symbol, sym_code(symbol))
     result['sector'] = SECTORS.get(symbol, '其他')
     # 改用數字代碼直接組TradingView連結（MYX:5168這種），TradingView會自動導向正確股票，
     # 不再依賴容易錯置的TV_SYMBOLS簡稱對照表（見audit_names發現的大量代碼錯置問題）
-    result['tv_symbol'] = f"MYX:{symbol.replace('.KL', '')}"
+    result['tv_symbol'] = tv_sym(symbol)
 
     df_daily = fetch_ohlcv(symbol, '1D')
     raw_1h = _fetch_1h_raw(symbol)  # 4H/1H共用同一份原始資料，只下載一次
@@ -2654,6 +2801,13 @@ def scan_symbol(symbol):
                 result['turnover'] = float((_dc['close'] * _dc['volume']).mean())
     except Exception as e:
         log.warning(f"turnover {symbol}: {e}")
+    result['nodata'] = df_daily.empty
+    result['RS_raw'] = None
+    if not df_daily.empty and RS_BENCHMARK and symbol != RS_BENCHMARK:
+        try:
+            result['RS_raw'] = calc_rs_raw(df_daily, BENCH_CLOSE)
+        except Exception as e:
+            log.warning(f"RS {symbol}: {e}")
     if not df_daily.empty:
         wy_process_symbol(result, df_daily)   # 🧱 威科夫：用同一份日線，不多抓資料
 
@@ -2683,6 +2837,8 @@ def scan_symbol(symbol):
             s1s       = res.get('s1_strong', False)
 
             pct_str  = f'({pct}%)' if pct is not None else ''
+            if res.get('provisional'):
+                pct_str += ' ⏳'   # 低點還沒確認（跟crypto版、舊美股版一樣顯示在格子裡）
             c_suffix = '(空)' if is_bear_c else ''
             base_str = f' B{base}' if base > 0 else ''
             zone_str = f' {zone}' if ready else ''
@@ -2781,11 +2937,14 @@ def run_scan():
         scan_state['status'] = 'scanning'
     seen = set()
     unique_syms = [s for s in SYMBOLS if s not in seen and not seen.add(s)]
-    log.info(f"🇲🇾 莊家思維 大馬掃描器 開始掃描 ({len(unique_syms)} 只)")
+    log.info(f"{M['flag']} 莊家思維 {M['name']}掃描器 等待掃描（一次只掃一個市場）({len(unique_syms)} 只)")
+    results = []
+    GLOBAL_SCAN_LOCK.acquire()
+    log.info(f"{M['flag']} 莊家思維 {M['name']}掃描器 開始掃描 ({len(unique_syms)} 只)")
     card_events.clear()
     wy_scan_begin()
-    results = []
     try:
+        load_benchmark()
         for i, sym in enumerate(unique_syms):
             r = scan_symbol(sym)
             results.append(r)
@@ -2793,12 +2952,17 @@ def run_scan():
             if (i + 1) % 100 == 0:
                 save_cards()
             time.sleep(0.3)
+        try:
+            compute_rs_scores(results)
+        except Exception as e:
+            log.warning(f"RS計算失敗：{e}")
         cached_results = results
         try:
             wy_scan_finish()
         except Exception as e:
             log.warning(f"🧱 威科夫整理失敗：{e}")
     finally:
+        GLOBAL_SCAN_LOCK.release()
         save_cards()
         with WY_LOCK:
             if WY_STATE['status'] == 'running':
@@ -2811,6 +2975,62 @@ def run_scan():
     send_card_telegram()
 
 # ============================================================
+# 💪 力量（相對強度）：跟舊美股版、crypto版同一套邏輯；基準＝M['rs_benchmark']（美股SPY；KLSE目前不算）
+# ============================================================
+RS_BENCHMARK     = M['rs_benchmark']
+RS_LOOKBACK_DAYS = 20
+RS_MIN_SAMPLES   = 10
+BENCH_CLOSE      = None
+
+def load_benchmark():
+    global BENCH_CLOSE
+    if not RS_BENCHMARK:
+        return
+    try:
+        df = fetch_ohlcv(RS_BENCHMARK, '1D')
+        BENCH_CLOSE = df['close'] if not df.empty else None
+    except Exception as e:
+        log.warning(f"抓 {RS_BENCHMARK} 失敗：{e}")
+        BENCH_CLOSE = None
+
+def calc_rs_raw(df_daily, bench_close):
+    """「該股/基準」收盤比值在 RS_LOOKBACK_DAYS 天內的漲跌幅(%)"""
+    if bench_close is None or df_daily is None or df_daily.empty:
+        return None
+    aligned = pd.concat([df_daily['close'].rename('sym'), bench_close.rename('bench')], axis=1, join='inner').dropna()
+    if len(aligned) < RS_LOOKBACK_DAYS + 1:
+        return None
+    ratio = aligned['sym'] / aligned['bench']
+    now_r, past_r = ratio.iloc[-1], ratio.iloc[-1 - RS_LOOKBACK_DAYS]
+    if pd.isna(now_r) or pd.isna(past_r) or past_r == 0:
+        return None
+    return float((now_r / past_r - 1) * 100)
+
+def compute_rs_scores(results):
+    """排名轉成 -5~+5 分數（sign-floor：比值沒漲不給正分、沒跌不給負分），另附「比值%」（100%＝跟基準同步）"""
+    if not RS_BENCHMARK:
+        return
+    valid = [(i, r['RS_raw']) for i, r in enumerate(results) if r.get('RS_raw') is not None]
+    for r in results:
+        r['RS_score'], r['RS_text'], r['RS_color'], r['RS_pct'] = None, '--', '#2a2a2a', None
+    if len(valid) < RS_MIN_SAMPLES:
+        return
+    valid.sort(key=lambda x: x[1])
+    n = len(valid)
+    rank_of = {idx: pos for pos, (idx, _) in enumerate(valid)}
+    for i, r in enumerate(results):
+        raw = r.get('RS_raw')
+        if raw is None:
+            continue
+        score = ((rank_of[i] / (n - 1) * 100) if n > 1 else 50) - 50
+        score /= 10
+        score = min(score, 0) if raw <= 0 else max(score, 0)
+        score = int(max(-5, min(5, round(score))))
+        r['RS_score'], r['RS_pct'] = score, round(raw + 100)
+        r['RS_text'] = f'{score:+d} ({r["RS_pct"]}%)' if score != 0 else f'0 ({r["RS_pct"]}%)'
+        r['RS_color'] = '#1a6b3c' if score >= 2 else ('#8b0000' if score <= -2 else '#4a4a4a')
+
+# ============================================================
 # 📨 Telegram「可開單」通知（2026-10-27 MH確認）
 # 只推同時符合全部條件的訊號：
 #   1) 只看日線（TG_SIGNAL_TFS，預設1D）  2) 多頭、日線Stage=S2
@@ -2820,9 +3040,11 @@ def run_scan():
 # 只推「新的」：同一個形態（同一個C高點）推過一次就不再推；形成新的C才會再推。
 # 1C、做空、S4、2C還沒🎯的，全部只留在網頁總表。
 # ============================================================
-TG_SIGNAL_TFS       = [t.strip() for t in os.environ.get('TG_SIGNAL_TFS', '1D').split(',') if t.strip() in TF_LABELS]
-TG_MIN_TURNOVER_MYR = float(os.environ.get('TG_MIN_TURNOVER_MYR', '1000000'))
-KLSE_URL            = os.environ.get('KLSE_URL', 'https://klse-scanner-production-6926.up.railway.app')
+TG_SIGNAL_TFS       = [t.strip() for t in menv('TG_SIGNAL_TFS', M['tg_tfs']).split(',') if t.strip() in TF_LABELS]
+# 成交額門檻（20日平均，用該市場的貨幣）：KLSE讀 TG_MIN_TURNOVER_MYR（RM），美股讀 US_TG_MIN_TURNOVER（US$）
+TG_MIN_TURNOVER_MYR = float(os.environ.get(M['turnover_env'], '1000000'))
+SITE_ROOT           = (os.environ.get('SITE_URL') or os.environ.get('KLSE_URL') or 'https://klse-scanner-production-6926.up.railway.app').rstrip('/')
+KLSE_URL            = SITE_ROOT + BASE   # 這個市場的網址（美股＝…/us）
 TG_SENT_KEEP_DAYS   = 120
 
 def _tg_sent_file():
@@ -2850,7 +3072,10 @@ def _tg_sent_save(d):
 def _fmt_turnover(v):
     if v is None:
         return '-'
-    return f'RM{v / 1e6:.1f}M' if v >= 1e6 else f'RM{v / 1e3:.0f}K'
+    cur = M['currency']
+    if v >= 1e9:
+        return f'{cur}{v / 1e9:.2f}B'
+    return f'{cur}{v / 1e6:.1f}M' if v >= 1e6 else f'{cur}{v / 1e3:.0f}K'
 
 def _tick_round(p, up):
     """BO往上、SL往下對齊Bursa跳動單位，掛單價格才是有效價位"""
@@ -2888,7 +3113,7 @@ def collect_tradeable(results):
                 skipped['liq'] += 1; continue
             sigs.append({
                 'key': f"{r['symbol']}|{tf}|{s['h_time']}",
-                'symbol': r['symbol'], 'name': r.get('name') or r['symbol'].replace('.KL', ''),
+                'symbol': r['symbol'], 'name': r.get('name') or sym_code(r['symbol']),
                 'tf': tf, 'cnt': s['cnt'], 'pct': s['pct'], 'zone': s['zone'],
                 'bo': bo, 'sl': sl, 'price': price, 'turnover': to,
                 'r_pct': (bo - sl) / bo * 100 if bo else 0,
@@ -2910,10 +3135,9 @@ def send_telegram(results):
     now = now_dt.strftime('%m-%d %H:%M')
     lines = []
     for s in new:
-        code = s['symbol'].replace('.KL', '')
         over = ' ⚡盤中已過BO' if s['price'] >= s['bo'] else ''
         pct = f"({s['pct']}%)" if s['pct'] is not None else ''
-        lines.append(f"🎯 {s['name']}({code})｜{s['tf']} {s['cnt']}C{pct}｜{s['zone']}{over}\n"
+        lines.append(f"🎯 {label_of(s['name'], s['symbol'])}｜{s['tf']} {s['cnt']}C{pct}｜{s['zone']}{over}\n"
                      f"   BO {fmt_px(s['bo'])}｜SL {fmt_px(s['sl'])}｜1R {s['r_pct']:.1f}%\n"
                      f"   現價 {fmt_px(s['price'])}｜成交額 {_fmt_turnover(s['turnover'])}")
     footer = (f"{'━' * 12}\n"
@@ -2926,7 +3150,7 @@ def send_telegram(results):
     ok_all = True
     for i, batch in enumerate(batches):
         part = f" ({i + 1}/{len(batches)})" if len(batches) > 1 else ""
-        msg = f"🇲🇾 KLSE 可開單｜{now}｜新 {len(new)} 只{part}\n{'━' * 12}\n" + "\n".join(batch)
+        msg = f"{M['flag']} {M['short']} 可開單｜{now}｜新 {len(new)} 只{part}\n{'━' * 12}\n" + "\n".join(batch)
         if i == len(batches) - 1:
             msg += "\n" + footer
         try:
@@ -2956,8 +3180,8 @@ def send_telegram(results):
 # ============================================================
 import json
 
-CARD_TFS          = [t.strip() for t in os.environ.get('CARD_TFS', '1D,4H,1H').split(',') if t.strip() in TF_LABELS]
-CARD_TELEGRAM_TFS = [t.strip() for t in os.environ.get('CARD_TELEGRAM_TFS', '1D').split(',') if t.strip()]
+CARD_TFS          = [t.strip() for t in menv('CARD_TFS', '1D,4H,1H').split(',') if t.strip() in TF_LABELS]
+CARD_TELEGRAM_TFS = [t.strip() for t in menv('CARD_TELEGRAM_TFS', M['tg_tfs']).split(',') if t.strip()]
 # 老師規則（股票、加密貨幣通用）：天圖 ±1%、時圖 ±0.5%、分圖 ±0.25%
 #   BO = C高 × (1 + 緩衝%)，SL = C低 × (1 − 緩衝%)
 TF_BUFFER_PCT     = {'1D': 1.0, '4H': 0.5, '1H': 0.5}
@@ -2978,9 +3202,12 @@ def _resolve_data_dir():
     os.makedirs(d, exist_ok=True)
     return d
 
-DATA_DIR        = _resolve_data_dir()
+_ROOT_DATA_DIR  = _resolve_data_dir()
+DATA_PERSISTENT = bool(os.environ.get('DATA_DIR')) or _ROOT_DATA_DIR == '/data'
+# KLSE沿用原本的位置（舊紀錄不會不見）；其他市場各自一個子資料夾，例：/data/us
+DATA_DIR        = os.path.join(_ROOT_DATA_DIR, M['data_sub']) if M['data_sub'] else _ROOT_DATA_DIR
+os.makedirs(DATA_DIR, exist_ok=True)
 CARDS_FILE      = os.path.join(DATA_DIR, 'cards_state.json')
-DATA_PERSISTENT = bool(os.environ.get('DATA_DIR')) or DATA_DIR == '/data'
 
 cards_lock  = threading.Lock()
 cards_state = {'pending': {}, 'active': {}, 'done': [], 'used': {}, 'seen': {}}
@@ -3013,7 +3240,9 @@ def save_cards():
         log.warning(f"🃏 儲存 {CARDS_FILE} 失敗：{e}")
 
 def bursa_tick(p):
-    """Bursa Malaysia 跳動單位"""
+    """跳動單位：美股 $1以上0.01、$1以下0.0001；其他是 Bursa Malaysia 規則"""
+    if MARKET == 'US':
+        return 0.01 if p >= 1 else 0.0001
     if p < 1:    return 0.005
     if p < 10:   return 0.01
     if p < 100:  return 0.02
@@ -3052,20 +3281,25 @@ def _positions_after(df, iso):
 
 def closed_bars(df, tf, now=None):
     """去掉還沒收盤的K線（只檢查最後3根，前面的一定已收盤）。
-    1D：當天17:05後才算收盤；4H/1H：K線開始時間+長度 ≤ 現在，或是之前的交易日。"""
+    1D：收盤後5分鐘才算收盤（KLSE 17:05、美股美東16:05）；4H/1H：K線開始時間+長度 ≤ 現在，或是之前的交易日。
+    時間一律用該市場自己的時區判斷。"""
     if df.empty: return df
-    now = now or datetime.now(MY_TZ)
+    now = now.astimezone(MKT_TZ) if now is not None else datetime.now(MKT_TZ)
+    dc_h, dc_m = M['daily_close']
     n = len(df)
     keep = n
     for i in range(n - 1, max(-1, n - 4), -1):
         ts = pd.Timestamp(df.index[i])
-        ts = ts.tz_localize(MY_TZ) if ts.tzinfo is None else ts.tz_convert(MY_TZ)
+        ts = ts.tz_localize(MKT_TZ) if ts.tzinfo is None else ts.tz_convert(MKT_TZ)
         if ts.date() < now.date():
             break
         if tf == '1D':
-            close_t = ts.normalize() + timedelta(hours=17, minutes=5)
+            close_t = ts.normalize() + timedelta(hours=dc_h, minutes=dc_m)
         else:
             close_t = ts + (timedelta(hours=4) if tf == '4H' else timedelta(hours=1))
+            sess_end = ts.normalize() + timedelta(hours=M['close'][0], minutes=M['close'][1])
+            if ts < sess_end:
+                close_t = min(close_t, sess_end)   # 美股下午那根4H只到16:00
         if close_t <= now:
             break
         keep = i
@@ -3200,6 +3434,7 @@ def _card_step(meta, tf, df_all, dfc, res, backfill=False, st=None):
     for case in st['active'].values():
         if case.get('key') == key and not df_all.empty:
             case['price'] = float(df_all['close'].values[-1])
+            case['turnover'] = meta.get('turnover')
 
 def card_process_tf(meta, tf, df, df_daily, res):
     """scan_symbol()每個時間框架分析完後呼叫"""
@@ -3258,8 +3493,7 @@ def send_card_telegram():
         if to is None or to < TG_MIN_TURNOVER_MYR:   # 成交額不足：網頁照樣記錄，Telegram不推（突破和結果都不推）
             if kind == 'open': thin += 1
             continue
-        code = c['symbol'].replace('.KL', '')
-        head = f"{c.get('name') or code}({code}) {c['tf']}"
+        head = f"{label_of(c.get('name'), c['symbol'])} {c['tf']}"
         if kind == 'open':
             tags = [f"S{c.get('stage')}" if c.get('stage') else 'S?']
             if c.get('vol_x') is not None: tags.append(f"量{c['vol_x']}x" + ('🔥' if c['vol_x'] >= VOL_SURGE_X else ''))
@@ -3279,7 +3513,7 @@ def send_card_telegram():
     batches = [lines[i:i+15] for i in range(0, len(lines), 15)]
     for i, batch in enumerate(batches):
         part = f" ({i+1}/{len(batches)})" if len(batches) > 1 else ""
-        msg = f"🃏 大馬突破卡片{part}\n{now}\n{'─'*20}\n" + "\n".join(batch)
+        msg = f"{M['flag']} 🃏 {M['name']}突破卡片{part}\n{now}\n{'─'*20}\n" + "\n".join(batch)
         try:
             requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
                           json={'chat_id': TELEGRAM_CHAT_ID, 'text': msg}, timeout=10)
@@ -3336,8 +3570,8 @@ def run_c1_backtest(tf='1D', bars=None, limit=None):
     first_date = last_date = None
     try:
         for si, sym in enumerate(syms):
-            meta = {'symbol': sym, 'name': NAMES.get(sym, sym.replace('.KL', '')),
-                    'sector': SECTORS.get(sym, '其他'), 'tv_symbol': f"MYX:{sym.replace('.KL', '')}"}
+            meta = {'symbol': sym, 'name': NAMES.get(sym, sym_code(sym)),
+                    'sector': SECTORS.get(sym, '其他'), 'tv_symbol': tv_sym(sym)}
             try:
                 daily = fetch_ohlcv(sym, '1D')
                 df = daily if tf == '1D' else fetch_ohlcv(sym, tf)
@@ -3476,8 +3710,8 @@ def run_exit_backtest(tf='1D', c1=10, bars=None, limit=None):
     first_date = last_date = None
     try:
         for si, sym in enumerate(syms):
-            meta = {'symbol': sym, 'name': NAMES.get(sym, sym.replace('.KL', '')),
-                    'sector': SECTORS.get(sym, '其他'), 'tv_symbol': f"MYX:{sym.replace('.KL', '')}"}
+            meta = {'symbol': sym, 'name': NAMES.get(sym, sym_code(sym)),
+                    'sector': SECTORS.get(sym, '其他'), 'tv_symbol': tv_sym(sym)}
             try:
                 daily = fetch_ohlcv(sym, '1D')
                 df = daily if tf == '1D' else fetch_ohlcv(sym, tf)
@@ -3691,7 +3925,7 @@ WY_RETEST_MAX_DROP   = float(os.environ.get('WY_RETEST_MAX_DROP', 30))  # 從突
 WY_FAIL_CLOSE_PCT    = float(os.environ.get('WY_FAIL_CLOSE_PCT', 1))    # 收盤低於天花板 X% ＝ 跌回區間（假突破）
 WY_RISK_MAX_ATR      = float(os.environ.get('WY_RISK_MAX_ATR', 2.0))    # SL距離超過幾倍日線ATR＝風險太大
 WY_NEAR_CEIL_PCT     = float(os.environ.get('WY_NEAR_CEIL_PCT', 5))     # 🟡 價格離天花板 X% 以內才放進盯盤名單
-WY_TG_ON             = os.environ.get('WY_TG', '1') == '1'              # 設成0就不推播
+WY_TG_ON             = menv('WY_TG', '1') == '1'              # 設成0就不推播
 # KLSE版：不另外抓資料，跟著C系列主掃描（開市時間每小時＋17:40收盤後）一起跑：
 #   用「已收盤日K」判斷階段（開市中＝到昨天為止，收盤後＝包含今天），所以一天內階段只會在收盤後變一次；
 #   盯盤（🟡重點名單正在突破、🟠回踩到天花板、🟢觸發Entry／跌破SL）用今天還沒收完的K線，每小時一次。
@@ -4059,6 +4293,8 @@ wy_rows_pending = []
 def send_telegram_plain(text):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return False
+    if not text.startswith(M['flag']):
+        text = f"{M['flag']} {text}"   # 同一個Telegram收好幾個市場：每則前面加國旗
     try:
         requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
                       json={'chat_id': TELEGRAM_CHAT_ID, 'text': text, 'disable_web_page_preview': True}, timeout=10)
@@ -4076,8 +4312,7 @@ def wy_alert_once(sym, kind, text):
         send_telegram_plain(text)
 
 def _wy_label(r):
-    code = r['symbol'].replace('.KL', '')
-    return f"{r.get('name') or code}({code})"
+    return label_of(r.get('name'), r['symbol'])
 
 def wy_scan_begin():
     wy_rows_pending.clear()
@@ -4161,12 +4396,13 @@ def wy_summary_text(rows, title):
     green  = [r for r in cand if r['stage'] == 'green' and r.get('liquid')]
     orange = [r for r in cand if r['stage'] == 'orange' and r.get('liquid')]
     focus  = [r for r in cand if r['stage'] == 'yellow' and r.get('liquid')]
-    lines = [f'【大馬威科夫 {title}】', datetime.now(MY_TZ).strftime('%Y-%m-%d %H:%M')]
+    lines = [f'【{M["name"]}威科夫 {title}】', datetime.now(MY_TZ).strftime('%Y-%m-%d %H:%M')]
     lines.append(f'━━ 🟢 三個條件全部符合（{len(green)}）')
     lines += [_wy_green_line(r) for r in green] or ['沒有']
     lines.append(f'━━ 🟠 已放量突破，等回踩（{len(orange)}）')
     lines += [_wy_orange_line(r) for r in orange] or ['沒有']
-    lines.append(f'━━ 🟡 重點名單（{len(focus)}）：每小時盯盤，突破時會推')
+    _every = '每小時' if M['scan_every_min'] >= 60 else f"每{M['scan_every_min']}分鐘"
+    lines.append(f'━━ 🟡 重點名單（{len(focus)}）：{_every}盯盤，突破時會推')
     lines += [f'🟡 {_wy_label(r)}  離天花板 {fmt_px(r["ceiling"])} 還差 {r.get("dist_pct", 0):.1f}%' for r in focus] or ['沒有']
     if thin:
         lines.append(f'💧 成交額<{_fmt_turnover(TG_MIN_TURNOVER_MYR)}未列：' + '、'.join(_wy_label(r) for r in thin))
@@ -4202,7 +4438,7 @@ def wy_scan_finish():
             log.warning(f'🧱 寫入威科夫摘要旗標失敗：{e}')
         log.info('🧱 威科夫：已推送首次目前名單摘要')
     elif WY_TG_ON and (new_green or new_orange):
-        lines = ['【大馬威科夫 洗盤→真突破】']
+        lines = [f'【{M["name"]}威科夫 洗盤→真突破】']
         for r in new_green:
             lines.append(_wy_green_line(r))
         for r in new_orange:
@@ -4321,11 +4557,11 @@ SCANNING_BANNER
   <label class="chk-label"><input type="checkbox" id="onlyC" onchange="applyFilter()"> 只顯示有C的</label>
   <button class="btn btn-green" onclick="exportWatchlist()">&#x1F4CB; Export Watchlist</button>
 </div>
-<div class="info">更新：LAST_SCAN | 共 TOTAL 只 | 顯示 <span id="countDisplay">TOTAL</span> 個</div>
+<div class="info">更新：LAST_SCAN (MYT) | MKT_STATUS | 共 TOTAL 只 | 顯示 <span id="countDisplay">TOTAL</span> 個MISSING_INFO</div>
 <textarea id="watchlistBox" readonly style="background:#1a1a2e;color:#0f0;border:1px solid #444;padding:12px;border-radius:6px;width:500px;height:150px;font-family:monospace;font-size:12px;margin-top:8px;display:none"></textarea>
 <br id="watchlistBr" style="display:none">
 <table id="mainTable">
-  <tr><th>股票</th><th>板塊</th><th>1D</th><th>4H</th><th>1H</th></tr>
+  <tr><th>股票</th><th>板塊</th><th>日均額</th>RS_HEAD<th>1D</th><th>4H</th><th>1H</th></tr>
   ROWS
 </table>
 <br>
@@ -4412,7 +4648,7 @@ def build_html(status='done'):
     rows = ''
     for r in (cached_results or []):
         sym = r['symbol']
-        tv  = r.get('tv_symbol', sym.replace('.KL',''))
+        tv  = r.get('tv_symbol', tv_sym(sym))
         tv_url = f"{tv_chart_base()}?symbol={tv}&interval=D"  # 股票名稱欄預設跳日線
         name = r.get('name', sym)
         sector = r.get('sector', '其他')
@@ -4429,8 +4665,14 @@ def build_html(status='done'):
         anchor_marks = get_row_anchor_marks(r)
 
         rows += f'<tr data-stage="{stage_val}" data-sector="{sector}" data-symbol="{tv}" data-hasc="{"1" if has_c_any else "0"}">'
-        rows += f'<td class="sym"><a href="{tv_url}" target="_blank">{name}</a><br><span style="color:#8b949e;font-size:10px">{sym}</span><span style="display:none">{alias}</span></td>'
+        sub = f'<br><span style="color:#8b949e;font-size:10px">{sym}</span>' if name != sym else ''
+        rows += f'<td class="sym"><a href="{tv_url}" target="_blank">{name}</a>{sub}<span style="display:none">{alias}</span></td>'
         rows += f'<td style="color:#aaa;font-size:12px;text-align:center">{sector}</td>'
+        to = r.get('turnover')
+        to_bg = '#2a2a2a' if to is None else ('#1a6b3c' if to >= TG_MIN_TURNOVER_MYR else '#8b0000')
+        rows += f'<td class="cell" style="background:{to_bg};color:#fff">{_fmt_turnover(to)}</td>'
+        if RS_BENCHMARK:
+            rows += f'<td class="cell" style="background:{r.get("RS_color", "#2a2a2a")};color:#fff">{r.get("RS_text", "--")}</td>'
         for tf in TF_LABELS:
             text = r.get(tf, '-')
             cls  = r.get(f'{tf}_cls', 'gray')
@@ -4444,6 +4686,10 @@ def build_html(status='done'):
     total = len(cached_results)
     scanning_banner = '<div class="scanning-banner">⏳ 掃描中，請稍候...（約需10分鐘）</div>' if status == 'scanning' else ''
     sector_opts = ''.join(f'<option value="{s}">{s}</option>' for s in sorted(set(SECTORS.values())))
+    rs_head = f'<th title="20天 vs {RS_BENCHMARK}：-5~+5排名分數（比值%，100%＝同步）">力量</th>' if RS_BENCHMARK else ''
+    mkt_status = '🟢 開盤中' if is_market_hours() else '⚪ 已收盤'
+    n_missing = sum(1 for r in (cached_results or []) if r.get('nodata'))
+    missing_info = f' | <a href="/debug_missing" style="color:#ffb74d">⚠️ {n_missing} 只抓不到資料</a>' if n_missing else ''
 
     # 掃描中打開頁面時自動輪詢，掃完自動刷新（之前要手動重新整理）
     autopoll = 'pollStatus();' if status == 'scanning' else ''
@@ -4451,6 +4697,9 @@ def build_html(status='done'):
         .replace('SCANNING_BANNER', scanning_banner)
         .replace('SECTOR_OPTIONS', sector_opts)
         .replace('LAST_SCAN', last)
+        .replace('RS_HEAD', rs_head)
+        .replace('MKT_STATUS', mkt_status)
+        .replace('MISSING_INFO', missing_info)
         .replace('TOTAL', str(total))
         .replace('AUTOPOLL', autopoll)
         .replace('ROWS', rows))
@@ -4562,7 +4811,7 @@ def _search_attr(c):
     return f'data-sector="{_h(c.get("sector") or "其他")}" data-q="{_h((code + " " + (c.get("name") or "")).upper())}"'
 
 def _tv_url(c, tf):
-    tv = c.get('tv_symbol') or f"MYX:{c['symbol'].replace('.KL', '')}"
+    tv = c.get('tv_symbol') or tv_sym(c['symbol'])
     return f"{tv_chart_base()}?symbol={tv}&interval={TV_INTERVAL.get(tf, 'D')}"
 
 def _render_pending(c, tf):
@@ -4734,7 +4983,7 @@ def cards_json():
     sym = request.args.get('symbol', '').upper()
     with cards_lock:
         def match(k):
-            return (not sym) or k.startswith(sym if sym.endswith('.KL') else sym + '.KL')
+            return (not sym) or k.startswith(norm_sym(sym) + '|')
         out = {
             'data_dir': DATA_DIR, 'persistent': DATA_PERSISTENT,
             'pending': {k: v for k, v in cards_state['pending'].items() if match(k)},
@@ -4755,7 +5004,7 @@ def backtest_page():
         threading.Thread(target=run_c1_backtest, args=(run_tf, None, limit), daemon=True).start()
         time.sleep(0.5)
         # 轉回不帶run參數的網址：否則頁面每30秒自動刷新時，跑完又會重新開始一次
-        return redirect(f'/backtest?tf={run_tf}')
+        return redirect(f'{BASE}/backtest?tf={run_tf}')
     view_tf = request.args.get('tf', run_tf if run_tf in TF_LABELS else (bt_state.get('tf') or '1D')).upper()
     if view_tf not in TF_LABELS: view_tf = '1D'
 
@@ -4862,8 +5111,8 @@ def generate_wyckoff_html():
         h += '<th>Entry / SL / 上方空間</th>' if stage == 'green' else ''
         h += '<th>說明</th></tr>'
         for r in sub:
-            code = r['symbol'].replace('.KL', '')
-            tv = f"{tv_chart_base()}?symbol={r.get('tv_symbol') or 'MYX:' + code}&interval=D"
+            code = sym_code(r['symbol'])
+            tv = f"{tv_chart_base()}?symbol={r.get('tv_symbol') or tv_sym(r['symbol'])}&interval=D"
             rng = f'{r["range_from"]} 起 {r["range_days"]} 天<br><span class=small>天花板 {f(r["ceiling"])}<br>地板 {f(r["floor"])}</span>'
             spring = f'{r["spring_date"]} 刺穿 {r["spring_depth"]:.1f}%<br><span class=small>低點 {f(r["spring_low"])}，量 {x(r.get("spring_vol"))}</span>'
             quiet = f'{ok(r["quiet_ok"])} {x(r.get("quiet_ratio"))}'
@@ -4917,7 +5166,7 @@ def generate_wyckoff_html():
             focus = [r for r in sub if r.get('focus')]
             rest = [r for r in sub if not r.get('focus')]
             html += (f'<p class=note><b>重點名單（{len(focus)}）</b>：離天花板 ≤ {WY_NEAR_CEIL_PCT:g}%、安靜 ✓、不是「S4＋中途整理」。'
-                     '這些股票在開市時間每小時盯盤，正在突破時會推 Telegram（成交額 < RM'+f'{TG_MIN_TURNOVER_MYR/1e6:g}'+'M 的標 💧不推，只在網頁顯示）。</p>')
+                     '這些股票在開市時間每小時盯盤，正在突破時會推 Telegram（成交額 < '+_fmt_turnover(TG_MIN_TURNOVER_MYR)+' 的標 💧不推，只在網頁顯示）。</p>')
             html += table(focus, stage) if focus else '<p class=note>今天沒有。</p>'
             if rest:
                 html += (f'<details><summary class=note>其他 {len(rest)} 個（離天花板太遠、量還沒縮，或下跌途中的橫盤）'
@@ -4950,9 +5199,7 @@ def wyckoff_push():
 @app.route('/debug_wyckoff')
 def debug_wyckoff():
     """診斷用：/debug_wyckoff?symbol=0128"""
-    sym = request.args.get('symbol', '0128').upper()
-    if not sym.endswith('.KL'):
-        sym += '.KL'
+    sym = norm_sym(request.args.get('symbol', M['default_sym']))
     try:
         df = fetch_ohlcv(sym, '1D')
         closed = closed_bars(df, '1D').tail(500)
@@ -4973,7 +5220,7 @@ def exit_backtest_page():
         limit = int(limit) if limit and limit.isdigit() else None
         threading.Thread(target=run_exit_backtest, args=(run_tf, c1, None, limit), daemon=True).start()
         time.sleep(0.5)
-        return redirect(f'/exit_backtest?tf={run_tf}&c1={c1}')
+        return redirect(f'{BASE}/exit_backtest?tf={run_tf}&c1={c1}')
     view_tf = request.args.get('tf', ex_state.get('tf') or '1D').upper()
     if view_tf not in TF_LABELS: view_tf = '1D'
 
@@ -5119,7 +5366,7 @@ def audit_missing_result():
 def debug_bars():
     """診斷用：把某symbol最近N根原始K線(日期/OHLC)連同is_swing_high2/is_swing_low2旗標一起
     印出來，方便跟Pine的isSwingHigh2結果逐根比對（跟crypto版scannerrailway.py的同名路由對齊）。"""
-    symbol = request.args.get('symbol', '1155.KL')
+    symbol = norm_sym(request.args.get('symbol', M['default_sym']))
     tf = request.args.get('tf', '1D')
     last_n = int(request.args.get('last', 20))
     df = fetch_ohlcv(symbol, tf)
@@ -5147,9 +5394,7 @@ def debug_bars():
 @app.route('/debug_c')
 def debug_c():
     import json as _json
-    symbol = request.args.get('symbol', '1155.KL')
-    if not symbol.upper().endswith('.KL'):
-        symbol = symbol.upper() + '.KL'
+    symbol = norm_sym(request.args.get('symbol', M['default_sym']))
     tf = request.args.get('tf', '1D').upper()
     if tf not in TF_LABELS:
         tf = '1D'
@@ -5259,23 +5504,91 @@ def debug_c():
 
     return Response(_json.dumps(out, indent=2, ensure_ascii=False, default=str), mimetype='application/json')
 
+@app.route('/debug_missing')
+def debug_missing():
+    """哪幾隻抓不到日線資料（代碼改名或下市時會出現）"""
+    miss = [r['symbol'] for r in (cached_results or []) if r.get('nodata')]
+    return jsonify({'market': MARKET, 'missing': miss, 'count': len(miss), 'total': len(cached_results or [])})
+
+# ============================================================
+# 🌏 多市場網頁：網址前綴（美股在 /us）＋上方市場切換按鈕＋文字換成該市場
+# ============================================================
+_HREF_RE  = re.compile(r'''((?:href|action)=["'])/(?!/)''')
+_FETCH_RE = re.compile(r'''(fetch\(\s*["'])/(?!/)''')
+
+def market_switch_html():
+    if len(ACTIVE_MARKETS) < 2:
+        return ''
+    out = ''
+    for mk in ACTIVE_MARKETS:
+        c = MKT_CFG[mk]
+        on = 'background:#6a1b9a;border-color:#6a1b9a;color:#fff;' if mk == MARKET else ''
+        out += f'<a href="{c["base"]}/" style="{on}font-weight:bold">{c["tab"]}</a>'
+    return out + '<span style="border-left:1px solid #444;margin:0 4px"></span>'
+
+@app.after_request
+def _market_html(resp):
+    try:
+        if resp.mimetype != 'text/html' or resp.direct_passthrough:
+            return resp
+        html = resp.get_data(as_text=True)
+        if BASE:
+            html = _HREF_RE.sub(lambda m_: m_.group(1) + BASE + '/', html)
+            html = _FETCH_RE.sub(lambda m_: m_.group(1) + BASE + '/', html)
+        for a, b in M['html_replace']:
+            html = html.replace(a, b)
+        sw = market_switch_html()
+        if sw:
+            html = html.replace('<div class="nav">', '<div class="nav">' + sw)
+        resp.set_data(html)
+    except Exception as e:
+        log.warning(f"html rewrite: {e}")
+    return resp
+
 def scheduler():
+    """開盤時間每 scan_every_min 分鐘掃一次（KLSE 60、美股 30），收盤後再補掃一次確認日K。時間用該市場自己的時區。"""
     last_post_close = None
+    every = int(menv('SCAN_EVERY_MIN', str(M['scan_every_min'])))
     while True:
-        now = datetime.now(MY_TZ)
+        now = datetime.now(MKT_TZ)
+        hm = (now.hour, now.minute)
         if is_market_hours():
             run_scan()
-            time.sleep(3600)
-        elif now.weekday() < 5 and (now.hour, now.minute) >= (17, 40) and now.hour < 19 and last_post_close != now.date():
-            # 收盤後補掃一次：17:00收盤後的日線/最後一根1H才會被確認，突破卡片才能當天記錄
+            time.sleep(every * 60)
+        elif now.weekday() < 5 and M['post_close'] <= hm < M['post_close_end'] and last_post_close != now.date():
+            # 收盤後補掃一次：日線/最後一根1H收盤後才會被確認，突破卡片才能當天記錄
             last_post_close = now.date()
             run_scan()
         else:
             time.sleep(300)
 
+def _load_market_module(mk):
+    """把這一份程式再載入一次，當成另一個市場（各自的狀態、資料檔、排程完全分開）"""
+    import importlib.util, sys
+    os.environ['SCANNER_MARKET'] = mk
+    spec = importlib.util.spec_from_file_location(f'scanner_{mk.lower()}', os.path.abspath(__file__))
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
 if __name__ == '__main__':
-    log.info("🇲🇾 莊家思維 大馬掃描器 啟動")
-    threading.Thread(target=scheduler, daemon=True).start()
-    threading.Thread(target=run_scan, daemon=True).start()
+    import sys
+    from werkzeug.serving import run_simple
+    from werkzeug.middleware.dispatcher import DispatcherMiddleware
+    wanted = [x.strip().upper() for x in os.environ.get('MARKETS', 'KLSE,US').split(',') if x.strip().upper() in MKT_CFG]
+    mods = {MARKET: sys.modules[__name__]}
+    for mk in wanted:
+        if mk not in mods:
+            mods[mk] = _load_market_module(mk)
+    order = [mk for mk in MKT_CFG if mk in mods]
+    for mod in mods.values():
+        mod.ACTIVE_MARKETS = order
+        mod.GLOBAL_SCAN_LOCK = GLOBAL_SCAN_LOCK     # 全部市場共用一把鎖：一次只掃一個
+    root = DispatcherMiddleware(app, {MKT_CFG[mk]['base']: mods[mk].app for mk in order if MKT_CFG[mk]['base']})
+    log.info(f"莊家思維 股票掃描器 啟動：{' + '.join(MKT_CFG[mk]['flag'] + ' ' + mk for mk in order)}")
+    for mk in order:
+        threading.Thread(target=mods[mk].scheduler, daemon=True).start()
+        threading.Thread(target=mods[mk].run_scan, daemon=True).start()
     port = int(os.environ.get('PORT', 8082))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    run_simple('0.0.0.0', port, root, threaded=True, use_reloader=False, use_debugger=False)
