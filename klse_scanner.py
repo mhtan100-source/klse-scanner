@@ -4316,6 +4316,7 @@ def _wy_label(r):
 
 def wy_scan_begin():
     wy_rows_pending.clear()
+    wy_case_events.clear()
     with WY_LOCK:
         WY_STATE.update({'status': 'running', 'progress': '跟著C系列掃描中', 'errors': []})
 
@@ -4329,6 +4330,10 @@ def wy_process_symbol(meta, df_daily):
         ddf = closed.tail(500)                     # 跟加密版一樣用最近500根日K
         r = wy_analyze(sym, ddf)
         if not r:
+            try:
+                wy_track_live(meta, ddf, None)     # 📊 進行中的案例照樣要追
+            except Exception as e:
+                log.warning(f"📊 追蹤 {sym}: {e}")
             return
         try:
             st, _, _ = get_stage(ddf)
@@ -4343,6 +4348,10 @@ def wy_process_symbol(meta, df_daily):
         r.update({'name': meta.get('name'), 'sector': meta.get('sector'), 'tv_symbol': meta.get('tv_symbol'),
                   'turnover': meta.get('turnover'), 'liquid': wy_liquid(meta.get('turnover'))})
         wy_rows_pending.append(r)
+        try:
+            wy_track_live(meta, ddf, r)            # 📊 🟢 結果追蹤
+        except Exception as e:
+            log.warning(f"📊 追蹤 {sym}: {e}")
         if len(df_daily) > len(closed):            # 今天的日K還沒收完 → 盯盤
             wy_monitor_row(r, df_daily)
     except Exception as e:
@@ -4426,6 +4435,11 @@ def wy_scan_finish():
     new_green = [r for r in rows if r['stage'] == 'green' and prev.get(r['symbol']) != 'green' and r.get('liquid')]
     new_orange = [r for r in rows if r['stage'] == 'orange' and prev.get(r['symbol']) not in ('orange', 'green') and r.get('liquid')]
     wy_save_stages({r['symbol']: r['stage'] for r in rows})
+    wy_cases_save()
+    try:
+        wy_send_case_results()
+    except Exception as e:
+        log.warning(f"📊 威科夫結果推播失敗：{e}")
     summary_due = (not have_prev) or (not os.path.exists(WY_SUMMARY_FLAG))
     if summary_due:
         # 第一輪（或這個版本第一次部署）：推一則「目前名單」摘要，之後才只推新的
@@ -4488,6 +4502,329 @@ def wy_green_rules_html():
         f'上方空間 ≥ {HEADROOM_MIN_R:g}R（參考）；SL 距離 ≤ {WY_RISK_MAX_ATR:g} 倍日線ATR（太寬就改到 4H／1H 找 C 進場）；'
         '現價已經過了 Entry 就不追，等下一次回踩。日線S4的吸籌突破，大趨勢還沒確認，倉位要小。</div>'
         '</div>')
+
+
+# ============================================================
+# 📊 威科夫 🟢 結果追蹤（MH 2026-10-28）
+# 規則（跟突破卡片同一套出場，方便跟VCP比較）：
+#   🟢 出現 → 等觸發：之後某根日K高點 ≥ Entry 就算成交（開盤就跳空高過Entry，用開盤價成交）
+#   等觸發期間：每天照最新的 🟢 更新 Entry/SL（跟你移動掛單一樣）；先跌破SL → 作廢；WY_TRIGGER_DAYS 根內沒觸發 → 沒觸發
+#   成交後：R = 成交價 − SL；碰SL → −1R；達 1:1.5 → +1.5R；WY_HOLD_DAYS 根都沒碰到 → 到期（用收盤價算R）
+#   同一根K線又碰SL又碰目標 → 保守算止損；🟢 出現時現價已經在 Entry 上面 → 照規則「不追」，記為沒追
+# 作廢／沒觸發／沒追 都不算勝負，只計數。
+# ============================================================
+from bisect import bisect_right as _wy_bisect
+WY_TRIGGER_DAYS  = int(menv('WY_TRIGGER_DAYS', '10'))
+WY_HOLD_DAYS     = int(menv('WY_HOLD_DAYS', '20'))
+WY_TP_R          = 1.5
+WY_BACKFILL_DAYS = int(menv('WY_BACKFILL_DAYS', '20'))
+WY_CASES_FILE    = os.path.join(DATA_DIR, 'wyckoff_cases.json')
+WY_BT_FILE       = os.path.join(DATA_DIR, 'wyckoff_backtest.json')
+WY_BT_DAYS       = int(menv('WY_BT_DAYS', '500'))     # 回測最近幾根日K（500 ≈ 2年，跟C1回測一樣）
+wy_cases_lock    = threading.Lock()
+wy_case_events   = []
+
+def _wy_new_state():
+    return {'pending': {}, 'active': {}, 'done': [], 'used': {}, 'seen': {}}
+
+wy_cases = _wy_new_state()
+
+def wy_cases_load():
+    global wy_cases
+    try:
+        if os.path.exists(WY_CASES_FILE):
+            with open(WY_CASES_FILE, 'r', encoding='utf-8') as f:
+                d = json.load(f)
+            base = _wy_new_state(); base.update(d); wy_cases = base
+            log.info(f"📊 威科夫追蹤：等觸發{len(wy_cases['pending'])} 進行中{len(wy_cases['active'])} 已結束{len(wy_cases['done'])}")
+    except Exception as e:
+        log.warning(f"📊 載入 {WY_CASES_FILE} 失敗：{e}")
+
+def wy_cases_save():
+    try:
+        with wy_cases_lock:
+            wy_cases['done'] = wy_cases['done'][-DONE_KEEP:]
+            payload = json.dumps(wy_cases, ensure_ascii=False, default=str)
+        tmp = WY_CASES_FILE + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            f.write(payload)
+        os.replace(tmp, WY_CASES_FILE)
+    except Exception as e:
+        log.warning(f"📊 儲存 {WY_CASES_FILE} 失敗：{e}")
+
+def _wy_close(st, case, result, r_mult, t, events):
+    case.update({'result': result, 'r_mult': round(float(r_mult), 2) if r_mult is not None else None, 'end_time': t})
+    st['pending'].pop(case['id'], None)
+    st['active'].pop(case['id'], None)
+    st['done'].append(case)
+    if events is not None and not case.get('backfill') and result in ('TP1', 'SL', 'TIMEOUT'):
+        events.append(case)
+
+def wy_track_step(st, sym, dates, bars, row, meta, backfill=False, events=None, day_stage_fn=None):
+    """dates/bars＝這一檔到「今天」為止的已收盤日K；row＝今天的威科夫結果（可以是None）。只處理上次檢查之後的新K線。"""
+    for cid, p in list(st['pending'].items()):
+        if p['symbol'] != sym: continue
+        for i in range(_wy_bisect(dates, p['last_checked']), len(dates)):
+            b = bars[i]
+            if b['h'] >= p['entry']:
+                fill = max(p['entry'], b['o'])
+                R = fill - p['sl']
+                if R <= 0:
+                    _wy_close(st, p, 'CANCEL', None, dates[i], events); break
+                p.update({'fill': fill, 'R': R, 'tp': fill + WY_TP_R * R, 'trigger_time': dates[i],
+                          'bars_held': 0, 'last_checked': dates[i]})
+                st['pending'].pop(cid, None)
+                st['active'][cid] = p
+                if b['l'] <= p['sl']:
+                    _wy_close(st, p, 'SL', -1.0, dates[i], events)
+                break
+            if b['l'] <= p['sl']:
+                _wy_close(st, p, 'CANCEL', None, dates[i], events); break
+            p['waited'] = p.get('waited', 0) + 1
+            p['last_checked'] = dates[i]
+            if p['waited'] >= WY_TRIGGER_DAYS:
+                _wy_close(st, p, 'NOFILL', None, dates[i], events); break
+    for cid, a in list(st['active'].items()):
+        if a['symbol'] != sym: continue
+        for i in range(_wy_bisect(dates, a['last_checked']), len(dates)):
+            b = bars[i]
+            a['bars_held'] += 1
+            a['last_checked'] = dates[i]
+            a['last_close'] = b['c']
+            if b['l'] <= a['sl']:
+                _wy_close(st, a, 'SL', -1.0, dates[i], events); break
+            if b['h'] >= a['tp']:
+                _wy_close(st, a, 'TP1', WY_TP_R, dates[i], events); break
+            if a['bars_held'] >= WY_HOLD_DAYS:
+                _wy_close(st, a, 'TIMEOUT', (b['c'] - a['fill']) / a['R'], dates[i], events); break
+    if not row or row.get('stage') != 'green' or not row.get('entry') or not row.get('sl'):
+        return
+    cid = f"{sym}|{row.get('bo_date')}|{row.get('retest_date')}|{float(row.get('ceiling') or 0):.4f}"
+    if cid in st['pending']:                      # 還沒觸發：照最新的🟢移動 Entry／SL
+        p = st['pending'][cid]
+        p['entry'], p['sl'] = float(row['entry']), float(row['sl'])
+        return
+    if cid in st['used']:
+        return
+    st['used'][cid] = dates[-1]
+    tail = bars[-20:]
+    turnover = sum(x['c'] * x['v'] for x in tail) / len(tail) if tail else None
+    case = {
+        'id': cid, 'symbol': sym, 'name': meta.get('name'), 'sector': meta.get('sector'), 'tv_symbol': meta.get('tv_symbol'),
+        'created': dates[-1], 'last_checked': dates[-1], 'waited': 0,
+        'entry': float(row['entry']), 'sl': float(row['sl']), 'entry0': float(row['entry']), 'ceiling': row.get('ceiling'),
+        'bo_date': row.get('bo_date'), 'retest_date': row.get('retest_date'),
+        'day_stage': row.get('day_stage') or (day_stage_fn() if day_stage_fn else '--'),
+        'wall_r': row.get('wall_r'), 'risk_atr': row.get('risk_atr'), 'turnover': turnover,
+        'liquid': wy_liquid(turnover), 'backfill': bool(backfill),
+    }
+    if bars[-1]['c'] > case['entry']:            # 規則：現價已過Entry就不追
+        case['result'], case['r_mult'], case['end_time'] = 'CHASE', None, dates[-1]
+        st['done'].append(case)
+        return
+    st['pending'][cid] = case
+
+def wy_track_live(meta, ddf, row):
+    """主掃描每一檔都呼叫（用已收盤日K）。第一次看到某檔時，先回放最近 WY_BACKFILL_DAYS 天補抓（標「回補」，不推Telegram）"""
+    sym = meta['symbol']
+    dates = [pd.Timestamp(t).strftime('%Y-%m-%d') for t in ddf.index]
+    bars = cf_bars(ddf)
+    with wy_cases_lock:
+        if sym not in wy_cases['seen'] and WY_BACKFILL_DAYS > 0:
+            for k in range(WY_BACKFILL_DAYS, 0, -1):
+                n = len(ddf) - k
+                if n < 121: continue
+                sub = ddf.iloc[:n]
+                try:
+                    rk = wy_analyze(sym, sub)
+                    stage_fn = lambda sub=sub: STAGE_LABEL_MAP.get(get_stage(sub)[0], '--')
+                    wy_track_step(wy_cases, sym, dates[:n], bars[:n], rk, meta, backfill=True, day_stage_fn=stage_fn)
+                except Exception as e:
+                    log.warning(f"📊 回補 {sym} k={k}: {e}")
+        wy_cases['seen'][sym] = dates[-1]
+        wy_track_step(wy_cases, sym, dates, bars, row, meta, backfill=False, events=wy_case_events)
+        for c in list(wy_cases['pending'].values()) + list(wy_cases['active'].values()):
+            if c['symbol'] == sym:
+                c['price'] = bars[-1]['c']
+
+def wy_stats(done):
+    """跟突破卡片同樣的算法：勝率＝達1:1.5÷(達1:1.5＋止損)；平均R含到期"""
+    traded = [d for d in done if d.get('result') in ('TP1', 'SL', 'TIMEOUT')]
+    def agg(sub):
+        n = len(sub); w = sum(1 for d in sub if d['result'] == 'TP1'); l = sum(1 for d in sub if d['result'] == 'SL')
+        to = n - w - l; tot = sum(d['r_mult'] for d in sub)
+        return {'n': n, 'win': w, 'loss': l, 'timeout': to, 'winrate': round(w / (w + l) * 100, 1) if (w + l) else None,
+                'avg_r': round(tot / n, 3) if n else None, 'total_r': round(tot, 1)}
+    groups = [
+        ('全部', '全部', lambda d: True),
+        ('日線Stage', 'S2', lambda d: d.get('day_stage') == 'S2'),
+        ('日線Stage', '非S2', lambda d: d.get('day_stage') != 'S2'),
+        ('上方空間', f'≥{HEADROOM_MIN_R:g}R或藍天', lambda d: d.get('wall_r') is None or d['wall_r'] >= HEADROOM_MIN_R),
+        ('上方空間', f'<{HEADROOM_MIN_R:g}R', lambda d: d.get('wall_r') is not None and d['wall_r'] < HEADROOM_MIN_R),
+        ('SL距離', f'≤{WY_RISK_MAX_ATR:g}倍ATR', lambda d: (d.get('risk_atr') or 0) <= WY_RISK_MAX_ATR),
+        ('SL距離', f'>{WY_RISK_MAX_ATR:g}倍ATR', lambda d: (d.get('risk_atr') or 0) > WY_RISK_MAX_ATR),
+        ('成交額', '夠（會推）', lambda d: d.get('liquid')),
+        ('成交額', '💧不夠', lambda d: not d.get('liquid')),
+    ]
+    rows = [(g, lab, agg([d for d in traded if fn(d)])) for g, lab, fn in groups]
+    counts = {k: sum(1 for d in done if d.get('result') == k) for k in ('NOFILL', 'CANCEL', 'CHASE')}
+    return rows, counts
+
+def wy_send_case_results():
+    evs = [c for c in wy_case_events if c.get('liquid')]
+    if not evs or not WY_TG_ON:
+        return
+    icon = {'TP1': '✅ 達1:1.5', 'SL': '❌ 止損', 'TIMEOUT': f'⏱ {WY_HOLD_DAYS}天到期'}
+    lines = [f'【{M["name"]}威科夫 🟢 結果】']
+    for c in evs:
+        lines.append(f"{icon.get(c['result'], c['result'])} {label_of(c.get('name'), c['symbol'])}  "
+                     f"成交 {fmt_px(c['fill'])} → {c['r_mult']:+.2f}R（🟢 {c['created'][5:]}）")
+    send_telegram_plain('\n'.join(lines))
+
+# ---------------- 歷史回測：把過去 WY_BT_DAYS 天每一天都重播一次 ----------------
+wy_bt_state = {'status': 'idle', 'done': 0, 'total': 0, 'error': None, 'started': None, 'lock': threading.Lock()}
+
+def run_wy_backtest(limit=None):
+    with wy_bt_state['lock']:
+        if wy_bt_state['status'] == 'running':
+            return
+        wy_bt_state.update({'status': 'running', 'done': 0, 'error': None,
+                            'started': datetime.now(MY_TZ).strftime('%Y-%m-%d %H:%M')})
+    try:
+        syms = list(dict.fromkeys(SYMBOLS))[:limit] if limit else list(dict.fromkeys(SYMBOLS))
+        wy_bt_state['total'] = len(syms)
+        st = _wy_new_state()
+        for si, sym in enumerate(syms):
+            try:
+                df = closed_bars(fetch_ohlcv(sym, '1D'), '1D')
+                if len(df) >= 250:
+                    meta = {'symbol': sym, 'name': NAMES.get(sym, sym_code(sym)), 'sector': SECTORS.get(sym, '其他'), 'tv_symbol': tv_sym(sym)}
+                    dates = [pd.Timestamp(t).strftime('%Y-%m-%d') for t in df.index]
+                    bars = cf_bars(df)
+                    for T in range(max(130, len(df) - WY_BT_DAYS), len(df)):
+                        sub = df.iloc[max(0, T - 499):T + 1]
+                        r = wy_analyze(sym, sub)
+                        stage_fn = lambda sub=sub: STAGE_LABEL_MAP.get(get_stage(sub)[0], '--')
+                        wy_track_step(st, sym, dates[:T + 1], bars[:T + 1], r, meta, day_stage_fn=stage_fn)
+            except Exception as e:
+                log.warning(f"📊 威科夫回測 {sym}: {e}")
+            wy_bt_state['done'] = si + 1
+            time.sleep(0.2)
+        rows, counts = wy_stats(st['done'])
+        res = {'finished': datetime.now(MY_TZ).strftime('%Y-%m-%d %H:%M'), 'days': WY_BT_DAYS, 'symbols': len(syms),
+               'rows': rows, 'counts': counts, 'open': len(st['pending']) + len(st['active']),
+               'cases': sorted([d for d in st['done'] if d.get('result') in ('TP1', 'SL', 'TIMEOUT')],
+                               key=lambda d: d.get('trigger_time', ''), reverse=True)[:300]}
+        with open(WY_BT_FILE, 'w', encoding='utf-8') as f:
+            json.dump(res, f, ensure_ascii=False, default=str)
+        with wy_bt_state['lock']:
+            wy_bt_state['status'] = 'done'
+    except Exception as e:
+        log.error(f"📊 威科夫回測失敗：{e}")
+        with wy_bt_state['lock']:
+            wy_bt_state.update({'status': 'error', 'error': str(e)})
+
+def load_wy_bt():
+    try:
+        with open(WY_BT_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+wy_cases_load()
+
+def _wy_stat_table(rows):
+    out = '<table class=wy><tr><th>分組</th><th>條件</th><th>筆數</th><th>✅</th><th>❌</th><th>⏱</th><th>勝率</th><th>平均R</th><th>總R</th></tr>'
+    for g, lab, s in rows:
+        wr = f'{s["winrate"]:.0f}%' if s['winrate'] is not None else '-'
+        ar = f'{s["avg_r"]:+.2f}R' if s['avg_r'] is not None else '-'
+        out += (f'<tr><td>{_h(g)}</td><td>{_h(lab)}</td><td class=c>{s["n"]}</td><td class=c>{s["win"]}</td><td class=c>{s["loss"]}</td>'
+                f'<td class=c>{s["timeout"]}</td><td class=c>{wr}</td><td class=c>{ar}</td><td class=c>{s["total_r"]:+.1f}</td></tr>')
+    return out + '</table>'
+
+def wy_tracking_html():
+    """威科夫頁面最下面：🟢 結果追蹤＋歷史回測＋跟VCP對照"""
+    f = lambda v: '—' if v is None else fmt_px(v)
+    with wy_cases_lock:
+        pend = sorted(wy_cases['pending'].values(), key=lambda c: c['created'], reverse=True)
+        act = sorted(wy_cases['active'].values(), key=lambda c: c.get('trigger_time', ''), reverse=True)
+        done = list(wy_cases['done'])
+    rows, counts = wy_stats(done)
+    def lab(c):
+        tv = f"{tv_chart_base()}?symbol={c.get('tv_symbol') or tv_sym(c['symbol'])}&interval=D"
+        nm = c.get('name') or ''
+        nm = '' if nm == sym_code(c['symbol']) else f' <span class=small>{_h(nm)}</span>'
+        tags = (' <span class=small>回補</span>' if c.get('backfill') else '') + ('' if c.get('liquid') else ' <span class=small style="color:#ee7373">💧</span>')
+        return f'<a href="{tv}" target="_blank"><b>{sym_code(c["symbol"])}</b></a>{nm}{tags}'
+    h = ('<h3 class=wyh id=wytrack style="border-left:6px solid #4cc28e;padding-left:8px">📊 🟢 結果追蹤</h3>'
+         f'<p class=note>每個 🟢 出現後自動追蹤：等價格碰到 Entry（{WY_TRIGGER_DAYS} 天內），成交後看先碰 SL（−1R）還是先到 1:{WY_TP_R:g}（+{WY_TP_R:g}R），'
+         f'{WY_HOLD_DAYS} 天都沒碰到算到期。出場規則跟突破卡片一樣，所以可以直接比較。還沒觸發時，Entry／SL 每天照最新的 🟢 移動。'
+         f'「回補」＝第一次部署時回放最近 {WY_BACKFILL_DAYS} 天補抓的。💧＝成交額不夠（只記錄、不推）。</p>')
+    h += f'<p class=note><b>等觸發（{len(pend)}）</b></p>'
+    if pend:
+        h += '<div class=wrap><table class=wy><tr><th>股票</th><th>🟢 日期</th><th>日線</th><th>Entry</th><th>SL</th><th>現價</th><th>已等</th></tr>'
+        for c in pend:
+            h += (f'<tr><td>{lab(c)}</td><td class=c>{c["created"][5:]}</td><td class=c>{c.get("day_stage")}</td><td class=c>{f(c["entry"])}</td>'
+                  f'<td class=c>{f(c["sl"])}</td><td class=c>{f(c.get("price"))}</td><td class=c>{c.get("waited", 0)}/{WY_TRIGGER_DAYS}</td></tr>')
+        h += '</table></div>'
+    else:
+        h += '<p class=note>沒有。</p>'
+    h += f'<p class=note><b>已成交、進行中（{len(act)}）</b></p>'
+    if act:
+        h += '<div class=wrap><table class=wy><tr><th>股票</th><th>成交日</th><th>成交價</th><th>SL</th><th>1:1.5</th><th>現價（R）</th><th>已過</th></tr>'
+        for c in act:
+            px = c.get('price') or c.get('last_close') or c['fill']
+            h += (f'<tr><td>{lab(c)}</td><td class=c>{c["trigger_time"][5:]}</td><td class=c>{f(c["fill"])}</td><td class=c>{f(c["sl"])}</td>'
+                  f'<td class=c>{f(c["tp"])}</td><td class=c>{f(px)}（{(px - c["fill"]) / c["R"]:+.2f}R）</td><td class=c>{c["bars_held"]}/{WY_HOLD_DAYS}</td></tr>')
+        h += '</table></div>'
+    else:
+        h += '<p class=note>沒有。</p>'
+    recent = sorted([d for d in done if d.get('result') in ('TP1', 'SL', 'TIMEOUT')], key=lambda d: d.get('end_time', ''), reverse=True)[:20]
+    if recent:
+        icon = {'TP1': '✅', 'SL': '❌', 'TIMEOUT': '⏱'}
+        h += f'<details><summary class=note>最近結束 {len(recent)} 筆 — 點這裡展開</summary><div class=wrap><table class=wy><tr><th>股票</th><th>結果</th><th>成交</th><th>結束</th><th>R</th></tr>'
+        for c in recent:
+            h += (f'<tr><td>{lab(c)}</td><td class=c>{icon[c["result"]]}</td><td class=c>{c["trigger_time"][5:]} @ {f(c["fill"])}</td>'
+                  f'<td class=c>{c["end_time"][5:]}</td><td class=c>{c["r_mult"]:+.2f}</td></tr>')
+        h += '</table></div></details>'
+    h += (f'<p class=note><b>即時戰績</b>（從部署這天開始累積；不算勝負的：沒觸發 {counts["NOFILL"]}、觸發前就破SL作廢 {counts["CANCEL"]}、'
+          f'現價已過Entry沒追 {counts["CHASE"]}）</p>' + '<div class=wrap>' + _wy_stat_table(rows) + '</div>')
+
+    # ---- 歷史回測 + 跟VCP對照 ----
+    with wy_bt_state['lock']:
+        bst = dict(wy_bt_state)
+    bt = load_wy_bt()
+    h += '<h3 class=wyh id=wybt style="border-left:6px solid #84aedb;padding-left:8px">🧪 歷史回測：威科夫 🟢 vs VCP 突破卡片</h3>'
+    if bst['status'] == 'running':
+        h += f'<p class=note>⏳ 回測進行中：{bst["done"]}/{bst["total"]} 檔（{bst["started"]} 開始）。跑完重新整理這一頁。</p>'
+    else:
+        if bst['status'] == 'error':
+            h += f'<p class=note style="color:#ee7373">上次回測出錯：{_h(bst["error"])}</p>'
+        h += (f'<p class=note><a href="/wyckoff_backtest?run=1" onclick="return confirm(\'開始跑威科夫歷史回測？會在背景跑大約10～30分鐘，不影響正常掃描\')">'
+              f'▶ 跑威科夫歷史回測（最近 {WY_BT_DAYS} 個交易日）</a>　<span class=small>可以先加 &amp;limit=50 試50檔</span></p>')
+    if bt:
+        h += (f'<p class=note>{bt["finished"]} 完成・{bt["symbols"]} 檔・最近 {bt["days"]} 個交易日・'
+              f'沒觸發 {bt["counts"]["NOFILL"]}、作廢 {bt["counts"]["CANCEL"]}、沒追 {bt["counts"]["CHASE"]}、回測結束時還沒結果 {bt["open"]}</p>')
+        h += '<div class=wrap>' + _wy_stat_table(bt['rows']) + '</div>'
+        vcp = load_bt_result('1D')
+        cfg = None
+        if vcp:
+            cfg = next((c for c in vcp.get('configs', []) if c.get('cfg', {}).get('min_drop') == MIN_DROP_PCT), None)
+        def line(name, s):
+            wr = f'{s["winrate"]:.0f}%' if s.get('winrate') is not None else '-'
+            ar = f'{s["avg_r"]:+.2f}R' if s.get('avg_r') is not None else '-'
+            return f'<tr><td>{name}</td><td class=c>{s["n"]}</td><td class=c>{wr}</td><td class=c>{ar}</td><td class=c>{s.get("total_r", 0):+.1f}</td></tr>'
+        h += ('<p class=note><b>對照（同樣的出場規則：SL −1R／1:1.5／20根到期）</b></p><div class=wrap><table class=wy>'
+              '<tr><th>策略</th><th>筆數</th><th>勝率</th><th>平均R</th><th>總R</th></tr>')
+        h += line('🧱 威科夫 🟢・全部', bt['rows'][0][2]) + line('🧱 威科夫 🟢・日線S2', bt['rows'][1][2])
+        if cfg:
+            h += line(f'🃏 VCP 突破卡片 1D（C1 {MIN_DROP_PCT:g}%）・全部', cfg['all']) + line(f'🃏 VCP 突破卡片 1D・日線S2', cfg['s2'])
+            h += '</table></div><p class=note>VCP 數字來自「🧪 C1門檻回測」1D 的結果（' + _h(vcp.get('finished', '')) + '）。'
+        else:
+            h += (f'</table></div><p class=note>還沒有 VCP 1D 的回測結果可以對照：到「🧪 C1門檻回測」跑一次 1D（C1 {MIN_DROP_PCT:g}%），這裡就會出現。')
+        h += ('差別：VCP 卡片用「突破那根K線的收盤價」進場，威科夫用 Entry 觸價成交；樣本少於 30 筆時參考就好。'
+              '過去的結果不代表未來，只供自己研究。</p>')
+    return h
 
 load_cards()
 
@@ -4806,6 +5143,10 @@ def _card_tags(c, tf, extra=None):
     if extra: tags.extend(extra)
     return '<div class="tags">' + ''.join(tags) + '</div>'
 
+def _nm(c):
+    n = c.get('name') or ''
+    return '' if n == sym_code(c['symbol']) else _h(n)
+
 def _search_attr(c):
     code = c['symbol'].replace('.KL', '')
     return f'data-sector="{_h(c.get("sector") or "其他")}" data-q="{_h((code + " " + (c.get("name") or "")).upper())}"'
@@ -4824,7 +5165,7 @@ def _render_pending(c, tf):
     elif dist <= 0:       dist_html = '<span class="dist over">盤中已過BO・等收盤</span>'
     else:                 dist_html = f'<span class="dist">差 {dist:.1f}%</span>'
     return f'''<div class="card pend" {_search_attr(c)}>
-<div class="hd"><a href="{_tv_url(c, tf)}" target="_blank">{code}</a><span class="nm">{_h(c.get("name"))}</span>{dist_html}</div>
+<div class="hd"><a href="{_tv_url(c, tf)}" target="_blank">{code}</a><span class="nm">{_nm(c)}</span>{dist_html}</div>
 {_card_tags(c, tf)}
 <div class="line"><span>第 {c.get("base", 0) + 1} 個 base ・ 收縮 {c.get("c_count")} 段</span><span class="muted">還沒突破</span></div>
 <div class="pxrow"><div><div class="lbl">現價</div><div class="big">{fmt_px(price)}</div></div>
@@ -4843,7 +5184,7 @@ def _render_active(c, tf):
     extra = [f'<span class="tag">已過 {c.get("bars_held", 0)}/{MAX_HOLD_BARS} 根</span>']
     if c.get('backfill'): extra.append('<span class="tag">回補</span>')
     return f'''<div class="card" {_search_attr(c)}>
-<div class="hd"><a href="{_tv_url(c, tf)}" target="_blank">{code}</a><span class="nm">{_h(c.get("name"))}</span><span class="dt">{_fmt_time(c["confirm_time"], tf)}</span></div>
+<div class="hd"><a href="{_tv_url(c, tf)}" target="_blank">{code}</a><span class="nm">{_nm(c)}</span><span class="dt">{_fmt_time(c["confirm_time"], tf)}</span></div>
 {_card_tags(c, tf, extra)}
 <div class="line"><span>第 {c.get("base", 0) + 1} 個 base ・ 收縮 {c.get("c_count")} 段</span><span class="muted">{_fmt_time(c["confirm_time"], tf)} 收盤確認</span></div>
 <div class="pxrow"><div><div class="lbl">確認價（進場）</div><div class="big">{fmt_px(entry)}</div><div class="lbl">現價 {fmt_px(price)}（{cur_r:+.2f}R）</div></div>
@@ -4858,7 +5199,7 @@ def _render_done(c, tf):
     label = {'TP1': '✅ 達1:1.5', 'SL': '❌ 止損', 'TIMEOUT': '⏱ 20根到期'}.get(c['result'], c['result'])
     cls = 'pos' if c['r_mult'] > 0 else 'neg'
     return f'''<div class="card res-{c["result"]}" {_search_attr(c)}>
-<div class="hd"><a href="{_tv_url(c, tf)}" target="_blank">{code}</a><span class="nm">{_h(c.get("name"))}</span><span class="dt">{label}</span></div>
+<div class="hd"><a href="{_tv_url(c, tf)}" target="_blank">{code}</a><span class="nm">{_nm(c)}</span><span class="dt">{label}</span></div>
 {_card_tags(c, tf)}
 <div class="line"><span>{_fmt_time(c["confirm_time"], tf)} 進場 {fmt_px(c["entry"])} → {_fmt_time(c.get("end_time"), tf)}</span><span class="{cls}">{c["r_mult"]:+.2f}R</span></div>
 </div>'''
@@ -5072,6 +5413,116 @@ ATR% = 14根平均真實波幅 ÷ 收盤價；「3×ATR%」= C1跌幅要超過�
 注意：回測沒算手續費和滑價；同一檔可能同時出現多筆；樣本少於30筆的結果參考就好。</div>
 </body></html>'''
 
+
+# ============================================================
+# 🧱 威科夫卡片（MH 2026-10-28 選B）：🟢 和 🟠 用卡片顯示，🟡／⚪／❌／⛔ 維持表格
+# ============================================================
+WY_CARD_CSS = ('.card.wyg{border-left-color:#4cc28e}.card.wyo{border-left-color:#ff8a3d}'
+               '.story{font-size:11px;color:#aab;line-height:1.7;margin:4px 0 2px}.story b{color:#ddd}'
+               '.wynote{font-size:11px;color:#8b949e;margin-top:7px;line-height:1.5}'
+               '.tag.track{border-color:#4cc28e;color:#a5d6a7}')
+
+def _wy_fp(v):
+    return '—' if v is None else fmt_px(v)
+
+def _wy_card_tags(r, extra=None):
+    st = r.get('day_stage', '--')
+    tags = [f'<span class="tag">{_h(r.get("sector") or "其他")}</span>',
+            f'<span class="tag {"s2" if st == "S2" else "sx"}">日線{_h(st)}</span>',
+            f'<span class="tag">{_h(r.get("position") or "")}</span>']
+    if r.get('loud_mult') is not None:
+        tags.append(f'<span class="tag hot">🔥突破量{r["loud_mult"]:.1f}x</span>')
+    if r.get('redist'):
+        tags.append('<span class="tag warn">⚠️ S4再派發？</span>')
+    to = r.get('turnover')
+    if to is not None:
+        tags.append(f'<span class="tag{"" if r.get("liquid") else " warn"}">成交額{_fmt_turnover(to)}{"" if r.get("liquid") else " 💧不推"}</span>')
+    if extra:
+        tags.extend(extra)
+    return '<div class="tags">' + ''.join(tags) + '</div>'
+
+def _wy_story(r):
+    ok = lambda b: '✓' if b else '✗'
+    parts = [f'<b>區間</b> {r["range_from"]} 起 {r["range_days"]} 天（天花板 {_wy_fp(r["ceiling"])}／地板 {_wy_fp(r["floor"])}）',
+             f'<b>洗盤</b> {r["spring_date"]} 刺穿 {r["spring_depth"]:.1f}%']
+    if r.get('quiet_ratio') is not None:
+        parts.append(f'<b>安靜</b> {ok(r.get("quiet_ok"))} {r["quiet_ratio"]:.1f}x')
+    if r.get('bo_date'):
+        parts.append(f'<b>大聲</b> {ok(r.get("loud_ok"))} {r["bo_date"]} {r.get("loud_mult") or 0:.1f}x')
+    if r.get('retest_date'):
+        parts.append(f'<b>站穩</b> {ok(r.get("retest_ok"))} {r["retest_date"]} 低點 {_wy_fp(r.get("retest_low"))}')
+    return '<div class="story">' + ' → '.join(parts) + '</div>'
+
+def _wy_head(r, badge):
+    tv = f"{tv_chart_base()}?symbol={r.get('tv_symbol') or tv_sym(r['symbol'])}&interval=D"
+    return (f'<div class="hd"><a href="{tv}" target="_blank">{sym_code(r["symbol"])}</a>'
+            f'<span class="nm">{_nm(r)}</span>{badge}</div>')
+
+def _wy_track_tag(sym):
+    with wy_cases_lock:
+        for c in wy_cases['active'].values():
+            if c['symbol'] == sym:
+                px = c.get('price') or c.get('last_close') or c['fill']
+                return f'<span class="tag track">📊 已成交 {fmt_px(c["fill"])}・{(px - c["fill"]) / c["R"]:+.2f}R</span>'
+        for c in wy_cases['pending'].values():
+            if c['symbol'] == sym:
+                return f'<span class="tag track">📊 等觸發 {c.get("waited", 0)}/{WY_TRIGGER_DAYS} 天</span>'
+    return None
+
+def wy_card_green(r):
+    entry, sl, price = r['entry'], r['sl'], r.get('price') or 0
+    r1 = entry - sl
+    tp = entry + WY_TP_R * r1
+    if price and price > entry:
+        badge = '<span class="dist over">現價已過Entry・不追</span>'
+    elif price:
+        badge = f'<span class="dist">差 {_pct(entry, price):.1f}%</span>'
+    else:
+        badge = ''
+    extra = []
+    if r.get('risk_atr') and r['risk_atr'] > WY_RISK_MAX_ATR:
+        extra.append(f'<span class="tag warn">⚠️ SL {r["risk_atr"]:.1f}倍ATR・改4H/1H找C</span>')
+    tt = _wy_track_tag(r['symbol'])
+    if tt:
+        extra.append(tt)
+    wr = r.get('wall_r')
+    if r.get('wall') is None:
+        wall_txt, wall_cls = '藍天（上方沒有日線牆）', 'pos'
+    else:
+        wall_txt = f'{wr:.2f}R（{r.get("wall_tier") or ""}級牆 {_wy_fp(r["wall"])}）'
+        wall_cls = 'pos' if wr >= HEADROOM_MIN_R else 'neg'
+    tps = '、'.join(_wy_fp(t) for t in r.get('tps') or []) or '—'
+    return f'''<div class="card wyg">
+{_wy_head(r, badge)}
+{_wy_card_tags(r, extra)}
+{_wy_story(r)}
+<div class="pxrow"><div><div class="lbl">現價</div><div class="big">{_wy_fp(price)}</div></div>
+<div class="r"><div class="lbl">Entry（觸價買入）</div><div class="big">{_wy_fp(entry)}</div><div class="lbl">回踩後反彈高點 +0.5%</div></div></div>
+<div class="lv"><div><span>SL</span><span>{_wy_fp(sl)} <span class="neg">({_pct(sl, entry):.1f}%)</span></span></div>
+<div><span>1:{WY_TP_R:g}</span><span>{_wy_fp(tp)} <span class="pos">(+{_pct(tp, entry):.1f}%)</span></span></div>
+<div><span>上方空間</span><span class="{wall_cls}">{wall_txt}</span></div>
+<div><span>TP參考</span><span>{tps}</span></div></div>
+<div class="wynote">{r.get("note", "")}</div>
+</div>'''
+
+def wy_card_orange(r):
+    price, ceil = r.get('price') or 0, r['ceiling']
+    badge = f'<span class="dist">突破 {r.get("bo_days_ago", 0)} 天</span>'
+    near = ceil * (1 + WY_RETEST_NEAR_PCT / 100)
+    to_ceil = _pct(price, ceil) if price else None
+    return f'''<div class="card wyo">
+{_wy_head(r, badge)}
+{_wy_card_tags(r)}
+{_wy_story(r)}
+<div class="pxrow"><div><div class="lbl">現價</div><div class="big">{_wy_fp(price)}</div></div>
+<div class="r"><div class="lbl">天花板（等回踩到這裡）</div><div class="big">{_wy_fp(ceil)}</div>
+<div class="lbl">{"高於天花板 " + f"{to_ceil:+.1f}%" if to_ceil is not None else ""}</div></div></div>
+<div class="lv"><div><span>回踩區</span><span>{_wy_fp(ceil)} ～ {_wy_fp(near)}</span></div>
+<div><span>突破那天</span><span>{r.get("bo_date") or "—"}・量 {r.get("loud_mult") or 0:.1f}x・收盤位置 {r.get("loud_close_pos") or 0:.2f}</span></div>
+<div><span>地板</span><span>{_wy_fp(r.get("floor"))}</span></div></div>
+<div class="wynote">{r.get("note", "")}</div>
+</div>'''
+
 def generate_wyckoff_html():
     """跟加密版 /wyckoff 同一個版面（表格欄位、階段、說明文字），只換成馬股的顯示方式"""
     with WY_LOCK:
@@ -5090,7 +5541,7 @@ def generate_wyckoff_html():
                 'else setTimeout(p,15000)}).catch(()=>setTimeout(p,20000))})();</script>') if scanning else ''
     banner = '<div class="scanning-banner">⏳ C系列掃描進行中，威科夫名單會在掃完後自動更新...</div>' if scanning else ''
     html = (f'<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
-            f'<title>🧱 大馬威科夫</title><style>{CARDS_CSS}{css}</style></head><body>'
+            f'<title>🧱 大馬威科夫</title><style>{CARDS_CSS}{css}{WY_CARD_CSS}</style></head><body>'
             '<h2>&#x1F1F2;&#x1F1FE; 大馬莊家思維 ・ 威科夫：洗盤 → 真突破（日線）</h2>'
             '<div class="nav"><a href="/">📊 C系列總表</a><a href="/cards">🃏 突破卡片</a><a class="nav-on" href="/wyckoff">🧱 威科夫突破</a>'
             '<a href="/backtest">🧪 C1門檻回測</a><a href="/exit_backtest">🚪 出場回測</a></div>'
@@ -5127,7 +5578,7 @@ def generate_wyckoff_html():
                         f'突破量的 {(r["retest_vol"] or 0):.0%}{vm_txt}</span>')
             else:
                 hold = '—'
-            h += (f'<tr><td><a href="{tv}" target="_blank"><b>{code}</b></a> <span class=small>{_h(r.get("name") or "")}</span>'
+            h += (f'<tr><td><a href="{tv}" target="_blank"><b>{code}</b></a> <span class=small>{_nm(r)}</span>'
                   f'<br><span class=small>{_h(r.get("sector") or "")}・{f(r["price"])}</span>'
                   f'<br><span class=small>成交額 {_fmt_turnover(r.get("turnover"))}'
                   + ('' if r.get('liquid') else ' <span style="color:#ee7373">💧不推</span>') + '</span></td>'
@@ -5162,6 +5613,10 @@ def generate_wyckoff_html():
         if not sub:
             html += '<p class=note>沒有。</p>'
             continue
+        if stage in ('green', 'orange'):          # 🧱 卡片
+            render = wy_card_green if stage == 'green' else wy_card_orange
+            html += '<div class="grid">' + ''.join(render(r) for r in sub) + '</div>'
+            continue
         if stage == 'yellow':
             focus = [r for r in sub if r.get('focus')]
             rest = [r for r in sub if not r.get('focus')]
@@ -5173,6 +5628,10 @@ def generate_wyckoff_html():
                          '— 點這裡展開</summary>' + table(rest, stage) + '</details>')
             continue
         html += table(sub, stage)
+    try:
+        html += wy_tracking_html()
+    except Exception as e:
+        html += f'<p class=note>結果追蹤顯示錯誤：{_h(e)}</p>'
     if st['errors']:
         html += ('<details><summary class=note>錯誤 ' + str(len(st['errors'])) + ' 筆</summary><pre>'
                  + _h('\n'.join(st['errors'][:50])) + '</pre></details>')
@@ -5195,6 +5654,14 @@ def wyckoff_push():
         return jsonify({'sent': False, 'reason': '還沒有威科夫結果，等掃描跑完'})
     ok = send_telegram_plain(wy_summary_text(rows, '目前名單（手動）'))
     return jsonify({'sent': bool(ok), 'rows': len(rows)})
+
+@app.route('/wyckoff_backtest')
+def wyckoff_backtest_route():
+    """▶ 開始威科夫歷史回測（背景執行）：/wyckoff_backtest?run=1&limit=50"""
+    if request.args.get('run'):
+        lim = request.args.get('limit')
+        threading.Thread(target=run_wy_backtest, kwargs={'limit': int(lim) if lim and lim.isdigit() else None}, daemon=True).start()
+    return redirect(f'{BASE}/wyckoff#wybt')
 
 @app.route('/debug_wyckoff')
 def debug_wyckoff():
