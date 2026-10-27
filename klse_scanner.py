@@ -3118,6 +3118,7 @@ def _open_case(key, meta, tf, p, dfc, i, backfill, st):
     case.update({
         'id': cid, 'key': key, 'tf': tf,
         'symbol': meta['symbol'], 'name': meta.get('name'), 'sector': meta.get('sector'), 'tv_symbol': meta.get('tv_symbol'),
+        'turnover': meta.get('turnover'),
         'entry': entry, 'tp1': tp1, 'tp2': tp2,
         'confirm_time': _iso(dfc.index[i]), 'last_checked': _iso(dfc.index[i]),
         'bars_held': 0, 'last_close': entry, 'vol_x': _vol_ratio(dfc, i),
@@ -3194,6 +3195,7 @@ def _card_step(meta, tf, df_all, dfc, res, backfill=False, st=None):
     if p is not None and not df_all.empty:
         p['price'] = float(df_all['close'].values[-1])
         p['price_time'] = _iso(df_all.index[-1])
+        p['turnover'] = meta.get('turnover')
     _check_active(key, dfc, backfill, st)
     for case in st['active'].values():
         if case.get('key') == key and not df_all.empty:
@@ -3249,8 +3251,13 @@ def send_card_telegram():
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID or not card_events:
         return
     lines = []
+    thin = 0
     for kind, c in card_events:
         if c.get('tf') not in CARD_TELEGRAM_TFS: continue
+        to = c.get('turnover')
+        if to is None or to < TG_MIN_TURNOVER_MYR:   # 成交額不足：網頁照樣記錄，Telegram不推（突破和結果都不推）
+            if kind == 'open': thin += 1
+            continue
         code = c['symbol'].replace('.KL', '')
         head = f"{c.get('name') or code}({code}) {c['tf']}"
         if kind == 'open':
@@ -3264,7 +3271,10 @@ def send_card_telegram():
             icon = {'TP1': '✅ 達1:1.5', 'SL': '❌ 止損', 'TIMEOUT': '⏱ 20根到期'}.get(c['result'], c['result'])
             lines.append(f"{icon} {head} R={c['r_mult']:+.2f}")
     if not lines:
+        if thin: log.info(f"🃏 有{thin}個突破因成交額不足沒推")
         return
+    if thin:
+        lines.append(f"💧 另有 {thin} 個突破成交額<{_fmt_turnover(TG_MIN_TURNOVER_MYR)}，沒推（網頁有記錄）")
     now = datetime.now(MY_TZ).strftime('%Y-%m-%d %H:%M')
     batches = [lines[i:i+15] for i in range(0, len(lines), 15)]
     for i, batch in enumerate(batches):
@@ -4095,7 +4105,8 @@ def wy_process_symbol(meta, df_daily):
             r['note'] = '⚠️ 日線S4、下跌途中的橫盤，小心是再派發（中途再出一次貨，之後繼續跌）。' + r.get('note', '')
         r['focus'] = (r['stage'] == 'yellow' and r.get('dist_pct', 99) <= WY_NEAR_CEIL_PCT
                       and r.get('quiet_ok') and not r['redist'])
-        r.update({'name': meta.get('name'), 'sector': meta.get('sector'), 'tv_symbol': meta.get('tv_symbol')})
+        r.update({'name': meta.get('name'), 'sector': meta.get('sector'), 'tv_symbol': meta.get('tv_symbol'),
+                  'turnover': meta.get('turnover'), 'liquid': wy_liquid(meta.get('turnover'))})
         wy_rows_pending.append(r)
         if len(df_daily) > len(closed):            # 今天的日K還沒收完 → 盯盤
             wy_monitor_row(r, df_daily)
@@ -4103,8 +4114,14 @@ def wy_process_symbol(meta, df_daily):
         with WY_LOCK:
             WY_STATE['errors'].append(f'{sym}: {type(e).__name__}: {e}')
 
+def wy_liquid(turnover):
+    """成交額門檻跟C系列「可開單」同一個（TG_MIN_TURNOVER_MYR）：網頁照樣顯示，Telegram只推夠的"""
+    return turnover is not None and turnover >= TG_MIN_TURNOVER_MYR
+
 def wy_monitor_row(r, df_daily):
     """跟加密版 wy_monitor_once 同一套提醒，只是一次看一檔、用主掃描已經抓好的日線"""
+    if not r.get('liquid'):
+        return   # 成交額不足：不盯盤、不推
     if not (r['stage'] in ('green', 'orange') or (r['stage'] == 'yellow' and r.get('focus'))):
         return
     bars = cf_bars(df_daily.tail(60))
@@ -4139,9 +4156,11 @@ def _wy_orange_line(r):
     return f'🟠 {_wy_label(r)}  {r["bo_date"]} 放量突破 {fmt_px(r["ceiling"])}（{r["loud_mult"]:.1f}倍量），等回踩'
 
 def wy_summary_text(rows, title):
-    green  = [r for r in rows if r['stage'] == 'green']
-    orange = [r for r in rows if r['stage'] == 'orange']
-    focus  = [r for r in rows if r['stage'] == 'yellow' and r.get('focus')]
+    cand   = [r for r in rows if r['stage'] in ('green', 'orange') or (r['stage'] == 'yellow' and r.get('focus'))]
+    thin   = [r for r in cand if not r.get('liquid')]
+    green  = [r for r in cand if r['stage'] == 'green' and r.get('liquid')]
+    orange = [r for r in cand if r['stage'] == 'orange' and r.get('liquid')]
+    focus  = [r for r in cand if r['stage'] == 'yellow' and r.get('liquid')]
     lines = [f'【大馬威科夫 {title}】', datetime.now(MY_TZ).strftime('%Y-%m-%d %H:%M')]
     lines.append(f'━━ 🟢 三個條件全部符合（{len(green)}）')
     lines += [_wy_green_line(r) for r in green] or ['沒有']
@@ -4149,6 +4168,8 @@ def wy_summary_text(rows, title):
     lines += [_wy_orange_line(r) for r in orange] or ['沒有']
     lines.append(f'━━ 🟡 重點名單（{len(focus)}）：每小時盯盤，突破時會推')
     lines += [f'🟡 {_wy_label(r)}  離天花板 {fmt_px(r["ceiling"])} 還差 {r.get("dist_pct", 0):.1f}%' for r in focus] or ['沒有']
+    if thin:
+        lines.append(f'💧 成交額<{_fmt_turnover(TG_MIN_TURNOVER_MYR)}未列：' + '、'.join(_wy_label(r) for r in thin))
     lines.append(f'📄 {KLSE_URL}/wyckoff')
     return '\n'.join(lines)
 
@@ -4166,8 +4187,8 @@ def wy_scan_finish():
         WY_STATE.update({'rows': rows, 'status': 'done', 'progress': '',
                          'last_update': datetime.now(MY_TZ).strftime('%Y-%m-%d %H:%M'),
                          'run_date': datetime.now(MY_TZ).strftime('%Y-%m-%d')})
-    new_green = [r for r in rows if r['stage'] == 'green' and prev.get(r['symbol']) != 'green']
-    new_orange = [r for r in rows if r['stage'] == 'orange' and prev.get(r['symbol']) not in ('orange', 'green')]
+    new_green = [r for r in rows if r['stage'] == 'green' and prev.get(r['symbol']) != 'green' and r.get('liquid')]
+    new_orange = [r for r in rows if r['stage'] == 'orange' and prev.get(r['symbol']) not in ('orange', 'green') and r.get('liquid')]
     wy_save_stages({r['symbol']: r['stage'] for r in rows})
     summary_due = (not have_prev) or (not os.path.exists(WY_SUMMARY_FLAG))
     if summary_due:
@@ -4529,6 +4550,10 @@ def _card_tags(c, tf, extra=None):
         hot = c['vol_x'] >= VOL_SURGE_X
         tags.append(f'<span class="tag {"hot" if hot else ""}">{"🔥" if hot else ""}量{c["vol_x"]}x</span>')
     if c.get('chase'): tags.append('<span class="tag warn">⚠️不追</span>')
+    _to = c.get('turnover')
+    if _to is not None:
+        tags.append(f'<span class="tag{"" if _to >= TG_MIN_TURNOVER_MYR else " warn"}">成交額{_fmt_turnover(_to)}'
+                    + ('' if _to >= TG_MIN_TURNOVER_MYR else ' 💧不推') + '</span>')
     if extra: tags.extend(extra)
     return '<div class="tags">' + ''.join(tags) + '</div>'
 
@@ -4854,7 +4879,9 @@ def generate_wyckoff_html():
             else:
                 hold = '—'
             h += (f'<tr><td><a href="{tv}" target="_blank"><b>{code}</b></a> <span class=small>{_h(r.get("name") or "")}</span>'
-                  f'<br><span class=small>{_h(r.get("sector") or "")}・{f(r["price"])}</span></td>'
+                  f'<br><span class=small>{_h(r.get("sector") or "")}・{f(r["price"])}</span>'
+                  f'<br><span class=small>成交額 {_fmt_turnover(r.get("turnover"))}'
+                  + ('' if r.get('liquid') else ' <span style="color:#ee7373">💧不推</span>') + '</span></td>'
                   f'<td class=c>{r.get("day_stage", "--")}</td><td>{r["position"]}</td><td>{rng}</td><td>{spring}</td>'
                   f'<td class=c>{quiet}</td><td>{loud}</td><td>{hold}</td>')
             if stage == 'green':
@@ -4890,7 +4917,7 @@ def generate_wyckoff_html():
             focus = [r for r in sub if r.get('focus')]
             rest = [r for r in sub if not r.get('focus')]
             html += (f'<p class=note><b>重點名單（{len(focus)}）</b>：離天花板 ≤ {WY_NEAR_CEIL_PCT:g}%、安靜 ✓、不是「S4＋中途整理」。'
-                     '這些股票在開市時間每小時盯盤，正在突破時會推 Telegram。</p>')
+                     '這些股票在開市時間每小時盯盤，正在突破時會推 Telegram（成交額 < RM'+f'{TG_MIN_TURNOVER_MYR/1e6:g}'+'M 的標 💧不推，只在網頁顯示）。</p>')
             html += table(focus, stage) if focus else '<p class=note>今天沒有。</p>'
             if rest:
                 html += (f'<details><summary class=note>其他 {len(rest)} 個（離天花板太遠、量還沒縮，或下跌途中的橫盤）'
