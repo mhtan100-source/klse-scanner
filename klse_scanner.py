@@ -2645,6 +2645,15 @@ def scan_symbol(symbol):
 
     df_daily = fetch_ohlcv(symbol, '1D')
     raw_1h = _fetch_1h_raw(symbol)  # 4H/1H共用同一份原始資料，只下載一次
+    # 📨 Telegram流動性過濾：最近20個已收盤交易日的平均成交額（收盤價×成交量，單位RM）
+    result['turnover'] = None
+    try:
+        if not df_daily.empty:
+            _dc = closed_bars(df_daily, '1D').tail(20)
+            if len(_dc):
+                result['turnover'] = float((_dc['close'] * _dc['volume']).mean())
+    except Exception as e:
+        log.warning(f"turnover {symbol}: {e}")
     if not df_daily.empty:
         wy_process_symbol(result, df_daily)   # 🧱 威科夫：用同一份日線，不多抓資料
 
@@ -2715,6 +2724,19 @@ def scan_symbol(symbol):
             result[f'{tf}_cls']   = cls
             result[f'{tf}_pct']   = pct
             result[f'{tf}_isbear'] = is_bear_c
+            result[f'{tf}_cnt']    = cnt
+            result['stage']        = res.get('stage', 0)   # 日線Stage（每個時間框架都用日線算，值相同）
+            # 📨 Telegram「可開單」候選：多頭、≥2C、🎯（是否推送在send_telegram再過濾）
+            lc = res.get('last_c')
+            if hc and not is_bear_c and cnt >= 2 and ready and lc:
+                n_ = len(df)
+                result[f'{tf}_sig'] = {
+                    'cnt': cnt, 'pct': pct, 'zone': zone,
+                    'hv': float(lc['hv']), 'lv': float(lc['lv']),
+                    'h_time': _iso(df.index[int(lc['hb'])]),
+                    'provisional': ((n_ - 3) - int(lc['lb'])) < PROVISIONAL_BARS,
+                    'price': float(df['close'].values[-1]),
+                }
         except Exception as e:
             log.warning(f"⚠️ {symbol} {tf}: {e}")
             result[tf] = 'ERR'
@@ -2788,41 +2810,138 @@ def run_scan():
     send_telegram(results)
     send_card_telegram()
 
+# ============================================================
+# 📨 Telegram「可開單」通知（2026-10-27 MH確認）
+# 只推同時符合全部條件的訊號：
+#   1) 只看日線（TG_SIGNAL_TFS，預設1D）  2) 多頭、日線Stage=S2
+#   3) ≥2C 而且有🎯（Pivot/Cheat/LCheat 都推）  4) 沒有⏳（最後一個C低點還沒確認的不推）
+#   5) 現價還沒跌破SL、也沒有高於BO超過3%（老師「不追」規則）
+#   6) 最近20日平均成交額 ≥ TG_MIN_TURNOVER_MYR
+# 只推「新的」：同一個形態（同一個C高點）推過一次就不再推；形成新的C才會再推。
+# 1C、做空、S4、2C還沒🎯的，全部只留在網頁總表。
+# ============================================================
+TG_SIGNAL_TFS       = [t.strip() for t in os.environ.get('TG_SIGNAL_TFS', '1D').split(',') if t.strip() in TF_LABELS]
+TG_MIN_TURNOVER_MYR = float(os.environ.get('TG_MIN_TURNOVER_MYR', '1000000'))
+KLSE_URL            = os.environ.get('KLSE_URL', 'https://klse-scanner-production-6926.up.railway.app')
+TG_SENT_KEEP_DAYS   = 120
+
+def _tg_sent_file():
+    return os.path.join(DATA_DIR, 'tg_sent.json')
+
+def _tg_sent_load():
+    try:
+        with open(_tg_sent_file(), 'r', encoding='utf-8') as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+def _tg_sent_save(d):
+    try:
+        cutoff = (datetime.now(MY_TZ) - timedelta(days=TG_SENT_KEEP_DAYS)).isoformat()
+        d = {k: v for k, v in d.items() if v >= cutoff}
+        tmp = _tg_sent_file() + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(d, f, ensure_ascii=False)
+        os.replace(tmp, _tg_sent_file())
+    except Exception as e:
+        log.warning(f"📨 儲存Telegram已推紀錄失敗：{e}")
+
+def _fmt_turnover(v):
+    if v is None:
+        return '-'
+    return f'RM{v / 1e6:.1f}M' if v >= 1e6 else f'RM{v / 1e3:.0f}K'
+
+def _tick_round(p, up):
+    """BO往上、SL往下對齊Bursa跳動單位，掛單價格才是有效價位"""
+    import math
+    t = bursa_tick(p)
+    k = p / t
+    k = math.ceil(k - 1e-9) if up else math.floor(k + 1e-9)
+    return round(k * t, 4)
+
+def collect_tradeable(results):
+    """回傳 (可開單清單, 被過濾的數量, 觀察中數量)"""
+    sigs = []
+    skipped = {'prov': 0, 'broken': 0, 'chase': 0, 'liq': 0}
+    watch = 0
+    for r in results:
+        if r.get('stage') != 2:
+            continue
+        for tf in TG_SIGNAL_TFS:
+            if r.get(f'{tf}_cls') == 'bull-c' and (r.get(f'{tf}_cnt') or 0) >= 2:
+                watch += 1
+            s = r.get(f'{tf}_sig')
+            if not s:
+                continue
+            bo, sl = calc_levels(s['hv'], s['lv'], tf)
+            bo, sl = _tick_round(bo, True), _tick_round(sl, False)
+            price = s['price']
+            if s['provisional']:
+                skipped['prov'] += 1; continue
+            if price <= sl:
+                skipped['broken'] += 1; continue
+            if price > bo * (1 + CHASE_MAX_PCT / 100):
+                skipped['chase'] += 1; continue
+            to = r.get('turnover')
+            if to is None or to < TG_MIN_TURNOVER_MYR:
+                skipped['liq'] += 1; continue
+            sigs.append({
+                'key': f"{r['symbol']}|{tf}|{s['h_time']}",
+                'symbol': r['symbol'], 'name': r.get('name') or r['symbol'].replace('.KL', ''),
+                'tf': tf, 'cnt': s['cnt'], 'pct': s['pct'], 'zone': s['zone'],
+                'bo': bo, 'sl': sl, 'price': price, 'turnover': to,
+                'r_pct': (bo - sl) / bo * 100 if bo else 0,
+            })
+    sigs.sort(key=lambda x: (TF_LABELS.index(x['tf']), x['r_pct']))
+    return sigs, skipped, watch
+
 def send_telegram(results):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
-    now = datetime.now(MY_TZ).strftime('%Y-%m-%d %H:%M')
-    lines = []
-    for r in results:
-        d1  = r.get('1D', '-')
-        cls = r.get('1D_cls', 'gray')
-        # 多頭跟空頭都通知（對齊crypto版後來的改動，原本只看多頭S2）
-        if cls not in ('bull-c', 'bull-ready', 'bear-c', 'bear-ready'):
-            continue
-        name    = r.get('name', r['symbol'].replace('.KL',''))
-        sector  = r.get('sector', '')
-        h4      = r.get('4H', '-')
-        h1      = r.get('1H', '-')
-        side    = '空' if r.get('1D_isbear', False) else '多'
-        pct     = r.get('1D_pct')
-        pct_str = f" | 收斂{pct}%" if pct is not None else ""
-        lines.append(f"{name}({sector}) | {side} | 1D:{d1}{pct_str} | 4H:{h4} | 1H:{h1}")
-    if not lines:
+    sigs, skipped, watch = collect_tradeable(results)
+    sent = _tg_sent_load()
+    new = [s for s in sigs if s['key'] not in sent]
+    old_n = len(sigs) - len(new)
+    log.info(f"📨 可開單：{len(sigs)}（新{len(new)}、之前已推{old_n}）・觀察{watch}・過濾{skipped}")
+    if not new:
         return
-    header = f"\U0001f1f2\U0001f1fe 大馬莊家思維掃描\n{now}\n共{len(lines)}只 訊號\n{'─'*20}"
-    batches = [lines[i:i+25] for i in range(0, len(lines), 25)]
+    now_dt = datetime.now(MY_TZ)
+    now = now_dt.strftime('%m-%d %H:%M')
+    lines = []
+    for s in new:
+        code = s['symbol'].replace('.KL', '')
+        over = ' ⚡盤中已過BO' if s['price'] >= s['bo'] else ''
+        pct = f"({s['pct']}%)" if s['pct'] is not None else ''
+        lines.append(f"🎯 {s['name']}({code})｜{s['tf']} {s['cnt']}C{pct}｜{s['zone']}{over}\n"
+                     f"   BO {fmt_px(s['bo'])}｜SL {fmt_px(s['sl'])}｜1R {s['r_pct']:.1f}%\n"
+                     f"   現價 {fmt_px(s['price'])}｜成交額 {_fmt_turnover(s['turnover'])}")
+    footer = (f"{'━' * 12}\n"
+              f"仍有效（之前已推）：{old_n} 只\n"
+              f"👀 2C 待🎯：{watch} 只\n"
+              f"已過濾：成交額<{_fmt_turnover(TG_MIN_TURNOVER_MYR)} {skipped['liq']}・⏳ {skipped['prov']}・"
+              f"超BO {CHASE_MAX_PCT:.0f}% {skipped['chase']}・破SL {skipped['broken']}\n"
+              f"📄 完整名單：{KLSE_URL}")
+    batches = [lines[i:i + 10] for i in range(0, len(lines), 10)]
+    ok_all = True
     for i, batch in enumerate(batches):
-        part = f" ({i+1}/{len(batches)})" if len(batches) > 1 else ""
-        msg = header + part + "\n" + "\n".join(batch)
+        part = f" ({i + 1}/{len(batches)})" if len(batches) > 1 else ""
+        msg = f"🇲🇾 KLSE 可開單｜{now}｜新 {len(new)} 只{part}\n{'━' * 12}\n" + "\n".join(batch)
+        if i == len(batches) - 1:
+            msg += "\n" + footer
         try:
-            requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                json={'chat_id': TELEGRAM_CHAT_ID, 'text': msg},
-                timeout=10
-            )
+            resp = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                                 json={'chat_id': TELEGRAM_CHAT_ID, 'text': msg, 'disable_web_page_preview': True},
+                                 timeout=10)
+            ok_all = ok_all and resp.ok
             time.sleep(1)
         except Exception as e:
+            ok_all = False
             log.warning(f"Telegram error: {e}")
+    if ok_all:   # 發送成功才記錄，發送失敗下一輪會再試
+        for s in new:
+            sent[s['key']] = now_dt.isoformat()
+        _tg_sent_save(sent)
 
 # ============================================================
 # 🃏 突破卡片引擎（BO / SL / 目標 + 已突破追蹤 + 戰績統計）
@@ -4009,6 +4128,30 @@ def wy_monitor_row(r, df_daily):
         if today['l'] <= r['sl']:
             wy_alert_once(sym, 'stop', f'❌ {lab} 跌破 SL {fmt_px(r["sl"])}（回踩低點 −0.5%）：「回頭站得穩」不成立。掛單取消，持倉照計劃出場。')
 
+WY_SUMMARY_FLAG = os.path.join(DATA_DIR, 'wyckoff_summary_sent.txt')
+
+def _wy_green_line(r):
+    wr = f'{r["wall_r"]:.2f}R' if r.get('wall_r') is not None else '藍天'
+    over = '（現價已過Entry，不追）' if r.get('price') and r['price'] > r['entry'] else ''
+    return f'🟢 {_wy_label(r)}  Entry {fmt_px(r["entry"])}  SL {fmt_px(r["sl"])}  上方空間 {wr}{over}'
+
+def _wy_orange_line(r):
+    return f'🟠 {_wy_label(r)}  {r["bo_date"]} 放量突破 {fmt_px(r["ceiling"])}（{r["loud_mult"]:.1f}倍量），等回踩'
+
+def wy_summary_text(rows, title):
+    green  = [r for r in rows if r['stage'] == 'green']
+    orange = [r for r in rows if r['stage'] == 'orange']
+    focus  = [r for r in rows if r['stage'] == 'yellow' and r.get('focus')]
+    lines = [f'【大馬威科夫 {title}】', datetime.now(MY_TZ).strftime('%Y-%m-%d %H:%M')]
+    lines.append(f'━━ 🟢 三個條件全部符合（{len(green)}）')
+    lines += [_wy_green_line(r) for r in green] or ['沒有']
+    lines.append(f'━━ 🟠 已放量突破，等回踩（{len(orange)}）')
+    lines += [_wy_orange_line(r) for r in orange] or ['沒有']
+    lines.append(f'━━ 🟡 重點名單（{len(focus)}）：每小時盯盤，突破時會推')
+    lines += [f'🟡 {_wy_label(r)}  離天花板 {fmt_px(r["ceiling"])} 還差 {r.get("dist_pct", 0):.1f}%' for r in focus] or ['沒有']
+    lines.append(f'📄 {KLSE_URL}/wyckoff')
+    return '\n'.join(lines)
+
 def wy_scan_finish():
     """主掃描跑完後：整理名單、跟上一次比較，新變成🟢／🟠的推Telegram（跟加密版每日摘要一樣）"""
     rows = list(wy_rows_pending)
@@ -4026,15 +4169,23 @@ def wy_scan_finish():
     new_green = [r for r in rows if r['stage'] == 'green' and prev.get(r['symbol']) != 'green']
     new_orange = [r for r in rows if r['stage'] == 'orange' and prev.get(r['symbol']) not in ('orange', 'green')]
     wy_save_stages({r['symbol']: r['stage'] for r in rows})
-    if not have_prev and (new_green or new_orange):
-        log.info(f'🧱 威科夫：沒有上一次的紀錄（第一次使用），這次只記錄、不推播（🟢{len(new_green)} 🟠{len(new_orange)}）')
-    if have_prev and WY_TG_ON and (new_green or new_orange):
+    summary_due = (not have_prev) or (not os.path.exists(WY_SUMMARY_FLAG))
+    if summary_due:
+        # 第一輪（或這個版本第一次部署）：推一則「目前名單」摘要，之後才只推新的
+        if WY_TG_ON:
+            send_telegram_plain(wy_summary_text(rows, '目前名單（首次）'))
+        try:
+            with open(WY_SUMMARY_FLAG, 'w', encoding='utf-8') as f:
+                f.write(datetime.now(MY_TZ).isoformat())
+        except Exception as e:
+            log.warning(f'🧱 寫入威科夫摘要旗標失敗：{e}')
+        log.info('🧱 威科夫：已推送首次目前名單摘要')
+    elif WY_TG_ON and (new_green or new_orange):
         lines = ['【大馬威科夫 洗盤→真突破】']
         for r in new_green:
-            wr = f'{r["wall_r"]:.2f}R' if r.get('wall_r') is not None else '藍天'
-            lines.append(f'🟢 {_wy_label(r)}  Entry {fmt_px(r["entry"])}  SL {fmt_px(r["sl"])}  上方空間 {wr}')
+            lines.append(_wy_green_line(r))
         for r in new_orange:
-            lines.append(f'🟠 {_wy_label(r)}  {r["bo_date"]} 放量突破 {fmt_px(r["ceiling"])}（{r["loud_mult"]:.1f}倍量），等回踩')
+            lines.append(_wy_orange_line(r))
         send_telegram_plain('\n'.join(lines))
 
 
@@ -4758,6 +4909,16 @@ def wyckoff_page():
     except Exception as e:
         log.error(f"wyckoff page error: {e}")
         return f"<html><body style='background:#1a1a2e;color:#eee;font-family:monospace;padding:40px'>🧱 威科夫頁錯誤：{_h(e)}</body></html>", 200
+
+@app.route('/wyckoff_push')
+def wyckoff_push():
+    """手動推一次目前威科夫名單到Telegram：/wyckoff_push"""
+    with WY_LOCK:
+        rows = list(WY_STATE['rows'])
+    if not rows:
+        return jsonify({'sent': False, 'reason': '還沒有威科夫結果，等掃描跑完'})
+    ok = send_telegram_plain(wy_summary_text(rows, '目前名單（手動）'))
+    return jsonify({'sent': bool(ok), 'rows': len(rows)})
 
 @app.route('/debug_wyckoff')
 def debug_wyckoff():
