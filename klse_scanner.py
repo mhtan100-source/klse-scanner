@@ -3944,6 +3944,132 @@ def load_ex_result(tf, c1):
         return None
 
 # ============================================================
+# 📋 出場回測「一眼看懂」結論卡（MH 2026-10-28）：程式自動評分＋寫建議，詳細表格摺疊在下面
+# 門檻可用環境變數調整（例：US_EXS_GOOD_R）
+# ============================================================
+EXS_GOOD_R      = float(menv('EXS_GOOD_R', '0.10'))    # 最好規則平均R > 此值 → 🟢 賺錢
+EXS_FLAT_R      = float(menv('EXS_FLAT_R', '-0.05'))   # 平均R ≥ 此值 → 🟡 打平；更低 → 🔴 虧錢
+EXS_MFE_GOOD    = float(menv('EXS_MFE_GOOD', '35'))    # 「幾乎沒漲(<0.5R)」比例 < 此% → 🟢 進場品質好
+EXS_MFE_BAD     = float(menv('EXS_MFE_BAD', '45'))     # 比例 > 此% → 🔴 差；中間 → 🟡 普通
+EXS_FILTER_GOOD = float(menv('EXS_FILTER_GOOD', '0.05'))  # 過濾後平均R改善 ≥ 此值 → 有用
+EXS_FILTER_MIN  = float(menv('EXS_FILTER_MIN', '0.01'))   # 改善 ≥ 此值 → 幫助很小；更少 → 沒幫助
+EXS_TIE_R       = 0.03   # 平均R相差不到這個，當作「差不多」
+
+def _exs_money(avg_r):
+    """平均R → 「每冒100元風險，平均賺/虧多少」"""
+    v = avg_r * 100
+    cur = M['currency']
+    if abs(v) < 0.5:
+        return f'每冒 {cur}100 風險，平均打平'
+    return f'每冒 {cur}100 風險，平均{"賺" if v > 0 else "虧"} {cur}{abs(v):.0f}'
+
+def exit_summary_html(res):
+    rules = [rl for rl in res.get('rules', []) if rl['all'].get('avg_r') is not None and rl['all'].get('n')]
+    if not rules:
+        return ''
+    cur_rule = res['rules'][0]
+    best = max(rules, key=lambda rl: rl['all']['avg_r'])
+    b_avg = best['all']['avg_r']
+    ties = [rl['name'] for rl in rules if rl is not best and b_avg - rl['all']['avg_r'] < EXS_TIE_R]
+
+    # ① 總評
+    if b_avg > EXS_GOOD_R:
+        v_icon, v_txt = '🟢', '這套進場有賺錢優勢'
+    elif b_avg >= EXS_FLAT_R:
+        v_icon, v_txt = '🟡', '接近打平（扣手續費後可能小虧）'
+    else:
+        v_icon, v_txt = '🔴', '這套進場目前不賺錢'
+    n_pos = sum(1 for rl in rules if rl['all']['avg_r'] > 0)
+    v_sub = (f'最好的出場方式：{_exs_money(b_avg)}・'
+             f'{len(rules)} 種出場方式裡有 {n_pos} 種是賺錢的')
+
+    # ② 進場品質（MFE）
+    mb = res.get('mfe_bins_20', {}) or {}
+    mtot = sum(mb.values())
+    if mtot:
+        p_none = mb.get('<0.5R', 0) / mtot * 100
+        p_1r = (mb.get('1~1.5R', 0) + mb.get('≥1.5R', 0)) / mtot * 100
+        p_big = mb.get('≥1.5R', 0) / mtot * 100
+        if p_none < EXS_MFE_GOOD:   m_icon, m_txt = '🟢', '好'
+        elif p_none <= EXS_MFE_BAD: m_icon, m_txt = '🟡', '普通'
+        else:                       m_icon, m_txt = '🔴', '差'
+        mfe_block = (f'<div class="exs-sub">每 100 筆突破（突破後20根K線內）：</div>'
+                     f'<ul class="exs-ul"><li><b>{p_none:.0f}</b> 筆 幾乎沒漲（最多漲不到 0.5R）</li>'
+                     f'<li><b>{p_1r:.0f}</b> 筆 能漲到 1R 以上</li>'
+                     f'<li><b>{p_big:.0f}</b> 筆 走出大行情（≥ 1.5R）</li></ul>')
+    else:
+        p_none, m_icon, m_txt, mfe_block = None, '⚪', '沒有資料', ''
+
+    # ③ 最好的出場 vs 現在用的
+    best_line = f'<b>{_h(best["name"])}</b>（平均 {b_avg:+.2f}R）'
+    if ties:
+        best_line += f'<div class="exs-sub">和「{_h("」「".join(ties))}」差不多（相差不到 {EXS_TIE_R}R），樣本小時可視為同一級</div>'
+    c_avg = cur_rule['all'].get('avg_r')
+    if cur_rule is not best and c_avg is not None:
+        best_line += f'<div class="exs-sub">現在用的「{_h(cur_rule["name"])}」：{_exs_money(c_avg)}（{c_avg:+.2f}R）</div>'
+    elif cur_rule is best:
+        best_line += '<div class="exs-sub">就是現在用的規則 👍</div>'
+
+    # ④ 過濾有沒有用：用每條規則「平均R」的改善，取平均（筆數不同，不能比總R）
+    def filt(key):
+        diffs = [rl[key]['avg_r'] - rl['all']['avg_r'] for rl in rules
+                 if rl[key].get('avg_r') is not None and rl[key].get('n')]
+        if not diffs:
+            return None, '⚪', '沒有資料'
+        d = sum(diffs) / len(diffs)
+        if d >= EXS_FILTER_GOOD: return d, '🟢', '有用'
+        if d >= EXS_FILTER_MIN:  return d, '🟡', '幫助很小'
+        return d, '❌', '沒幫助'
+    d_nc, i_nc, t_nc = filt('nochase')
+    d_s2, i_s2, t_s2 = filt('s2')
+    s2_share = (cur_rule['s2']['n'] / cur_rule['all']['n'] * 100) if cur_rule['all'].get('n') else 0
+    fmt_d = lambda d: '' if d is None else f'（平均R {d:+.2f}）'
+    s2_note = f'・{s2_share:.0f}% 的單本來就是S2，這個過濾幾乎沒過濾到什麼' if s2_share >= 90 else ''
+    filt_block = (f'<ul class="exs-ul"><li>排除⚠️不追：{i_nc} {t_nc}{fmt_d(d_nc)}</li>'
+                  f'<li>只看日線S2：{i_s2} {t_s2}{fmt_d(d_s2)}{s2_note}</li></ul>')
+
+    # ⑤ 可信度（筆數）
+    n = cur_rule['all'].get('n') or 0
+    if n > 300:   c_icon, c_txt = '🟢', '高'
+    elif n >= 100: c_icon, c_txt = '🟡', '中等（排名容易變動，只看大方向）'
+    else:          c_icon, c_txt = '🔴', '低（樣本太少，先別下結論）'
+
+    # ⑥ 建議（依燈號組合）
+    tips = []
+    entry_bad = p_none is not None and p_none > EXS_MFE_BAD
+    if v_icon == '🟢':
+        if cur_rule is best or b_avg - (c_avg or 0) < EXS_TIE_R:
+            tips.append('這套進場＋現在的出場已經有優勢，維持不變，繼續累積樣本。')
+        else:
+            tips.append(f'這套進場有優勢。可以考慮把出場改成「{_h(best["name"])}」，先在突破卡片上紙上追蹤一段時間確認。')
+    elif entry_bad:
+        tips.append(f'先不要再調出場方式。約 {p_none:.0f}% 的突破進場後根本沒漲，出場怎麼改都救不回來；'
+                    '應該先改善進場篩選（例如比較 C1 10%、4H 的結果），等「幾乎沒漲」降到 '
+                    f'{EXS_MFE_GOOD:.0f}% 以下，再回頭優化出場。')
+    elif v_icon == '🟡':
+        tips.append(f'接近打平。進場品質不算差，出場可以用「{_h(best["name"])}」，'
+                    '但扣掉手續費和滑價後優勢很薄，建議再加進場過濾提高勝率。')
+    else:
+        tips.append('進場後有漲，但最後沒賺到：可能是 SL 太緊被洗出去，或目標太遠。'
+                    f'可以試試讓利潤多跑一點（例如「{_h(best["name"])}」），或檢查 SL 的位置。')
+    if i_nc == '🟢':
+        tips.append('「排除⚠️不追」有效：實際交易時，確認價高於 BO 太多的就不要追。')
+    if i_s2 == '❌' and s2_share < 90:
+        tips.append('「只看日線S2」沒有幫助，不用特別靠它過濾。')
+    if c_icon != '🟢':
+        tips.append(f'目前只有約 {n} 筆，資料再多一點（> 300 筆）結論會更可靠。')
+
+    return f'''<div class="exs">
+<div class="exs-title">📋 一眼看懂（{_h(res["tf"])}・C1 {res["c1"]}%）</div>
+<div class="exs-row"><div class="exs-k">🚦 總評</div><div class="exs-v">{v_icon} <b>{v_txt}</b><div class="exs-sub">{v_sub}</div></div></div>
+<div class="exs-row"><div class="exs-k">📏 進場品質</div><div class="exs-v">{m_icon} <b>{m_txt}</b>{mfe_block}</div></div>
+<div class="exs-row"><div class="exs-k">🏆 最好的出場</div><div class="exs-v">{best_line}</div></div>
+<div class="exs-row"><div class="exs-k">🔍 過濾有沒有用</div><div class="exs-v">{filt_block}</div></div>
+<div class="exs-row"><div class="exs-k">📊 可信度</div><div class="exs-v">{c_icon} {c_txt}<div class="exs-sub">約 {n} 筆完成的交易</div></div></div>
+<div class="exs-tip"><b>💡 建議</b><ul class="exs-ul">{"".join(f"<li>{t}</li>" for t in tips)}</ul></div>
+</div>'''
+
+# ============================================================
 # 🧱 威科夫「洗盤 → 真突破」（2026-10-26 從Bybit掃描器 scannerrailway.py 原封不動移植）
 # 跟C系列／突破卡片分開，不需要C：區間（天花板、地板）→ 假跌破洗盤 → 突破前安靜 → 突破時大聲 → 回頭站得穩
 # 所有門檻跟加密版一樣（Railway環境變數名稱也一樣，可以各自覆蓋）。只做多頭、只看日線。
@@ -5897,10 +6023,18 @@ def exit_backtest_page():
                 f'<span class="{"pos" if x["r"] > 0 else "neg"}">{x["r"]:+.2f}R</span>（最多漲到{x["mfe"]:.1f}R）</div>'
                 for x in rl['cases'][:15])
             lists += f'<details><summary>{_h(rl["name"])}：最近15筆</summary><div class="lst">{li or "沒有案例"}</div></details>'
+        try:
+            summary = exit_summary_html(res)
+        except Exception as e:
+            log.warning(f"🚪 結論卡錯誤：{e}")
+            summary = ''
         body = f'''
 <div class="desc">期間 {res["period"][0]} ～ {res["period"][1]}・{res["symbols"]}檔・進場共 {res["entries"]} 筆（C1門檻 {res["c1"]}%）・完成於 {res["finished"]}</div>
-<div class="desc">📏 突破後20根內「最多漲到幾R」（MFE）：{mfe_html}</div>
-<table class="st"><tr><th>出場規則</th><th>範圍</th><th>筆數</th><th>🎯達標</th><th>❌SL</th><th>其他出場</th><th>賺錢比例</th><th>平均R</th><th>總R</th><th>平均持有根數</th><th>未走完</th></tr>{rows}</table>
+{summary}
+<details class="exs-detail"><summary>📊 詳細數據（每條出場規則的完整表格）— 點這裡展開</summary>
+<div class="desc" style="margin-top:8px">📏 突破後20根內「最多漲到幾R」（MFE）：{mfe_html}</div>
+<div style="overflow-x:auto"><table class="st"><tr><th>出場規則</th><th>範圍</th><th>筆數</th><th>🎯達標</th><th>❌SL</th><th>其他出場</th><th>賺錢比例</th><th>平均R</th><th>總R</th><th>平均持有根數</th><th>未走完</th></tr>{rows}</table></div>
+</details>
 <div class="sec"><h3>🔍 抽查案例</h3>{lists}</div>'''
     else:
         body = f'<div class="empty">{view_tf}・C1 {c1}%：還沒有出場回測結果。按上面的「▶ 跑」開始。</div>'
@@ -5908,7 +6042,17 @@ def exit_backtest_page():
     return f'''<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>🚪 出場規則回測</title><style>{CARDS_CSS}
 details{{background:#22223a;border:1px solid #3a3a55;border-radius:6px;padding:8px 12px;margin-bottom:6px;max-width:1150px}}
-summary{{cursor:pointer;color:#ffb74d}} .lst{{font-size:12px;line-height:1.8;margin-top:6px}}</style></head><body>
+summary{{cursor:pointer;color:#ffb74d}} .lst{{font-size:12px;line-height:1.8;margin-top:6px}}
+.exs{{background:#1f2440;border:1px solid #3d4780;border-radius:10px;padding:14px 18px;margin:10px 0 14px;max-width:820px}}
+.exs-title{{font-size:17px;font-weight:bold;color:#fff;margin-bottom:10px}}
+.exs-row{{display:flex;gap:12px;padding:9px 0;border-top:1px solid #333a66;font-size:14px}}
+.exs-k{{min-width:120px;color:#9fb3e8;font-weight:bold}} .exs-v{{flex:1;color:#eee;line-height:1.6}}
+.exs-sub{{color:#9aa0b8;font-size:12px;margin-top:2px}}
+.exs-ul{{margin:4px 0 0;padding-left:20px;line-height:1.7}}
+.exs-tip{{background:#2a2410;border:1px solid #6b5a1e;border-radius:8px;padding:10px 14px;margin-top:10px;font-size:14px;color:#f3e3b0;line-height:1.6}}
+.exs-tip b{{color:#ffd54f}}
+details.exs-detail summary{{color:#7ab3ff}}
+@media (max-width:600px){{.exs-row{{flex-direction:column;gap:2px}} .exs-k{{min-width:0}}}}</style></head><body>
 <h2>&#x1F1F2;&#x1F1FE; 大馬莊家思維 ・ 出場規則回測</h2>
 <div class="subtitle">同一批進場（突破卡片規則：收盤站上BO進場、SL在最後一個C低點下方），只換出場方式，看哪一種總R最好。正式掃描完全不受影響。</div>
 <div class="nav"><a href="/">📊 C系列總表</a><a href="/cards">🃏 突破卡片</a><a href="/wyckoff">🧱 威科夫突破</a><a href="/backtest">🧪 C1門檻回測</a><a class="nav-on" href="/exit_backtest">🚪 出場回測</a></div>
