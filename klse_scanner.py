@@ -1,5 +1,7 @@
 """
-莊家思維 股票掃描器（多市場：🇲🇾 KLSE ＋ 🇺🇸 美股）
+莊家思維 股票掃描器（多市場：🇲🇾 KLSE ＋ 🇺🇸 美股 ＋ 🇸🇬 新加坡）
+- 2026-10-28：加入 🇸🇬 新加坡（/sg）。只掃日線1D（MH決定：新加入的亞洲市場只看日線），C1門檻7%、日線BO/SL緩衝±1%，
+  TradingView用 SGX:代號，Telegram跟KLSE一樣推（前面加🇸🇬）。新加坡專用設定加前綴 SG_。
 - 2026-10-27：美股併進這個服務。同一份程式在同一個Railway服務裡載入兩次（KLSE一份、美股一份），
   兩個市場的狀態、資料檔、排程完全分開；美股網頁在 /us 底下。之後新加坡／港股／A股照同樣方式加。
 - 環境變數 MARKETS 決定開哪些市場（預設 KLSE,US）。美股專用的設定加前綴 US_（例：US_TG_MIN_TURNOVER）。
@@ -40,7 +42,7 @@ MKT_CFG = {
         'open': (9, 0), 'close': (17, 0), 'daily_close': (17, 5), 'post_close': (17, 40), 'post_close_end': (19, 0),
         'scan_every_min': 60, 'currency': 'RM', 'suffix': '.KL', 'tv_prefix': 'MYX:',
         'auto_adjust': True, 'rs_benchmark': '', 'turnover_env': 'TG_MIN_TURNOVER_MYR', 'default_sym': '1155.KL',
-        'data_sub': '', 'tg_tfs': '1D', 'html_replace': [],
+        'data_sub': '', 'tg_tfs': '1D', 'html_replace': [], 'tfs': ['1D', '4H', '1H'],
     },
     'US': {
         'flag': '🇺🇸', 'flag_html': '&#x1F1FA;&#x1F1F8;', 'name': '美股', 'short': 'US', 'tab': '🇺🇸 美股',
@@ -54,6 +56,20 @@ MKT_CFG = {
                          ('KLSE股票', '美股'), ('板塊', '行業'),
                          ('開市時間每小時一次＋17:40收盤後一次', '開盤時間每30分鐘一次＋收盤後一次（美東16:20，大馬時間清晨）'),
                          ('每小時盯盤', '每30分鐘盯盤'), ('17:05後', '美東16:05後')],
+        'tfs': ['1D', '4H', '1H'],
+    },
+    'SG': {
+        'flag': '🇸🇬', 'flag_html': '&#x1F1F8;&#x1F1EC;', 'name': '新加坡', 'short': 'SGX', 'tab': '🇸🇬 新加坡',
+        'base': '/sg', 'env_prefix': 'SG_', 'tz': 'Asia/Singapore',
+        # SGX 09:00–17:00 連續交易（中午不休市），17:06前收盤競價結束
+        'open': (9, 0), 'close': (17, 0), 'daily_close': (17, 10), 'post_close': (17, 40), 'post_close_end': (19, 0),
+        'scan_every_min': 60, 'currency': 'S$', 'suffix': '.SI', 'tv_prefix': 'SGX:',
+        'auto_adjust': True, 'rs_benchmark': 'ES3.SI', 'turnover_env': 'SG_TG_MIN_TURNOVER', 'default_sym': 'D05.SI',
+        'data_sub': 'sg', 'tg_tfs': '1D',
+        'html_replace': [('&#x1F1F2;&#x1F1FE;', '&#x1F1F8;&#x1F1EC;'), ('🇲🇾', '🇸🇬'), ('大馬', '新加坡'),
+                         ('KLSE股票', '新加坡股票')],
+        'tfs': ['1D'],   # MH 2026-10-28：新加坡只掃日線
+        'min_turnover_default': '500000',   # Telegram流動性門檻：20日平均成交額 S$50萬
     },
 }
 MARKET     = os.environ.get('SCANNER_MARKET', 'KLSE').upper()
@@ -1904,7 +1920,39 @@ if MARKET == 'US':
                 SECTORS[_s] = _sec
                 SYMBOLS.append(_s)
 
-TF_LABELS = ['1D', '4H', '1H']   # 由高到低（跟crypto版TF_LABELS的順序相反，這裡直接就是高到低）
+
+# ============================================================
+# 🇸🇬 新加坡股票清單（2026-10-28，依行業分組；SGX流動性集中在這約145檔，再往下日均成交額大多不到S$10萬）
+# 有代碼抓不到資料時，打開 /sg/debug_missing 看是哪幾隻
+# ============================================================
+SG_SECTOR_SYMBOLS = {
+    '銀行': [('D05', 'DBS'), ('O39', 'OCBC'), ('U11', 'UOB')],
+    '金融': [('S68', 'SGX'), ('AIY', 'iFAST'), ('U10', 'UOB Kay Hian'), ('S41', 'HL Finance'), ('G07', 'Great Eastern'), ('S20', 'Straits Trading')],
+    '電信': [('Z74', 'Singtel'), ('CC3', 'StarHub'), ('CJLU', 'NetLink Trust'), ('S7OU', 'Asian Pay TV')],
+    '工業': [('S63', 'ST Engineering'), ('BN4', 'Keppel'), ('U96', 'Sembcorp Ind'), ('5E2', 'Seatrium'), ('BS6', 'Yangzijiang'), ('YF8', 'YZJ Financial'), ('H22', 'HL Asia'), ('544', 'CSE Global'), ('F9D', 'Boustead'), ('P52', 'Pan-United'), ('E3B', 'Wee Hur'), ('OU8', 'Centurion'), ('CHZ', 'HRnetGroup'), ('ER0', 'KSH Holdings'), ('BQM', 'Tiong Woon')],
+    '綜合企業': [('J36', 'Jardine Matheson(USD)'), ('C07', 'Jardine C&C'), ('9CI', 'CapitaLand Invest'), ('Z59', 'Yoma Strategic'), ('LJ3', 'OUE')],
+    '運輸': [('C6L', 'SIA'), ('S59', 'SIA Engineering'), ('S58', 'SATS'), ('C52', 'ComfortDelGro'), ('S61', 'SBS Transit'), ('S08', 'SingPost'), ('G92', 'China Aviation Oil'), ('S56', 'Samudera'), ('NS8U', 'HPH Trust(USD)')],
+    '科技/電子': [('V03', 'Venture'), ('558', 'UMS'), ('AWX', 'AEM'), ('E28', 'Frencken'), ('MZH', 'Nanofilm'), ('5DD', 'Micro-Mechanics'), ('BN2', 'Valuetronics'), ('8AZ', 'Aztech'), ('JLB', 'Grand Venture'), ('M14', 'InnoTek'), ('F13', 'Fu Yu'), ('I07', 'ISDN'), ('5CP', 'Silverlake Axis')],
+    '能源/海工': [('5LY', 'Marco Polo Marine'), ('1MZ', 'Nam Cheong'), ('NO4', 'Dyna-Mac'), ('5WH', 'Rex Intl'), ('RE4', 'Geo Energy'), ('T13', 'RH PetroGas'), ('C9Q', 'Sinostar PEC'), ('U9E', 'China Everbright Water')],
+    '原材料': [('5TP', 'CNMC Goldmine'), ('QES', 'China Sunsine')],
+    '種植/農業': [('F34', 'Wilmar'), ('E5H', 'Golden Agri'), ('EB5', 'First Resources'), ('P8Z', 'Bumitama'), ('VC2', 'Olam'), ('MV4', 'Mewah'), ('5JS', 'Indofood Agri'), ('NC2', 'Sri Trang Agro'), ('UD2', 'Japfa')],
+    '消費': [('Y92', 'Thai Beverage'), ('F99', 'Fraser & Neave'), ('D01', 'DFI Retail(USD)'), ('OV8', 'Sheng Siong'), ('P34', 'Delfi'), ('Q01', 'QAF'), ('F03', 'Food Empire'), ('1D0', 'Kimly'), ('42R', 'Jumbo'), ('AGS', 'Hour Glass'), ('D03', 'Del Monte Pac'), ('EMI', 'Emperador'), ('G13', 'Genting Sing'), ('H15', 'Hotel Properties'), ('H02', 'Haw Par')],
+    '醫療': [('BSL', 'Raffles Medical'), ('AP4', 'Riverstone'), ('BVA', 'Top Glove'), ('A50', 'Thomson Medical'), ('QC7', 'Q&M Dental'), ('546', 'Medtecs')],
+    '房地產': [('C09', 'City Developments'), ('U14', 'UOL'), ('TQ5', 'Frasers Property'), ('H78', 'HK Land(USD)'), ('F17', 'GuocoLand'), ('Z25', 'Yanlord'), ('ADN', 'First Sponsor'), ('H13', 'Ho Bee'), ('W05', 'Wing Tai'), ('B61', 'Bukit Sembawang'), ('5UX', 'Oxley'), ('T24', 'Tuan Sing'), ('A26', 'Sinarmas Land'), ('OYY', 'PropNex'), ('CLN', 'APAC Realty')],
+    'REIT/信託': [('C38U', 'CapitaLand Int Comm'), ('A17U', 'CapitaLand Ascendas'), ('M44U', 'Mapletree Logistics'), ('ME8U', 'Mapletree Industrial'), ('N2IU', 'Mapletree PanAsia'), ('J69U', 'Frasers Centrepoint'), ('BUOU', 'Frasers Logistics'), ('T82U', 'Suntec REIT'), ('K71U', 'Keppel REIT'), ('AJBU', 'Keppel DC REIT'), ('A7RU', 'Keppel Infra Trust'), ('JYEU', 'Lendlease REIT'), ('DCRU', 'Digital Core REIT(USD)'), ('J85', 'CDL Hosp Trust'), ('HMN', 'CapitaLand Ascott'), ('C2PU', 'Parkway Life'), ('J91U', 'ESR REIT'), ('P40U', 'Starhill Global'), ('TS0U', 'OUE REIT'), ('O5RU', 'AIMS APAC REIT'), ('AU8U', 'CapitaLand China'), ('CY6U', 'CapitaLand India'), ('Q5T', 'Far East Hosp'), ('CRPU', 'Sasseur REIT'), ('AW9U', 'First REIT'), ('SK6U', 'Paragon REIT'), ('OXMU', 'Prime US REIT(USD)'), ('BTOU', 'Manulife US REIT(USD)'), ('CMOU', 'KORE(USD)'), ('ODBU', 'United Hampshire(USD)'), ('DHLU', 'Daiwa House Log'), ('MXNU', 'Elite UK REIT(GBP)'), ('UD1U', 'IREIT Global(EUR)'), ('CWBU', 'Stoneweg EU REIT(EUR)')],
+}
+
+if MARKET == 'SG':
+    SYMBOLS, NAMES, SECTORS, TV_SYMBOLS = [], {}, {}, {}
+    for _sec, _lst in SG_SECTOR_SYMBOLS.items():
+        for _c, _n in _lst:
+            _s = _c + '.SI'
+            if _s not in SECTORS:
+                SECTORS[_s] = _sec
+                NAMES[_s] = _n
+                SYMBOLS.append(_s)
+
+TF_LABELS = list(M.get('tfs', ['1D', '4H', '1H']))   # 由高到低（新加坡只有1D）（跟crypto版TF_LABELS的順序相反，這裡直接就是高到低）
 TV_INTERVAL  = {'1H': '60', '4H': '240', '1D': 'D'}
 # 跟crypto版(scannerrailway.py)共用同一個TradingView Layout（莊家思維指標已經加在上面），
 # 預設值bd3vZUwt是crypto版目前使用的Layout代碼；可用環境變數TV_LAYOUT_ID覆寫
@@ -2791,7 +2839,8 @@ def scan_symbol(symbol):
     result['tv_symbol'] = tv_sym(symbol)
 
     df_daily = fetch_ohlcv(symbol, '1D')
-    raw_1h = _fetch_1h_raw(symbol)  # 4H/1H共用同一份原始資料，只下載一次
+    # 4H/1H共用同一份原始資料，只下載一次；只掃日線的市場（新加坡）完全不抓1H
+    raw_1h = _fetch_1h_raw(symbol) if any(t in TF_LABELS for t in ('4H', '1H')) else pd.DataFrame()
     # 📨 Telegram流動性過濾：最近20個已收盤交易日的平均成交額（收盤價×成交量，單位RM）
     result['turnover'] = None
     try:
@@ -2948,7 +2997,7 @@ def run_scan():
         for i, sym in enumerate(unique_syms):
             r = scan_symbol(sym)
             results.append(r)
-            log.info(f"✅ {sym}: {{'1D': '{r.get('1D','-')}', '4H': '{r.get('4H','-')}', '1H': '{r.get('1H','-')}'}}")
+            log.info(f"✅ {sym}: " + str({t: r.get(t, '-') for t in TF_LABELS}))
             if (i + 1) % 100 == 0:
                 save_cards()
             time.sleep(0.3)
@@ -3042,7 +3091,7 @@ def compute_rs_scores(results):
 # ============================================================
 TG_SIGNAL_TFS       = [t.strip() for t in menv('TG_SIGNAL_TFS', M['tg_tfs']).split(',') if t.strip() in TF_LABELS]
 # 成交額門檻（20日平均，用該市場的貨幣）：KLSE讀 TG_MIN_TURNOVER_MYR（RM），美股讀 US_TG_MIN_TURNOVER（US$）
-TG_MIN_TURNOVER_MYR = float(os.environ.get(M['turnover_env'], '1000000'))
+TG_MIN_TURNOVER_MYR = float(os.environ.get(M['turnover_env'], M.get('min_turnover_default', '1000000')))
 SITE_ROOT           = (os.environ.get('SITE_URL') or os.environ.get('KLSE_URL') or 'https://klse-scanner-production-6926.up.railway.app').rstrip('/')
 KLSE_URL            = SITE_ROOT + BASE   # 這個市場的網址（美股＝…/us）
 TG_SENT_KEEP_DAYS   = 120
@@ -3243,6 +3292,10 @@ def bursa_tick(p):
     """跳動單位：美股 $1以上0.01、$1以下0.0001；其他是 Bursa Malaysia 規則"""
     if MARKET == 'US':
         return 0.01 if p >= 1 else 0.0001
+    if MARKET == 'SG':   # SGX：S$0.20以下0.001、S$0.20–1.00 0.005、S$1以上0.01
+        if p < 0.2: return 0.001
+        if p < 1:   return 0.005
+        return 0.01
     if p < 1:    return 0.005
     if p < 10:   return 0.01
     if p < 100:  return 0.02
@@ -4898,7 +4951,7 @@ SCANNING_BANNER
 <textarea id="watchlistBox" readonly style="background:#1a1a2e;color:#0f0;border:1px solid #444;padding:12px;border-radius:6px;width:500px;height:150px;font-family:monospace;font-size:12px;margin-top:8px;display:none"></textarea>
 <br id="watchlistBr" style="display:none">
 <table id="mainTable">
-  <tr><th>股票</th><th>板塊</th><th>日均額</th>RS_HEAD<th>1D</th><th>4H</th><th>1H</th></tr>
+  <tr><th>股票</th><th>板塊</th><th>日均額</th>RS_HEADTF_HEAD</tr>
   ROWS
 </table>
 <br>
@@ -5035,6 +5088,7 @@ def build_html(status='done'):
         .replace('SECTOR_OPTIONS', sector_opts)
         .replace('LAST_SCAN', last)
         .replace('RS_HEAD', rs_head)
+        .replace('TF_HEAD', ''.join(f'<th>{t}</th>' for t in TF_LABELS))
         .replace('MKT_STATUS', mkt_status)
         .replace('MISSING_INFO', missing_info)
         .replace('TOTAL', str(total))
@@ -5710,10 +5764,10 @@ def exit_backtest_page():
 
     runbar = ''.join(
         f'<a href="/exit_backtest?run={t}&c1={c}" onclick="return confirm(\'開始跑 {t}（C1 {c}%）出場回測？\')">▶ 跑 {t}・C1 {c}%</a>'
-        for t in ('1D', '4H') for c in (10, 7))
+        for t in ('1D', '4H') if t in TF_LABELS for c in (10, 7))
     viewbar = ''.join(
         f'<a class="{"on" if (t == view_tf and c == c1) else ""}" href="/exit_backtest?tf={t}&c1={c}">{t}・C1 {c}% 結果</a>'
-        for t in ('1D', '4H', '1H') for c in (10, 7))
+        for t in ('1D', '4H', '1H') if t in TF_LABELS for c in (10, 7))
 
     if res:
         def cells(s):
@@ -6043,7 +6097,7 @@ if __name__ == '__main__':
     import sys
     from werkzeug.serving import run_simple
     from werkzeug.middleware.dispatcher import DispatcherMiddleware
-    wanted = [x.strip().upper() for x in os.environ.get('MARKETS', 'KLSE,US').split(',') if x.strip().upper() in MKT_CFG]
+    wanted = [x.strip().upper() for x in os.environ.get('MARKETS', 'KLSE,US,SG').split(',') if x.strip().upper() in MKT_CFG]
     mods = {MARKET: sys.modules[__name__]}
     for mk in wanted:
         if mk not in mods:
