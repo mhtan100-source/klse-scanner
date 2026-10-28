@@ -1,5 +1,7 @@
 """
-莊家思維 股票掃描器（多市場：🇲🇾 KLSE ＋ 🇺🇸 美股 ＋ 🇸🇬 新加坡）
+莊家思維 股票掃描器（多市場：🇲🇾 KLSE ＋ 🇺🇸 美股 ＋ 🇸🇬 新加坡 ＋ 🇭🇰 港股）
+- 2026-10-28：加入 🇭🇰 港股（/hk）。只掃日線1D，C1門檻7%、日線BO/SL緩衝±1%，跳動單位用港交所價位表，
+  TradingView用 HKEX:代號（去掉前面的0），Telegram前面加🇭🇰。港股專用設定加前綴 HK_。
 - 2026-10-28：加入 🇸🇬 新加坡（/sg）。只掃日線1D（MH決定：新加入的亞洲市場只看日線），C1門檻7%、日線BO/SL緩衝±1%，
   TradingView用 SGX:代號，Telegram跟KLSE一樣推（前面加🇸🇬）。新加坡專用設定加前綴 SG_。
 - 2026-10-27：美股併進這個服務。同一份程式在同一個Railway服務裡載入兩次（KLSE一份、美股一份），
@@ -71,6 +73,19 @@ MKT_CFG = {
         'tfs': ['1D'],   # MH 2026-10-28：新加坡只掃日線
         'min_turnover_default': '500000',   # Telegram流動性門檻：20日平均成交額 S$50萬
     },
+    'HK': {
+        'flag': '🇭🇰', 'flag_html': '&#x1F1ED;&#x1F1F0;', 'name': '港股', 'short': 'HKEX', 'tab': '🇭🇰 港股',
+        'base': '/hk', 'env_prefix': 'HK_', 'tz': 'Asia/Hong_Kong',
+        # 港交所 09:30–12:00、13:00–16:00（午休照樣掃沒關係）；收市競價到約16:10
+        'open': (9, 30), 'close': (16, 0), 'daily_close': (16, 15), 'post_close': (16, 40), 'post_close_end': (18, 0),
+        'scan_every_min': 60, 'currency': 'HK$', 'suffix': '.HK', 'tv_prefix': 'HKEX:',
+        'auto_adjust': True, 'rs_benchmark': '2800.HK', 'turnover_env': 'HK_TG_MIN_TURNOVER', 'default_sym': '0700.HK',
+        'data_sub': 'hk', 'tg_tfs': '1D',
+        'html_replace': [('&#x1F1F2;&#x1F1FE;', '&#x1F1ED;&#x1F1F0;'), ('🇲🇾', '🇭🇰'), ('大馬', '港股'),
+                         ('KLSE股票', '港股')],
+        'tfs': ['1D'],   # MH 2026-10-28：新加入的亞洲市場只掃日線
+        'min_turnover_default': '10000000',   # Telegram流動性門檻：20日平均成交額 HK$1,000萬
+    },
 }
 MARKET     = os.environ.get('SCANNER_MARKET', 'KLSE').upper()
 if MARKET not in MKT_CFG:
@@ -90,13 +105,19 @@ def sym_code(sym):
     return sym[:-len(SUFFIX)] if SUFFIX and sym.endswith(SUFFIX) else sym
 
 def tv_sym(sym):
-    return f"{M['tv_prefix']}{sym_code(sym)}"
+    code = sym_code(sym)
+    if MARKET == 'HK':
+        code = code.lstrip('0') or '0'   # TradingView港股代號不補0：0700.HK → HKEX:700
+    return f"{M['tv_prefix']}{code}"
 
 def norm_sym(raw):
     """使用者輸入的代碼 → 程式內部代碼（KLSE補.KL；美股去掉 NASDAQ: 這類前綴、BRK.B→BRK-B）"""
     s = (raw or '').strip().upper()
     if ':' in s:
         s = s.split(':')[-1]
+    if MARKET == 'HK':
+        code = s[:-3] if s.endswith('.HK') else s
+        return (code.zfill(4) if code.isdigit() else code) + '.HK'   # 700 → 0700.HK
     if SUFFIX:
         return s if s.endswith(SUFFIX) else s + SUFFIX
     return s.replace('.', '-')
@@ -1924,6 +1945,7 @@ if MARKET == 'US':
 # ============================================================
 # 🇸🇬 新加坡股票清單（2026-10-28，依行業分組；SGX流動性集中在這約145檔，再往下日均成交額大多不到S$10萬）
 # 有代碼抓不到資料時，打開 /sg/debug_missing 看是哪幾隻
+# 2026-10-28 移除Yahoo抓不到的8檔（多半已私有化/下市）：JLB、5CP、NO4、UD2、A26、J91U、SK6U、CWBU
 # ============================================================
 SG_SECTOR_SYMBOLS = {
     '銀行': [('D05', 'DBS'), ('O39', 'OCBC'), ('U11', 'UOB')],
@@ -1932,14 +1954,14 @@ SG_SECTOR_SYMBOLS = {
     '工業': [('S63', 'ST Engineering'), ('BN4', 'Keppel'), ('U96', 'Sembcorp Ind'), ('5E2', 'Seatrium'), ('BS6', 'Yangzijiang'), ('YF8', 'YZJ Financial'), ('H22', 'HL Asia'), ('544', 'CSE Global'), ('F9D', 'Boustead'), ('P52', 'Pan-United'), ('E3B', 'Wee Hur'), ('OU8', 'Centurion'), ('CHZ', 'HRnetGroup'), ('ER0', 'KSH Holdings'), ('BQM', 'Tiong Woon')],
     '綜合企業': [('J36', 'Jardine Matheson(USD)'), ('C07', 'Jardine C&C'), ('9CI', 'CapitaLand Invest'), ('Z59', 'Yoma Strategic'), ('LJ3', 'OUE')],
     '運輸': [('C6L', 'SIA'), ('S59', 'SIA Engineering'), ('S58', 'SATS'), ('C52', 'ComfortDelGro'), ('S61', 'SBS Transit'), ('S08', 'SingPost'), ('G92', 'China Aviation Oil'), ('S56', 'Samudera'), ('NS8U', 'HPH Trust(USD)')],
-    '科技/電子': [('V03', 'Venture'), ('558', 'UMS'), ('AWX', 'AEM'), ('E28', 'Frencken'), ('MZH', 'Nanofilm'), ('5DD', 'Micro-Mechanics'), ('BN2', 'Valuetronics'), ('8AZ', 'Aztech'), ('JLB', 'Grand Venture'), ('M14', 'InnoTek'), ('F13', 'Fu Yu'), ('I07', 'ISDN'), ('5CP', 'Silverlake Axis')],
-    '能源/海工': [('5LY', 'Marco Polo Marine'), ('1MZ', 'Nam Cheong'), ('NO4', 'Dyna-Mac'), ('5WH', 'Rex Intl'), ('RE4', 'Geo Energy'), ('T13', 'RH PetroGas'), ('C9Q', 'Sinostar PEC'), ('U9E', 'China Everbright Water')],
+    '科技/電子': [('V03', 'Venture'), ('558', 'UMS'), ('AWX', 'AEM'), ('E28', 'Frencken'), ('MZH', 'Nanofilm'), ('5DD', 'Micro-Mechanics'), ('BN2', 'Valuetronics'), ('8AZ', 'Aztech'), ('M14', 'InnoTek'), ('F13', 'Fu Yu'), ('I07', 'ISDN')],
+    '能源/海工': [('5LY', 'Marco Polo Marine'), ('1MZ', 'Nam Cheong'), ('5WH', 'Rex Intl'), ('RE4', 'Geo Energy'), ('T13', 'RH PetroGas'), ('C9Q', 'Sinostar PEC'), ('U9E', 'China Everbright Water')],
     '原材料': [('5TP', 'CNMC Goldmine'), ('QES', 'China Sunsine')],
-    '種植/農業': [('F34', 'Wilmar'), ('E5H', 'Golden Agri'), ('EB5', 'First Resources'), ('P8Z', 'Bumitama'), ('VC2', 'Olam'), ('MV4', 'Mewah'), ('5JS', 'Indofood Agri'), ('NC2', 'Sri Trang Agro'), ('UD2', 'Japfa')],
+    '種植/農業': [('F34', 'Wilmar'), ('E5H', 'Golden Agri'), ('EB5', 'First Resources'), ('P8Z', 'Bumitama'), ('VC2', 'Olam'), ('MV4', 'Mewah'), ('5JS', 'Indofood Agri'), ('NC2', 'Sri Trang Agro')],
     '消費': [('Y92', 'Thai Beverage'), ('F99', 'Fraser & Neave'), ('D01', 'DFI Retail(USD)'), ('OV8', 'Sheng Siong'), ('P34', 'Delfi'), ('Q01', 'QAF'), ('F03', 'Food Empire'), ('1D0', 'Kimly'), ('42R', 'Jumbo'), ('AGS', 'Hour Glass'), ('D03', 'Del Monte Pac'), ('EMI', 'Emperador'), ('G13', 'Genting Sing'), ('H15', 'Hotel Properties'), ('H02', 'Haw Par')],
     '醫療': [('BSL', 'Raffles Medical'), ('AP4', 'Riverstone'), ('BVA', 'Top Glove'), ('A50', 'Thomson Medical'), ('QC7', 'Q&M Dental'), ('546', 'Medtecs')],
-    '房地產': [('C09', 'City Developments'), ('U14', 'UOL'), ('TQ5', 'Frasers Property'), ('H78', 'HK Land(USD)'), ('F17', 'GuocoLand'), ('Z25', 'Yanlord'), ('ADN', 'First Sponsor'), ('H13', 'Ho Bee'), ('W05', 'Wing Tai'), ('B61', 'Bukit Sembawang'), ('5UX', 'Oxley'), ('T24', 'Tuan Sing'), ('A26', 'Sinarmas Land'), ('OYY', 'PropNex'), ('CLN', 'APAC Realty')],
-    'REIT/信託': [('C38U', 'CapitaLand Int Comm'), ('A17U', 'CapitaLand Ascendas'), ('M44U', 'Mapletree Logistics'), ('ME8U', 'Mapletree Industrial'), ('N2IU', 'Mapletree PanAsia'), ('J69U', 'Frasers Centrepoint'), ('BUOU', 'Frasers Logistics'), ('T82U', 'Suntec REIT'), ('K71U', 'Keppel REIT'), ('AJBU', 'Keppel DC REIT'), ('A7RU', 'Keppel Infra Trust'), ('JYEU', 'Lendlease REIT'), ('DCRU', 'Digital Core REIT(USD)'), ('J85', 'CDL Hosp Trust'), ('HMN', 'CapitaLand Ascott'), ('C2PU', 'Parkway Life'), ('J91U', 'ESR REIT'), ('P40U', 'Starhill Global'), ('TS0U', 'OUE REIT'), ('O5RU', 'AIMS APAC REIT'), ('AU8U', 'CapitaLand China'), ('CY6U', 'CapitaLand India'), ('Q5T', 'Far East Hosp'), ('CRPU', 'Sasseur REIT'), ('AW9U', 'First REIT'), ('SK6U', 'Paragon REIT'), ('OXMU', 'Prime US REIT(USD)'), ('BTOU', 'Manulife US REIT(USD)'), ('CMOU', 'KORE(USD)'), ('ODBU', 'United Hampshire(USD)'), ('DHLU', 'Daiwa House Log'), ('MXNU', 'Elite UK REIT(GBP)'), ('UD1U', 'IREIT Global(EUR)'), ('CWBU', 'Stoneweg EU REIT(EUR)')],
+    '房地產': [('C09', 'City Developments'), ('U14', 'UOL'), ('TQ5', 'Frasers Property'), ('H78', 'HK Land(USD)'), ('F17', 'GuocoLand'), ('Z25', 'Yanlord'), ('ADN', 'First Sponsor'), ('H13', 'Ho Bee'), ('W05', 'Wing Tai'), ('B61', 'Bukit Sembawang'), ('5UX', 'Oxley'), ('T24', 'Tuan Sing'), ('OYY', 'PropNex'), ('CLN', 'APAC Realty')],
+    'REIT/信託': [('C38U', 'CapitaLand Int Comm'), ('A17U', 'CapitaLand Ascendas'), ('M44U', 'Mapletree Logistics'), ('ME8U', 'Mapletree Industrial'), ('N2IU', 'Mapletree PanAsia'), ('J69U', 'Frasers Centrepoint'), ('BUOU', 'Frasers Logistics'), ('T82U', 'Suntec REIT'), ('K71U', 'Keppel REIT'), ('AJBU', 'Keppel DC REIT'), ('A7RU', 'Keppel Infra Trust'), ('JYEU', 'Lendlease REIT'), ('DCRU', 'Digital Core REIT(USD)'), ('J85', 'CDL Hosp Trust'), ('HMN', 'CapitaLand Ascott'), ('C2PU', 'Parkway Life'), ('P40U', 'Starhill Global'), ('TS0U', 'OUE REIT'), ('O5RU', 'AIMS APAC REIT'), ('AU8U', 'CapitaLand China'), ('CY6U', 'CapitaLand India'), ('Q5T', 'Far East Hosp'), ('CRPU', 'Sasseur REIT'), ('AW9U', 'First REIT'), ('OXMU', 'Prime US REIT(USD)'), ('BTOU', 'Manulife US REIT(USD)'), ('CMOU', 'KORE(USD)'), ('ODBU', 'United Hampshire(USD)'), ('DHLU', 'Daiwa House Log'), ('MXNU', 'Elite UK REIT(GBP)'), ('UD1U', 'IREIT Global(EUR)')],
 }
 
 if MARKET == 'SG':
@@ -1947,6 +1969,40 @@ if MARKET == 'SG':
     for _sec, _lst in SG_SECTOR_SYMBOLS.items():
         for _c, _n in _lst:
             _s = _c + '.SI'
+            if _s not in SECTORS:
+                SECTORS[_s] = _sec
+                NAMES[_s] = _n
+                SYMBOLS.append(_s)
+
+
+# ============================================================
+# 🇭🇰 港股清單（2026-10-28，依行業分組，約260檔高成交額股票；代號用Yahoo的4位數格式）
+# 有代碼抓不到資料時，打開 /hk/debug_missing 看是哪幾隻
+# ============================================================
+HK_SECTOR_SYMBOLS = {
+    '指數ETF': [('2828', '恒生中國企業ETF'), ('3033', '南方恒生科技ETF')],
+    '銀行': [('0005', '滙豐控股'), ('0011', '恒生銀行'), ('0939', '建設銀行'), ('1398', '工商銀行'), ('3988', '中國銀行'), ('1288', '農業銀行'), ('3328', '交通銀行'), ('3968', '招商銀行'), ('0998', '中信銀行'), ('1658', '郵儲銀行'), ('2388', '中銀香港'), ('0023', '東亞銀行')],
+    '保險': [('1299', '友邦保險'), ('2318', '中國平安'), ('2628', '中國人壽'), ('2601', '中國太保'), ('1339', '中國人保'), ('2328', '中國財險'), ('1336', '新華保險'), ('0966', '中國太平'), ('6060', '眾安在線')],
+    '金融': [('0388', '香港交易所'), ('6030', '中信証券'), ('6886', '華泰證券'), ('3908', '中金公司'), ('2611', '國泰海通'), ('6099', '招商證券'), ('1776', '廣發證券'), ('1359', '中國信達'), ('2799', '中國中信金融資產'), ('0165', '中國光大控股'), ('2588', '中銀航空租賃')],
+    '互聯網': [('0700', '騰訊控股'), ('9988', '阿里巴巴'), ('3690', '美團'), ('9618', '京東集團'), ('9999', '網易'), ('9888', '百度集團'), ('1024', '快手'), ('9961', '攜程集團'), ('9626', '嗶哩嗶哩'), ('0780', '同程旅行'), ('2423', '貝殼'), ('1698', '騰訊音樂'), ('9898', '微博'), ('0772', '閱文集團'), ('6618', '京東健康'), ('0241', '阿里健康'), ('1833', '平安好醫生'), ('2618', '京東物流'), ('0696', '中國民航信息'), ('1357', '美圖公司'), ('0777', '網龍'), ('2400', '心動公司')],
+    '科技/半導體': [('1810', '小米集團'), ('0981', '中芯國際'), ('1347', '華虹半導體'), ('0992', '聯想集團'), ('0268', '金蝶國際'), ('3888', '金山軟件'), ('9698', '萬國數據'), ('2382', '舜宇光學'), ('2018', '瑞聲科技'), ('0285', '比亞迪電子'), ('1478', '丘鈦科技'), ('0522', 'ASMPT'), ('0020', '商湯'), ('9660', '地平線機器人'), ('2498', '速騰聚創'), ('9880', '優必選'), ('6869', '長飛光纖'), ('0148', '建滔集團'), ('1888', '建滔積層板'), ('6969', '思摩爾國際')],
+    '汽車': [('1211', '比亞迪股份'), ('0175', '吉利汽車'), ('2015', '理想汽車'), ('9868', '小鵬汽車'), ('9866', '蔚來'), ('9863', '零跑汽車'), ('2333', '長城汽車'), ('0489', '東風集團'), ('2238', '廣汽集團'), ('3750', '寧德時代'), ('0425', '敏實集團'), ('1316', '耐世特'), ('1585', '雅迪控股'), ('3606', '福耀玻璃'), ('0881', '中升控股'), ('2338', '濰柴動力'), ('3808', '中國重汽')],
+    '消費': [('9992', '泡泡瑪特'), ('2020', '安踏體育'), ('2331', '李寧'), ('1913', '普拉達'), ('1929', '周大福'), ('6181', '老鋪黃金'), ('2313', '申洲國際'), ('6110', '滔搏'), ('9896', '名創優品'), ('9633', '農夫山泉'), ('6862', '海底撈'), ('9987', '百勝中國'), ('2097', '蜜雪集團'), ('0291', '華潤啤酒'), ('0168', '青島啤酒'), ('1876', '百威亞太'), ('0322', '康師傅'), ('0151', '中國旺旺'), ('0220', '統一企業中國'), ('2319', '蒙牛乳業'), ('1044', '恒安國際'), ('1880', '中國中免'), ('6690', '海爾智家'), ('0300', '美的集團'), ('1999', '敏華控股'), ('9901', '新東方'), ('1797', '東方甄選'), ('2367', '巨子生物'), ('0669', '創科實業'), ('0179', '德昌電機')],
+    '博彩': [('0027', '銀河娛樂'), ('1928', '金沙中國'), ('0880', '澳博控股'), ('1128', '永利澳門'), ('2282', '美高梅中國'), ('0200', '新濠國際')],
+    '醫藥': [('2269', '藥明生物'), ('2359', '藥明康德'), ('3759', '康龍化成'), ('1177', '中國生物製藥'), ('1093', '石藥集團'), ('6160', '百濟神州'), ('1801', '信達生物'), ('3692', '翰森製藥'), ('2196', '復星醫藥'), ('1099', '國藥控股'), ('1066', '威高股份'), ('0867', '康哲藥業'), ('9926', '康方生物'), ('1530', '三生製藥'), ('2162', '康諾亞'), ('9995', '榮昌生物'), ('0013', '和黃醫藥'), ('6990', '科倫博泰'), ('9688', '再鼎醫藥'), ('1877', '君實生物'), ('0853', '微創醫療'), ('2252', '微創機器人'), ('2186', '綠葉製藥'), ('0570', '中國中藥'), ('3320', '華潤醫藥'), ('2607', '上海醫藥'), ('1548', '金斯瑞生物'), ('2228', '晶泰控股'), ('2096', '先聲藥業'), ('1952', '雲頂新耀'), ('6855', '亞盛醫藥'), ('9969', '諾誠健華')],
+    '地產': [('0016', '新鴻基地產'), ('1109', '華潤置地'), ('0688', '中國海外發展'), ('1113', '長實集團'), ('0012', '恒基地產'), ('0017', '新世界發展'), ('0083', '信和置業'), ('0101', '恒隆地產'), ('0960', '龍湖集團'), ('3900', '綠城中國'), ('1997', '九龍倉置業'), ('0004', '九龍倉集團'), ('0123', '越秀地產'), ('0119', '保利置業'), ('1908', '建發國際'), ('2202', '萬科企業'), ('0754', '合生創展'), ('1030', '新城發展'), ('3383', '雅居樂'), ('1918', '融創中國'), ('1209', '華潤萬象生活'), ('6098', '碧桂園服務'), ('2869', '綠城服務'), ('0823', '領展房產基金'), ('0778', '置富產業信託')],
+    '公用事業': [('0002', '中電控股'), ('0003', '香港中華煤氣'), ('0006', '電能實業'), ('1038', '長江基建'), ('0836', '華潤電力'), ('0902', '華能國際'), ('0991', '大唐發電'), ('0916', '龍源電力'), ('1816', '中廣核電力'), ('0384', '中國燃氣'), ('2688', '新奧能源'), ('1193', '華潤燃氣'), ('0135', '昆侖能源'), ('0270', '粵海投資'), ('0371', '北控水務'), ('0257', '光大環境')],
+    '能源/資源': [('0857', '中國石油'), ('0386', '中國石化'), ('0883', '中國海洋石油'), ('1088', '中國神華'), ('1898', '中煤能源'), ('1171', '兗礦能源'), ('3993', '洛陽鉬業'), ('2899', '紫金礦業'), ('1818', '招金礦業'), ('2600', '中國鋁業'), ('0358', '江西銅業'), ('1208', '五礦資源'), ('0486', '俄鋁'), ('0914', '海螺水泥'), ('3323', '中國建材'), ('2689', '玖龍紙業'), ('0189', '東岳集團')],
+    '新能源': [('2208', '金風科技'), ('0968', '信義光能'), ('0868', '信義玻璃'), ('3800', '協鑫科技'), ('1772', '贛鋒鋰業'), ('9696', '天齊鋰業'), ('6865', '福萊特玻璃')],
+    '電信': [('0941', '中國移動'), ('0762', '中國聯通'), ('0728', '中國電信'), ('0788', '中國鐵塔'), ('6823', '香港電訊'), ('0008', '電訊盈科')],
+    '工業/運輸': [('0001', '長和'), ('0267', '中信股份'), ('0019', '太古股份A'), ('0656', '復星國際'), ('0066', '港鐵公司'), ('0144', '招商局港口'), ('0316', '東方海外國際'), ('1919', '中遠海控'), ('1308', '海豐國際'), ('2343', '太平洋航運'), ('0598', '中國外運'), ('6936', '順豐控股'), ('0753', '中國國航'), ('0670', '東方航空'), ('1055', '南方航空'), ('0293', '國泰航空'), ('0694', '北京首都機場'), ('0576', '浙江滬杭甬'), ('0177', '江蘇寧滬'), ('1800', '中國交通建設'), ('0390', '中國中鐵'), ('1186', '中國鐵建'), ('1766', '中國中車'), ('3311', '中國建築國際'), ('1072', '東方電氣'), ('3898', '時代電氣'), ('1157', '中聯重科'), ('0631', '三一國際'), ('2357', '中航科工'), ('3899', '中集安瑞科'), ('2039', '中集集團'), ('1882', '海天國際')],
+}
+
+if MARKET == 'HK':
+    SYMBOLS, NAMES, SECTORS, TV_SYMBOLS = [], {}, {}, {}
+    for _sec, _lst in HK_SECTOR_SYMBOLS.items():
+        for _c, _n in _lst:
+            _s = _c + '.HK'
             if _s not in SECTORS:
                 SECTORS[_s] = _sec
                 NAMES[_s] = _n
@@ -3292,6 +3348,11 @@ def bursa_tick(p):
     """跳動單位：美股 $1以上0.01、$1以下0.0001；其他是 Bursa Malaysia 規則"""
     if MARKET == 'US':
         return 0.01 if p >= 1 else 0.0001
+    if MARKET == 'HK':   # 港交所價位表
+        for lim, t in ((0.25, 0.001), (0.5, 0.005), (10, 0.01), (20, 0.02), (100, 0.05), (200, 0.10),
+                       (500, 0.20), (1000, 0.50), (2000, 1.00), (5000, 2.00)):
+            if p < lim: return t
+        return 5.00
     if MARKET == 'SG':   # SGX：S$0.20以下0.001、S$0.20–1.00 0.005、S$1以上0.01
         if p < 0.2: return 0.001
         if p < 1:   return 0.005
@@ -6097,7 +6158,7 @@ if __name__ == '__main__':
     import sys
     from werkzeug.serving import run_simple
     from werkzeug.middleware.dispatcher import DispatcherMiddleware
-    wanted = [x.strip().upper() for x in os.environ.get('MARKETS', 'KLSE,US,SG').split(',') if x.strip().upper() in MKT_CFG]
+    wanted = [x.strip().upper() for x in os.environ.get('MARKETS', 'KLSE,US,SG,HK').split(',') if x.strip().upper() in MKT_CFG]
     mods = {MARKET: sys.modules[__name__]}
     for mk in wanted:
         if mk not in mods:
