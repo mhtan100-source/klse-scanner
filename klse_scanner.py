@@ -3851,6 +3851,125 @@ def _ex_agg(rows):
             'tp': sum(1 for x in rows if x['why'] == 'TP'), 'sl': sum(1 for x in rows if x['why'] == 'SL'),
             'other': sum(1 for x in rows if x['why'] not in ('TP', 'SL'))}
 
+# ============================================================
+# 🔬 進場條件分析（MH 2026-10-29）：把出場回測的每一筆進場，依「進場當下的條件」分組，
+# 看哪一組「幾乎沒漲（20根內最多漲不到0.5R）」比例最低 → 找出值得加的進場過濾。
+# 只用進場那一刻（含）之前的資料，沒有偷看未來。
+# ============================================================
+EXF_RS_STRONG = 5.0    # 力量：20天跑贏大盤 ≥ 5% 算「大幅跑贏」
+
+def _exf_bench_ctx():
+    """回測開始時抓一次大盤日線（美股SPY；沒有基準的市場回傳None）"""
+    if not RS_BENCHMARK:
+        return None
+    try:
+        b = fetch_ohlcv(RS_BENCHMARK, '1D')
+        if b.empty or len(b) < 200:
+            return None
+        return {'close': b['close'], 'df': b, 'dates': [pd.Timestamp(x).date() for x in b.index], 'stage': {}}
+    except Exception as e:
+        log.warning(f"🔬 抓大盤 {RS_BENCHMARK} 失敗：{e}")
+        return None
+
+def _exf_day_pos(dates, d, intraday):
+    """日線位置：日線進場用當天收盤（同一時間），盤中時間框架只用前一天收盤（避免偷看）"""
+    from bisect import bisect_left
+    return (bisect_right(dates, d) if not intraday else bisect_left(dates, d)) - 1
+
+def _exf_bench_stage(ctx, pos):
+    if pos < 0:
+        return None
+    if pos not in ctx['stage']:
+        try:
+            ctx['stage'][pos] = get_stage(ctx['df'].iloc[:pos + 1])[0]
+        except Exception:
+            ctx['stage'][pos] = None
+    return ctx['stage'][pos]
+
+def _exf_factors(e, daily, tf, ctx):
+    """回傳一筆進場的分組條件"""
+    f = {
+        'vol_x': e.get('vol_x'), 'provisional': bool(e.get('provisional')), 'c_count': e.get('c_count'),
+        'pct': e.get('pct'), 'base': e.get('base', 0), 'stage': e.get('stage'), 'chase': bool(e.get('chase')),
+        'r_pct': (e['entry'] - e['sl']) / e['entry'] * 100 if e.get('entry') else None,
+        'rs': None, 'mkt': None,
+    }
+    if ctx is None:
+        return f
+    try:
+        d = pd.Timestamp(e['confirm_time']).date()
+        intraday = tf != '1D'
+        bpos = _exf_day_pos(ctx['dates'], d, intraday)
+        f['mkt'] = _exf_bench_stage(ctx, bpos)
+        sdates = [pd.Timestamp(x).date() for x in daily.index]
+        spos = _exf_day_pos(sdates, d, intraday)
+        if spos >= RS_LOOKBACK_DAYS and bpos >= RS_LOOKBACK_DAYS:
+            s = daily['close'].iloc[:spos + 1]
+            b = ctx['close'].iloc[:bpos + 1]
+            al = pd.concat([s.rename('s'), b.rename('b')], axis=1, join='inner').dropna()
+            if len(al) > RS_LOOKBACK_DAYS:
+                ratio = al['s'] / al['b']
+                past = ratio.iloc[-1 - RS_LOOKBACK_DAYS]
+                if past:
+                    f['rs'] = round(float((ratio.iloc[-1] / past - 1) * 100), 2)
+    except Exception as ex:
+        log.warning(f"🔬 條件計算 {e.get('symbol')}: {ex}")
+    return f
+
+def _exf_groups(has_bench):
+    vx = lambda x: x.get('vol_x')
+    g = [
+        ('🔥 突破量', [(f'≥ {VOL_SURGE_X}倍均量', lambda x: (vx(x) or 0) >= VOL_SURGE_X),
+                       (f'1～{VOL_SURGE_X}倍', lambda x: vx(x) is not None and 1 <= vx(x) < VOL_SURGE_X),
+                       ('< 1倍（縮量突破）', lambda x: vx(x) is not None and vx(x) < 1)]),
+    ]
+    if has_bench:
+        g += [
+            (f'💪 力量（20天 vs {RS_BENCHMARK}）', [(f'大幅跑贏 ≥ {EXF_RS_STRONG:g}%', lambda x: x['rs'] is not None and x['rs'] >= EXF_RS_STRONG),
+                                                 (f'小幅跑贏 0～{EXF_RS_STRONG:g}%', lambda x: x['rs'] is not None and 0 <= x['rs'] < EXF_RS_STRONG),
+                                                 ('跑輸大盤', lambda x: x['rs'] is not None and x['rs'] < 0)]),
+            (f'📈 大盤（{RS_BENCHMARK} 日線）', [('大盤 S2', lambda x: x['mkt'] == 2),
+                                                ('大盤不是 S2', lambda x: x['mkt'] is not None and x['mkt'] != 2)]),
+        ]
+    g += [
+        ('📉 最後一個C收縮', [('很緊 < 5%', lambda x: x['pct'] is not None and x['pct'] < 5),
+                              ('5～10%', lambda x: x['pct'] is not None and 5 <= x['pct'] < 10),
+                              ('≥ 10%（比較鬆）', lambda x: x['pct'] is not None and x['pct'] >= 10)]),
+        ('📐 收縮段數', [('2C', lambda x: x['c_count'] == 2), ('3C 以上', lambda x: (x['c_count'] or 0) >= 3)]),
+        ('📏 1R 距離（SL多遠）', [('< 5%', lambda x: x['r_pct'] is not None and x['r_pct'] < 5),
+                                 ('5～10%', lambda x: x['r_pct'] is not None and 5 <= x['r_pct'] < 10),
+                                 ('≥ 10%', lambda x: x['r_pct'] is not None and x['r_pct'] >= 10)]),
+        ('⏳ 低點確認', [('已確認', lambda x: not x['provisional']), ('有⏳（未確認）', lambda x: x['provisional'])]),
+        ('🧱 Base', [('第1個base', lambda x: (x['base'] or 0) == 0), ('第2個base以上', lambda x: (x['base'] or 0) > 0)]),
+        ('📊 日線Stage', [('S2', lambda x: x['stage'] == 2), ('非S2', lambda x: x['stage'] != 2)]),
+    ]
+    return g
+
+def _exf_agg(sub, best_name, cur_name):
+    n = len(sub)
+    if not n:
+        return {'n': 0}
+    none = sum(1 for x in sub if x['mfe'] < 0.5)
+    big = sum(1 for x in sub if x['mfe'] >= 1.5)
+    rc = [x['r'][cur_name] for x in sub if cur_name in x['r']]
+    rb = [x['r'][best_name] for x in sub if best_name in x['r']]
+    return {'n': n, 'none_pct': round(none / n * 100, 1), 'big_pct': round(big / n * 100, 1),
+            'cur_r': round(sum(rc) / len(rc), 3) if rc else None, 'best_r': round(sum(rb) / len(rb), 3) if rb else None}
+
+def compute_entry_factors(ent_rows, results, has_bench):
+    """ent_rows：每筆進場的條件＋各出場規則的R＋20根MFE"""
+    if not ent_rows:
+        return None
+    rules = [rl for rl in results['rules'] if rl['all'].get('avg_r') is not None and rl['all'].get('n')]
+    cur_name = EXIT_RULES[0][0]
+    best_name = max(rules, key=lambda rl: rl['all']['avg_r'])['name'] if rules else cur_name
+    out = {'n': len(ent_rows), 'cur_name': cur_name, 'best_name': best_name,
+           'all': _exf_agg(ent_rows, best_name, cur_name), 'groups': []}
+    for gname, items in _exf_groups(has_bench):
+        out['groups'].append({'name': gname, 'items': [{'label': lab, **_exf_agg([x for x in ent_rows if fn(x)], best_name, cur_name)}
+                                                      for lab, fn in items]})
+    return out
+
 def run_exit_backtest(tf='1D', c1=10, bars=None, limit=None):
     with ex_state['lock']:
         if ex_state['status'] == 'running' or bt_state['status'] == 'running':
@@ -3866,7 +3985,9 @@ def run_exit_backtest(tf='1D', c1=10, bars=None, limit=None):
     per_rule = {rule[0]: [] for rule in EXIT_RULES}
     entries_n = 0; open_n = {rule[0]: 0 for rule in EXIT_RULES}; mfes = []
     first_date = last_date = None
+    ent_rows = []   # 🔬 進場條件分析用
     try:
+        bench_ctx = _exf_bench_ctx()
         for si, sym in enumerate(syms):
             meta = {'symbol': sym, 'name': NAMES.get(sym, sym_code(sym)),
                     'sector': SECTORS.get(sym, '其他'), 'tv_symbol': tv_sym(sym)}
@@ -3893,11 +4014,18 @@ def run_exit_backtest(tf='1D', c1=10, bars=None, limit=None):
                     e_idx = pos_of.get(e['confirm_time'])
                     if e_idx is None: continue
                     entries_n += 1
+                    ent = None
                     for rule in EXIT_RULES:
                         out = _simulate_exit(df, e_idx, e['entry'], e['sl'], rule, ma20)
                         if out is None:
                             open_n[rule[0]] += 1; continue
                         rm, why, k, mfe = out
+                        if rule is EXIT_RULES[0]:
+                            ent = _exf_factors(e, daily, tf, bench_ctx)
+                            ent.update({'mfe': round(float(mfe), 2), 'r': {}})
+                            ent_rows.append(ent)
+                        if ent is not None:
+                            ent['r'][rule[0]] = round(float(rm), 3)
                         per_rule[rule[0]].append({'symbol': sym, 'name': meta['name'], 'confirm_time': e['confirm_time'],
                                                   'entry': e['entry'], 'sl': e['sl'], 'r': round(float(rm), 3), 'why': why,
                                                   'bars': k, 'stage': e.get('stage'), 'chase': bool(e.get('chase')),
@@ -3926,6 +4054,10 @@ def run_exit_backtest(tf='1D', c1=10, bars=None, limit=None):
                 's2': _ex_agg([x for x in rows if x.get('stage') == 2]),
                 'cases': sorted(rows, key=lambda x: x['confirm_time'], reverse=True)[:40],
             })
+        try:
+            results['factors'] = compute_entry_factors(ent_rows, results, bench_ctx is not None)
+        except Exception as ex:
+            log.warning(f"🔬 進場條件分析失敗：{ex}")
         with open(_ex_file(tf, c1), 'w', encoding='utf-8') as f:
             json.dump(results, f, ensure_ascii=False, default=str)
         with ex_state['lock']:
@@ -3962,6 +4094,74 @@ def _exs_money(avg_r):
     if abs(v) < 0.5:
         return f'每冒 {cur}100 風險，平均打平'
     return f'每冒 {cur}100 風險，平均{"賺" if v > 0 else "虧"} {cur}{abs(v):.0f}'
+
+EXF_MIN_N_PCT  = 15    # 一組至少要有全部的15%（而且≥15筆）才拿來下結論，太小組的結果多半是運氣
+EXF_GOOD_DIFF  = float(menv('EXF_GOOD_DIFF', '10'))   # 某組「幾乎沒漲」比全部低 ≥ 10個百分點 → 值得當過濾條件
+
+def _exf_min_n(fx):
+    return max(15, fx['n'] * EXF_MIN_N_PCT / 100)
+
+def exf_best(fx):
+    """回傳 (最好的一組, 最差的一組)：只看樣本夠大的組，用「幾乎沒漲%」比較"""
+    if not fx or not fx.get('groups'):
+        return None, None
+    mn = _exf_min_n(fx)
+    cands = [dict(it, group=g['name']) for g in fx['groups'] for it in g['items'] if it.get('n', 0) >= mn]
+    if not cands:
+        return None, None
+    best = min(cands, key=lambda it: it['none_pct'])
+    worst = max(cands, key=lambda it: it['none_pct'])
+    return best, worst
+
+def _ex_compare_hint(res):
+    """依正在看的那一組，提示還沒比較過的 C1門檻／時間框架"""
+    combos = [(t, c) for t in ('1D', '4H') if t in TF_LABELS for c in (10, 7)]
+    cur = (res.get('tf'), int(res.get('c1') or 0))
+    missing = [f'{t}・C1 {c}%' for t, c in combos if (t, c) != cur and load_ex_result(t, c) is None]
+    return missing
+
+def exf_table_html(res):
+    fx = res.get('factors')
+    if not fx:
+        return ('<div class="sec"><h3>🔬 進場條件分析</h3><div class="empty">這份結果是舊版回測跑的，沒有進場條件資料。'
+                f'按上面的「▶ 跑 {_h(res.get("tf"))}・C1 {res.get("c1")}%」重跑一次就會出現。</div></div>')
+    al = fx['all']
+    mn = _exf_min_n(fx)
+    best, worst = exf_best(fx)
+    pr = lambda v: '-' if v is None else f'{v:+.2f}R'
+    rows = ''
+    for g in fx['groups']:
+        first = True
+        for it in g['items']:
+            gcell = f'<td class="g" rowspan="{len(g["items"])}"><b>{_h(g["name"])}</b></td>' if first else ''
+            first = False
+            if not it.get('n'):
+                rows += f'<tr>{gcell}<td class="g">{_h(it["label"])}</td><td>0</td><td>-</td><td>-</td><td>-</td><td>-</td></tr>'
+                continue
+            small = it['n'] < mn
+            diff = it['none_pct'] - al['none_pct']
+            if small:
+                col = 'color:#777'
+            elif diff <= -EXF_GOOD_DIFF:
+                col = 'background:#1b3d27;color:#a5d6a7;font-weight:bold'
+            elif diff >= EXF_GOOD_DIFF:
+                col = 'background:#4a1c1c;color:#ff9a9a'
+            else:
+                col = ''
+            star = ' ⭐' if (best and not small and it['label'] == best['label'] and g['name'] == best['group']
+                              and al['none_pct'] - best['none_pct'] >= EXF_GOOD_DIFF) else ''
+            rows += (f'<tr>{gcell}<td class="g">{_h(it["label"])}{star}{" <span style=color:#777>（太少）</span>" if small else ""}</td>'
+                     f'<td>{it["n"]}</td><td style="{col}">{it["none_pct"]:.0f}%</td><td>{it["big_pct"]:.0f}%</td>'
+                     f'<td>{pr(it["cur_r"])}</td><td>{pr(it["best_r"])}</td></tr>')
+    return f'''<div class="sec"><h3>🔬 進場條件分析（找出「比較會漲」的突破）</h3>
+<div class="desc">把 {fx["n"]} 筆進場依「進場當下的條件」分組。看第 4 欄「幾乎沒漲」：
+<span style="background:#1b3d27;color:#a5d6a7;padding:0 4px">綠色</span> = 比全部（{al["none_pct"]:.0f}%）低 {EXF_GOOD_DIFF:g} 個百分點以上，值得考慮當進場過濾；
+<span style="background:#4a1c1c;color:#ff9a9a;padding:0 4px">紅色</span> = 更容易沒漲；灰色「太少」= 少於 {mn:.0f} 筆，不下結論。⭐ = 最值得加的條件。</div>
+<div style="overflow-x:auto"><table class="st"><tr><th>條件</th><th>分組</th><th>筆數</th><th>幾乎沒漲<br>(&lt;0.5R)</th><th>大行情<br>(≥1.5R)</th>
+<th>平均R<br>{_h(fx["cur_name"])}</th><th>平均R<br>{_h(fx["best_name"])}</th></tr>
+<tr><td class="g"><b>全部</b></td><td class="g">—</td><td>{al["n"]}</td><td>{al["none_pct"]:.0f}%</td><td>{al["big_pct"]:.0f}%</td><td>{pr(al["cur_r"])}</td><td>{pr(al["best_r"])}</td></tr>
+{rows}</table></div>
+<div class="desc" style="margin-top:6px">只用進場那一刻（含）之前的資料計算，沒有偷看未來。同一個條件裡的組，筆數加起來可能少於全部（有些資料算不出來）。</div></div>'''
 
 def exit_summary_html(res):
     rules = [rl for rl in res.get('rules', []) if rl['all'].get('avg_r') is not None and rl['all'].get('n')]
@@ -4034,9 +4234,28 @@ def exit_summary_html(res):
     elif n >= 100: c_icon, c_txt = '🟡', '中等（排名容易變動，只看大方向）'
     else:          c_icon, c_txt = '🔴', '低（樣本太少，先別下結論）'
 
+    # 🔬 最有用的進場條件
+    fx = res.get('factors')
+    fx_best, fx_worst = exf_best(fx)
+    fx_good = bool(fx_best and fx['all']['none_pct'] - fx_best['none_pct'] >= EXF_GOOD_DIFF)
+    if not fx:
+        fx_block = '⚪ 這份是舊版結果，重跑一次回測才會有'
+    elif fx_good:
+        fx_block = (f'⭐ <b>{_h(fx_best["group"])}：{_h(fx_best["label"])}</b>'
+                    f'<div class="exs-sub">這組 {fx_best["n"]} 筆，幾乎沒漲只有 {fx_best["none_pct"]:.0f}%（全部是 {fx["all"]["none_pct"]:.0f}%）'
+                    f'・平均R {fx_best["best_r"]:+.2f}（用最好的出場）</div>' if fx_best.get('best_r') is not None else
+                    f'⭐ <b>{_h(fx_best["group"])}：{_h(fx_best["label"])}</b>')
+    else:
+        fx_block = (f'❌ 沒有明顯有用的條件<div class="exs-sub">每一組的「幾乎沒漲」都跟全部（{fx["all"]["none_pct"]:.0f}%）差不到 '
+                    f'{EXF_GOOD_DIFF:g} 個百分點</div>')
+    if fx and fx_worst and fx_worst['none_pct'] - fx['all']['none_pct'] >= EXF_GOOD_DIFF:
+        fx_block += (f'<div class="exs-sub">⚠️ 最該避開：{_h(fx_worst["group"])}「{_h(fx_worst["label"])}」'
+                     f'（幾乎沒漲 {fx_worst["none_pct"]:.0f}%）</div>')
+
     # ⑥ 建議（依燈號組合）
     tips = []
     entry_bad = p_none is not None and p_none > EXS_MFE_BAD
+    missing = _ex_compare_hint(res)
     if v_icon == '🟢':
         if cur_rule is best or b_avg - (c_avg or 0) < EXS_TIE_R:
             tips.append('這套進場＋現在的出場已經有優勢，維持不變，繼續累積樣本。')
@@ -4044,14 +4263,24 @@ def exit_summary_html(res):
             tips.append(f'這套進場有優勢。可以考慮把出場改成「{_h(best["name"])}」，先在突破卡片上紙上追蹤一段時間確認。')
     elif entry_bad:
         tips.append(f'先不要再調出場方式。約 {p_none:.0f}% 的突破進場後根本沒漲，出場怎麼改都救不回來；'
-                    '應該先改善進場篩選（例如比較 C1 10%、4H 的結果），等「幾乎沒漲」降到 '
-                    f'{EXS_MFE_GOOD:.0f}% 以下，再回頭優化出場。')
+                    f'應該先改善進場篩選，等「幾乎沒漲」降到 {EXS_MFE_GOOD:.0f}% 以下，再回頭優化出場。')
+        if fx_good:
+            tips.append(f'下一步：試試只做「{_h(fx_best["group"])}：{_h(fx_best["label"])}」的突破'
+                        f'（幾乎沒漲 {fx_best["none_pct"]:.0f}%）。先在突破卡片上紙上觀察，樣本夠了再正式加進過濾。')
+        elif missing:
+            tips.append('下一步：可以先比較 ' + '、'.join(missing) + ' 的結果，看進場品質有沒有比較好。')
+        elif fx:
+            tips.append('C1門檻、時間框架、目前這些條件都沒有明顯改善，可能要找其他進場確認方式'
+                        '（例如等回踩確認再進場，而不是收盤一突破就進）。')
     elif v_icon == '🟡':
         tips.append(f'接近打平。進場品質不算差，出場可以用「{_h(best["name"])}」，'
                     '但扣掉手續費和滑價後優勢很薄，建議再加進場過濾提高勝率。')
     else:
         tips.append('進場後有漲，但最後沒賺到：可能是 SL 太緊被洗出去，或目標太遠。'
                     f'可以試試讓利潤多跑一點（例如「{_h(best["name"])}」），或檢查 SL 的位置。')
+    if fx_good and not entry_bad:
+        tips.append(f'加上「{_h(fx_best["group"])}：{_h(fx_best["label"])}」這個條件，幾乎沒漲可以從 '
+                    f'{fx["all"]["none_pct"]:.0f}% 降到 {fx_best["none_pct"]:.0f}%，值得先紙上觀察。')
     if i_nc == '🟢':
         tips.append('「排除⚠️不追」有效：實際交易時，確認價高於 BO 太多的就不要追。')
     if i_s2 == '❌' and s2_share < 90:
@@ -4064,6 +4293,7 @@ def exit_summary_html(res):
 <div class="exs-row"><div class="exs-k">🚦 總評</div><div class="exs-v">{v_icon} <b>{v_txt}</b><div class="exs-sub">{v_sub}</div></div></div>
 <div class="exs-row"><div class="exs-k">📏 進場品質</div><div class="exs-v">{m_icon} <b>{m_txt}</b>{mfe_block}</div></div>
 <div class="exs-row"><div class="exs-k">🏆 最好的出場</div><div class="exs-v">{best_line}</div></div>
+<div class="exs-row"><div class="exs-k">🔬 最有用的條件</div><div class="exs-v">{fx_block}</div></div>
 <div class="exs-row"><div class="exs-k">🔍 過濾有沒有用</div><div class="exs-v">{filt_block}</div></div>
 <div class="exs-row"><div class="exs-k">📊 可信度</div><div class="exs-v">{c_icon} {c_txt}<div class="exs-sub">約 {n} 筆完成的交易</div></div></div>
 <div class="exs-tip"><b>💡 建議</b><ul class="exs-ul">{"".join(f"<li>{t}</li>" for t in tips)}</ul></div>
@@ -6028,9 +6258,15 @@ def exit_backtest_page():
         except Exception as e:
             log.warning(f"🚪 結論卡錯誤：{e}")
             summary = ''
+        try:
+            factor_html = exf_table_html(res)
+        except Exception as e:
+            log.warning(f"🔬 進場條件表錯誤：{e}")
+            factor_html = ''
         body = f'''
 <div class="desc">期間 {res["period"][0]} ～ {res["period"][1]}・{res["symbols"]}檔・進場共 {res["entries"]} 筆（C1門檻 {res["c1"]}%）・完成於 {res["finished"]}</div>
 {summary}
+{factor_html}
 <details class="exs-detail"><summary>📊 詳細數據（每條出場規則的完整表格）— 點這裡展開</summary>
 <div class="desc" style="margin-top:8px">📏 突破後20根內「最多漲到幾R」（MFE）：{mfe_html}</div>
 <div style="overflow-x:auto"><table class="st"><tr><th>出場規則</th><th>範圍</th><th>筆數</th><th>🎯達標</th><th>❌SL</th><th>其他出場</th><th>賺錢比例</th><th>平均R</th><th>總R</th><th>平均持有根數</th><th>未走完</th></tr>{rows}</table></div>
