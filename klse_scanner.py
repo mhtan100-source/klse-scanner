@@ -5314,7 +5314,7 @@ def wy_tracking_html():
     else:
         if bst['status'] == 'error':
             h += f'<p class=note style="color:#ee7373">上次回測出錯：{_h(bst["error"])}</p>'
-        h += (f'<p class=note><a href="/wyckoff_backtest?run=1" onclick="return confirm(\'開始跑威科夫歷史回測？會在背景跑大約10～30分鐘，不影響正常掃描\')">'
+        h += (f'<p class=note><a href="/wyckoff_backtest?run=1" style="{BRIGHT_BTN}" onclick="return confirm(\'開始跑威科夫歷史回測？會在背景跑大約10～30分鐘，不影響正常掃描\')">'
               f'▶ 跑威科夫歷史回測（最近 {WY_BT_DAYS} 個交易日）</a>　<span class=small>可以先加 &amp;limit=50 試50檔</span></p>')
     if bt:
         h += (f'<p class=note>{bt["finished"]} 完成・{bt["symbols"]} 檔・最近 {bt["days"]} 個交易日・'
@@ -5338,6 +5338,16 @@ def wy_tracking_html():
             h += (f'</table></div><p class=note>還沒有 VCP 1D 的回測結果可以對照：到「🧪 C1門檻回測」跑一次 1D（C1 {MIN_DROP_PCT:g}%），這裡就會出現。')
         h += ('差別：VCP 卡片用「突破那根K線的收盤價」進場，威科夫用 Entry 觸價成交；樣本少於 30 筆時參考就好。'
               '過去的結果不代表未來，只供自己研究。</p>')
+        cases = bt.get('cases') or []
+        if cases:
+            icon = {'TP1': '✅', 'SL': '❌', 'TIMEOUT': '⏱'}
+            li = ''.join(
+                f'<div><a href="/stock_bt?symbol={_h(sym_code(c["symbol"]))}&amp;strategy=wy&amp;tf=1D&amp;focus={_h(c.get("trigger_time") or "")}">'
+                f'<b>{_h(sym_code(c["symbol"]))}</b></a> {_nm(c)} ・ {_h((c.get("trigger_time") or "")[:10])} 成交 {fmt_px(c.get("fill"))} → '
+                f'{icon.get(c["result"], c["result"])} <span style="color:{"#4cc28e" if (c.get("r_mult") or 0) > 0 else "#ee7373"}">{(c.get("r_mult") or 0):+.2f}R</span></div>'
+                for c in cases)
+            h += (f'<details><summary class=note>🔍 回測裡的 {len(cases)} 筆交易（點代碼看圖）— 點這裡展開</summary>'
+                  f'<div class=note style="line-height:1.9;max-height:420px;overflow-y:auto">{li}</div></details>')
     return h
 
 load_cards()
@@ -5388,7 +5398,7 @@ HTML = """<!DOCTYPE html>
 </style></head><body>
 <h2>&#x1F1F2;&#x1F1FE; 大馬莊家思維掃描器</h2>
 <div class="subtitle">KLSE股票 · 操盤跟莊（邏輯已對齊 莊家思維 Contraction V53）</div>
-<div class="nav"><a class="nav-on" href="/">📊 C系列總表</a><a href="/cards">🃏 突破卡片</a><a href="/wyckoff">🧱 威科夫突破</a><a href="/backtest">🧪 C1門檻回測</a><a href="/exit_backtest">🚪 出場回測</a></div>
+<div class="nav"><a class="nav-on" href="/">📊 C系列總表</a><a href="/cards">🃏 突破卡片</a><a href="/wyckoff">🧱 威科夫突破</a><a href="/backtest">🧪 C1門檻回測</a><a href="/exit_backtest">🚪 出場回測</a><a href="/stock_bt">🔍 單股回測</a></div>
 SCANNING_BANNER
 <div class="ctrl-bar">
   <button class="btn btn-blue" onclick="startRefresh()" id="refreshBtn">&#x1F504; 重新掃描</button>
@@ -5764,7 +5774,7 @@ def build_cards_html(tf):
 <title>🃏 大馬突破卡片</title><style>{CARDS_CSS}</style></head><body>
 <h2>&#x1F1F2;&#x1F1FE; 大馬莊家思維 ・ 突破卡片</h2>
 <div class="subtitle">BO = 最後一個C高點+緩衝（收盤確認）・ SL = 最後一個C低點−緩衝（天圖1%、時圖0.5%）・ 目標 1:1.5 / 1:2 ・ 至少C2、只看多頭</div>
-<div class="nav"><a href="/">📊 C系列總表</a><a class="nav-on" href="/cards?tf={tf}">🃏 突破卡片</a><a href="/wyckoff">🧱 威科夫突破</a><a href="/backtest">🧪 C1門檻回測</a><a href="/exit_backtest">🚪 出場回測</a></div>
+<div class="nav"><a href="/">📊 C系列總表</a><a class="nav-on" href="/cards?tf={tf}">🃏 突破卡片</a><a href="/wyckoff">🧱 威科夫突破</a><a href="/backtest">🧪 C1門檻回測</a><a href="/exit_backtest">🚪 出場回測</a><a href="/stock_bt">🔍 單股回測</a></div>
 {warn}{banner}
 <div class="tfbar">{tfbar}</div>
 <div class="ctrl"><select id="sec" onchange="f()"><option value="">全部板塊</option>{sector_opts}</select>
@@ -5899,8 +5909,11 @@ def backtest_page():
         recent = ''
         for c in res['configs']:
             items = c['cases'][:15]
+            _cur = c.get('cfg', {}).get('min_drop') == MIN_DROP_PCT
+            _lk = lambda x: (f'<a href="/stock_bt?symbol={_h(sym_code(x["symbol"]))}&amp;strategy=vcp&amp;tf={res["tf"]}&amp;focus={_h(x.get("confirm_time") or "")}" style="color:#7ab3ff">'
+                             f'<b>{_h(sym_code(x["symbol"]))}</b></a>') if _cur else f'<b>{_h(sym_code(x["symbol"]))}</b>'
             li = ''.join(
-                f'<div>{_fmt_time(x["confirm_time"], res["tf"])} <b>{_h(x["symbol"].replace(".KL", ""))}</b> {_h(x.get("name") or "")} '
+                f'<div>{_fmt_time(x["confirm_time"], res["tf"])} {_lk(x)} {_h(x.get("name") or "")} '
                 f'進場{fmt_px(x["entry"])} SL{fmt_px(x["sl"])} → '
                 f'<span class="{"pos" if x["r_mult"] > 0 else "neg"}">{x["result"]} {x["r_mult"]:+.2f}R</span></div>'
                 for x in items)
@@ -5918,7 +5931,7 @@ details{{background:#22223a;border:1px solid #3a3a55;border-radius:6px;padding:8
 summary{{cursor:pointer;color:#ffb74d}} .lst{{font-size:12px;line-height:1.8;margin-top:6px}}</style></head><body>
 <h2>&#x1F1F2;&#x1F1FE; 大馬莊家思維 ・ C1跌幅門檻回測</h2>
 <div class="subtitle">用歷史K線重播突破卡片的完整規則（BO/SL/1:1.5/20根到期），只改C1跌幅門檻，比較哪一種比較好。正式掃描完全不受影響。</div>
-<div class="nav"><a href="/">📊 C系列總表</a><a href="/cards">🃏 突破卡片</a><a href="/wyckoff">🧱 威科夫突破</a><a class="nav-on" href="/backtest">🧪 C1門檻回測</a><a href="/exit_backtest">🚪 出場回測</a></div>
+<div class="nav"><a href="/">📊 C系列總表</a><a href="/cards">🃏 突破卡片</a><a href="/wyckoff">🧱 威科夫突破</a><a class="nav-on" href="/backtest">🧪 C1門檻回測</a><a href="/exit_backtest">🚪 出場回測</a><a href="/stock_bt">🔍 單股回測</a></div>
 {status_html}
 <div class="tfbar">{runbar}</div>
 <div class="tfbar">{tfbar}</div>
@@ -6059,7 +6072,7 @@ def generate_wyckoff_html():
             f'<title>🧱 大馬威科夫</title><style>{CARDS_CSS}{css}{WY_CARD_CSS}</style></head><body>'
             '<h2>&#x1F1F2;&#x1F1FE; 大馬莊家思維 ・ 威科夫：洗盤 → 真突破（日線）</h2>'
             '<div class="nav"><a href="/">📊 C系列總表</a><a href="/cards">🃏 突破卡片</a><a class="nav-on" href="/wyckoff">🧱 威科夫突破</a>'
-            '<a href="/backtest">🧪 C1門檻回測</a><a href="/exit_backtest">🚪 出場回測</a></div>'
+            '<a href="/backtest">🧪 C1門檻回測</a><a href="/exit_backtest">🚪 出場回測</a><a href="/stock_bt">🔍 單股回測</a></div>'
             f'{banner}'
             f'<p class=note>最後更新 {st["last_update"] or "—"}｜跟著C系列掃描一起跑：開市時間每小時一次＋17:40收盤後一次。'
             '階段只用「已收盤」的日K判斷（收盤後才會變）；重點名單／🟠／🟢 在開市時間每小時盯盤，有事推 Telegram。</p>'
@@ -6291,7 +6304,7 @@ details.exs-detail summary{{color:#7ab3ff}}
 @media (max-width:600px){{.exs-row{{flex-direction:column;gap:2px}} .exs-k{{min-width:0}}}}</style></head><body>
 <h2>&#x1F1F2;&#x1F1FE; 大馬莊家思維 ・ 出場規則回測</h2>
 <div class="subtitle">同一批進場（突破卡片規則：收盤站上BO進場、SL在最後一個C低點下方），只換出場方式，看哪一種總R最好。正式掃描完全不受影響。</div>
-<div class="nav"><a href="/">📊 C系列總表</a><a href="/cards">🃏 突破卡片</a><a href="/wyckoff">🧱 威科夫突破</a><a href="/backtest">🧪 C1門檻回測</a><a class="nav-on" href="/exit_backtest">🚪 出場回測</a></div>
+<div class="nav"><a href="/">📊 C系列總表</a><a href="/cards">🃏 突破卡片</a><a href="/wyckoff">🧱 威科夫突破</a><a href="/backtest">🧪 C1門檻回測</a><a class="nav-on" href="/exit_backtest">🚪 出場回測</a><a href="/stock_bt">🔍 單股回測</a></div>
 {status_html}
 <div class="tfbar">{runbar}</div>
 <div class="tfbar">{viewbar}</div>
@@ -6509,6 +6522,281 @@ def debug_c():
         out['next_c_fail_trace'] = []
 
     return Response(_json.dumps(out, indent=2, ensure_ascii=False, default=str), mimetype='application/json')
+
+
+# ============================================================
+# 🔍 單股回測（MH 2026-10-29）：選一檔股票＋策略＋時間框架，在 K 線圖上看每一筆怎麼進、怎麼出
+# 用的是跟「🧪 C1門檻回測」「🧱 威科夫歷史回測」完全同一套程式（同樣的根數、同樣的規則），
+# 所以這裡看到的交易，就是整體回測裡這一檔的那幾筆。
+# ============================================================
+BRIGHT_BTN = ('display:inline-block;background:#ffb300;color:#1a1a2e;font-weight:bold;padding:9px 18px;'
+              'border-radius:6px;text-decoration:none;font-size:14px')
+SB_CACHE = {}           # (symbol, strategy, tf) -> (時間, 結果)，同一檔 30 分鐘內不重算
+SB_CACHE_SEC = 1800
+
+def _sb_chart_time(ts, tf):
+    t = pd.Timestamp(ts)
+    if tf == '1D':
+        return t.strftime('%Y-%m-%d')
+    if t.tzinfo is None:
+        t = t.tz_localize(MKT_TZ)
+    loc = t.tz_convert(MKT_TZ)
+    return int(loc.timestamp() + loc.utcoffset().total_seconds())   # 圖表時間＝當地時間
+
+def _sb_stats(trades):
+    done = [t for t in trades if t.get('result') in ('TP1', 'SL', 'TIMEOUT')]
+    n = len(done); w = sum(1 for t in done if t['result'] == 'TP1'); l = sum(1 for t in done if t['result'] == 'SL')
+    tot = sum(t['r_mult'] for t in done)
+    return {'n': n, 'win': w, 'loss': l, 'timeout': n - w - l,
+            'winrate': (w / (w + l) * 100) if (w + l) else None, 'avg_r': (tot / n) if n else None, 'total_r': tot}
+
+def stock_backtest(sym, strategy, tf):
+    key = (sym, strategy, tf)
+    hit = SB_CACHE.get(key)
+    if hit and time.time() - hit[0] < SB_CACHE_SEC:
+        return hit[1]
+    meta = {'symbol': sym, 'name': NAMES.get(sym, sym_code(sym)), 'sector': SECTORS.get(sym, '其他'), 'tv_symbol': tv_sym(sym)}
+    out = {'symbol': sym, 'strategy': strategy, 'tf': tf, 'meta': meta, 'error': None, 'trades': [], 'others': []}
+    if strategy == 'wy':
+        df = closed_bars(fetch_ohlcv(sym, '1D'), '1D')
+        if len(df) < 250:
+            out['error'] = f'日線資料不夠（只有 {len(df)} 根，至少要 250 根）。'
+            return out
+        dates = [pd.Timestamp(t).strftime('%Y-%m-%d') for t in df.index]
+        bars = cf_bars(df)
+        st = _wy_new_state()
+        start = max(130, len(df) - WY_BT_DAYS)
+        for T in range(start, len(df)):
+            sub = df.iloc[max(0, T - 499):T + 1]
+            r = wy_analyze(sym, sub)
+            stage_fn = lambda sub=sub: STAGE_LABEL_MAP.get(get_stage(sub)[0], '--')
+            wy_track_step(st, sym, dates[:T + 1], bars[:T + 1], r, meta, day_stage_fn=stage_fn)
+        for c in st['done']:
+            (out['trades'] if c.get('result') in ('TP1', 'SL', 'TIMEOUT') else out['others']).append(dict(c))
+        for c in st['active'].values():
+            out['trades'].append(dict(c, result='OPEN'))
+        for c in st['pending'].values():
+            out['others'].append(dict(c, result='PENDING'))
+        out['bars_used'] = len(df) - start
+        chart_df = df.iloc[max(0, start - 60):]
+    else:
+        daily = fetch_ohlcv(sym, '1D')
+        df = daily if tf == '1D' else fetch_ohlcv(sym, tf)
+        if df.empty or len(df) < 300 or daily.empty:
+            out['error'] = f'{tf} 資料不夠（只有 {len(df)} 根，至少要 300 根）。'
+            return out
+        daily_dates = [pd.Timestamp(x).date() for x in daily.index]
+        n = len(df)
+        start = max(260, n - BT_DEFAULT_BARS.get(tf, 500))
+        st = {'pending': {}, 'active': {}, 'done': [], 'used': {}, 'events': []}
+        for t in list(range(start, n, BT_STEP)) + [n]:
+            d = df.iloc[:t]
+            dd = d if tf == '1D' else daily.iloc[:bisect_right(daily_dates, pd.Timestamp(d.index[-1]).date())]
+            _card_step(meta, tf, d, d, analyze(d, dd), backfill=True, st=st)
+        out['trades'] = [dict(c) for c in st['done']] + [dict(c, result='OPEN') for c in st['active'].values()]
+        out['others'] = [dict(c, result='PENDING') for c in st['pending'].values()]
+        out['bars_used'] = n - start
+        chart_df = df.iloc[max(0, start - 60):]
+    tkey = 'trigger_time' if strategy == 'wy' else 'confirm_time'
+    out['trades'].sort(key=lambda c: c.get(tkey) or '')
+    out['stats'] = _sb_stats(out['trades'])
+    out['period'] = (str(chart_df.index[60 if len(chart_df) > 60 else 0])[:10], str(chart_df.index[-1])[:10])
+    out['candles'] = [{'time': _sb_chart_time(i, tf), 'open': round(float(o), 6), 'high': round(float(h), 6),
+                       'low': round(float(l), 6), 'close': round(float(c), 6)}
+                      for i, o, h, l, c in zip(chart_df.index, chart_df['open'], chart_df['high'], chart_df['low'], chart_df['close'])]
+    SB_CACHE[key] = (time.time(), out)
+    return out
+
+def _sb_trade_rows(res):
+    """把每一筆交易整理成：表格一列＋圖上的標記＋點下去要畫的價格線"""
+    tf, wy = res['tf'], res['strategy'] == 'wy'
+    label = {'TP1': '✅ 達 1:1.5', 'SL': '❌ 止損', 'TIMEOUT': f'⏱ {WY_HOLD_DAYS if wy else MAX_HOLD_BARS} 根到期', 'OPEN': '⏳ 還在進行'}
+    rows, js = [], []
+    for i, c in enumerate(res['trades']):
+        t_in = c.get('trigger_time') if wy else c.get('confirm_time')
+        entry = c.get('fill') if wy else c.get('entry')
+        tp = c.get('tp') if wy else c.get('tp1')
+        r = c.get('r_mult')
+        if c['result'] == 'OPEN':
+            px = c.get('last_close') or entry
+            risk = (entry - c['sl']) if entry and c.get('sl') else None
+            r = (px - entry) / risk if risk else None
+        tags = []
+        st = c.get('day_stage') if wy else (f"S{c.get('stage')}" if c.get('stage') else '')
+        if st: tags.append(f'日線{st}')
+        if not wy:
+            if c.get('chase'): tags.append('⚠️不追')
+            if c.get('provisional'): tags.append('⏳低點未確認')
+            if c.get('vol_x') is not None: tags.append(f'量{c["vol_x"]}x')
+        else:
+            if c.get('wall_r') is not None: tags.append(f'上方空間 {c["wall_r"]:.2f}R')
+            else: tags.append('上方藍天')
+            tags.append(f'🟢 {(c.get("created") or "")[5:]}')
+        rows.append({'i': i, 't_in': t_in, 't_out': c.get('end_time'), 'entry': entry, 'sl': c.get('sl'), 'tp': tp,
+                     'bo': c.get('bo'), 'result': label.get(c['result'], c['result']), 'res': c['result'], 'r': r, 'tags': tags})
+        js.append({'i': i, 'in': _sb_chart_time(t_in, tf) if t_in else None,
+                   'out': _sb_chart_time(c['end_time'], tf) if c.get('end_time') else None,
+                   'entry': entry, 'sl': c.get('sl'), 'tp': tp, 'bo': c.get('bo'), 'ceil': c.get('ceiling') if wy else None,
+                   'res': c['result'], 'r': r,
+                   'created': _sb_chart_time(c['created'], tf) if (wy and c.get('created')) else None})
+    return rows, js
+
+SB_CSS = """
+.sbform{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:4px 0 14px}
+.sbform input,.sbform select{background:#2a2a3e;color:#fff;border:1px solid #444;padding:9px 12px;border-radius:6px;font-size:14px;font-family:monospace}
+.sbform input{width:170px}
+.sbform button{background:#ffb300;color:#1a1a2e;border:none;font-weight:bold;padding:10px 20px;border-radius:6px;font-size:14px;cursor:pointer;font-family:monospace}
+.sbsum{background:#22223a;border:1px solid #3a3a55;border-radius:8px;padding:12px 16px;max-width:1150px;margin-bottom:12px;line-height:1.7}
+.sbsum b{color:#fff} .pos{color:#4cc28e} .neg{color:#ee7373} .muted{color:#8b949e}
+#sbchart{width:100%;max-width:1150px;height:440px;border:1px solid #3a3a55;border-radius:8px}
+table.sbt{border-collapse:collapse;font-size:13px;margin-top:12px;max-width:1150px;width:100%}
+table.sbt th,table.sbt td{border:1px solid #444;padding:6px 8px;text-align:center}
+table.sbt th{background:#26264a;color:#fff} table.sbt tr.tr{cursor:pointer} table.sbt tr.tr:hover{background:#2a2a48}
+table.sbt tr.sel{background:#3a2f10} table.sbt td.l{text-align:left}
+.sbtag{display:inline-block;border:1px solid #555;color:#bbb;font-size:11px;padding:0 5px;border-radius:4px;margin:1px}
+.sbleg{font-size:12px;color:#aab;margin:6px 0;max-width:1150px;line-height:1.7}
+"""
+
+def build_stock_bt_html(sym_raw, strategy, tf, focus):
+    tfs = [t for t in CARD_TFS] or ['1D']
+    strategy = strategy if strategy in ('vcp', 'wy') else 'wy'
+    tf = '1D' if strategy == 'wy' else (tf if tf in tfs else tfs[0])
+    opts = ''.join(f'<option value="{_h(sym_code(x))}">{_h(NAMES.get(x, ""))}</option>' for x in dict.fromkeys(SYMBOLS))
+    tf_opts = ''.join(f'<option value="{t}"{" selected" if t == tf else ""}>{t}</option>' for t in tfs)
+    nav = ('<div class="nav"><a href="/">📊 C系列總表</a><a href="/cards">🃏 突破卡片</a><a href="/wyckoff">🧱 威科夫突破</a>'
+           '<a href="/backtest">🧪 C1門檻回測</a><a href="/exit_backtest">🚪 出場回測</a><a class="nav-on" href="/stock_bt">🔍 單股回測</a></div>')
+    form = (f'<form class="sbform" method="get" action="/stock_bt">'
+            f'<input name="symbol" list="sbsyms" placeholder="股票代碼，例：{_h(sym_code(M["default_sym"]))}" value="{_h(sym_raw)}" autocomplete="off">'
+            f'<datalist id="sbsyms">{opts}</datalist>'
+            f'<select name="strategy" id="sbstrat" onchange="document.getElementById(\'sbtf\').disabled=this.value===\'wy\'">'
+            f'<option value="wy"{" selected" if strategy == "wy" else ""}>🧱 威科夫 🟢（日線）</option>'
+            f'<option value="vcp"{" selected" if strategy == "vcp" else ""}>🃏 VCP 突破卡片</option></select>'
+            f'<select name="tf" id="sbtf"{" disabled" if strategy == "wy" else ""}>{tf_opts}</select>'
+            f'<button type="submit">▶ 跑回測</button></form>')
+    head = (f'<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+            f'<title>🔍 單股回測</title><style>{CARDS_CSS}{SB_CSS}</style></head><body>'
+            f'<h2>&#x1F1F2;&#x1F1FE; 大馬莊家思維 ・ 單股回測</h2>'
+            f'<div class="subtitle">選一檔股票，在 K 線圖上看每一筆交易怎麼進、怎麼出。用的是跟整體回測完全同一套規則，只是只看這一檔。</div>'
+            f'{nav}{form}')
+    if not sym_raw:
+        return head + ('<div class="sbsum">輸入股票代碼、選策略，按 <b>▶ 跑回測</b>。<br>'
+                       '<span class="muted">也可以從「🧱 威科夫突破」頁最下面、或「🧪 C1門檻回測」的抽查案例，直接點代碼進來。</span><br><br>'
+                       '<b>小提醒：</b>一檔股票兩年通常只有幾筆交易，這頁是用來<b>看懂</b>系統怎麼交易的；'
+                       '規則好不好，要看整體回測幾百筆的結果，不要用一兩檔的結果去改規則（overfitting）。</div></body></html>')
+    sym = norm_sym(sym_raw)
+    try:
+        res = stock_backtest(sym, strategy, tf)
+    except Exception as e:
+        log.warning(f"🔍 單股回測 {sym}: {e}")
+        return head + f'<div class="sbsum neg">回測出錯：{_h(e)}</div></body></html>'
+    if res.get('error'):
+        return head + f'<div class="sbsum">{_h(sym_code(sym))}：{_h(res["error"])}<br><span class="muted">代碼對嗎？可以用搜尋框的下拉選單挑。</span></div></body></html>'
+    meta, s, wy = res['meta'], res['stats'], strategy == 'wy'
+    rows, js = _sb_trade_rows(res)
+    code = sym_code(sym)
+    nm = '' if meta['name'] == code else f' {_h(meta["name"])}'
+    wr = f'{s["winrate"]:.0f}%' if s['winrate'] is not None else '-'
+    ar = f'{s["avg_r"]:+.2f}R' if s['avg_r'] is not None else '-'
+    tv = f"{tv_chart_base()}?symbol={tv_sym(sym)}&interval={TV_INTERVAL.get(tf, 'D')}"
+    strat_name = '🧱 威科夫 🟢' if wy else f'🃏 VCP 突破卡片（C1 {MIN_DROP_PCT:g}%）'
+    if s['n']:
+        verdict = (f'這一檔有 <b>{s["n"]}</b> 筆有結果的交易：✅ {s["win"]}、❌ {s["loss"]}、⏱ {s["timeout"]}，'
+                   f'勝率 <b>{wr}</b>、平均 <b>{ar}</b>、總共 <b class="{"pos" if s["total_r"] > 0 else "neg"}">{s["total_r"]:+.1f}R</b>。')
+    else:
+        verdict = '這段期間<b>沒有</b>完成的交易。'
+    if wy:
+        cnt = {k: sum(1 for c in res['others'] if c.get('result') == k) for k in ('NOFILL', 'CANCEL', 'CHASE', 'PENDING')}
+        extra = (f'<br><span class="muted">不算勝負的 🟢：沒觸發 {cnt["NOFILL"]}、觸發前就破 SL（作廢）{cnt["CANCEL"]}、現價已過 Entry 沒追 {cnt["CHASE"]}、'
+                 f'還在等觸發 {cnt["PENDING"]}。這些在圖上用灰色 G 標出 🟢 出現的日子。</span>')
+        rules = (f'規則：🟢 出現後 {WY_TRIGGER_DAYS} 天內價格碰到 Entry 才成交（跳空就用開盤價）；成交後先碰 SL ＝ −1R、'
+                 f'先到 1:{WY_TP_R:g} ＝ +{WY_TP_R:g}R、{WY_HOLD_DAYS} 天都沒碰到 ＝ 到期。')
+    else:
+        extra = (f'<br><span class="muted">回測結束時還在等突破的形態：{len(res["others"])} 個。</span>' if res['others'] else '')
+        rules = (f'規則：最後一個 C 的高點＋緩衝＝BO，K 線<b>收盤</b>站上 BO 才進場（用收盤價）；SL＝最後一個 C 低點−緩衝；'
+                 f'先碰 SL ＝ −1R、先到 1:1.5 ＝ +1.5R、{MAX_HOLD_BARS} 根都沒碰到 ＝ 到期。確認價高於 BO 超過 {CHASE_MAX_PCT:.0f}% 標 ⚠️不追。')
+    summ = (f'<div class="sbsum"><b style="font-size:17px"><a href="{tv}" target="_blank" style="color:#fff">{_h(code)}</a></b>{nm}'
+            f'　<span class="muted">{_h(meta.get("sector") or "")}・{strat_name}・{tf}・{res["period"][0]} ～ {res["period"][1]}（最近 {res["bars_used"]} 根）</span><br>'
+            f'{verdict}{extra}<br><span class="muted">{rules}</span></div>')
+    trs = ''
+    for r in rows:
+        rcls = 'pos' if (r['r'] or 0) > 0 else ('neg' if (r['r'] or 0) < 0 else '')
+        rtxt = f'{r["r"]:+.2f}R' if r['r'] is not None else '-'
+        trs += (f'<tr class="tr" data-i="{r["i"]}" onclick="pick({r["i"]})"><td>{r["i"] + 1}</td>'
+                f'<td>{_fmt_time(r["t_in"], tf)}</td><td>{fmt_px(r["entry"])}</td><td>{fmt_px(r["sl"])}</td><td>{fmt_px(r["tp"])}</td>'
+                f'<td>{r["result"]}</td><td>{_fmt_time(r["t_out"], tf) if r["t_out"] else "-"}</td><td class="{rcls}"><b>{rtxt}</b></td>'
+                f'<td class="l">{"".join(f"<span class=sbtag>{_h(t)}</span>" for t in r["tags"])}</td></tr>')
+    table = ('<table class="sbt"><tr><th>#</th><th>進場</th><th>進場價</th><th>SL</th><th>1:1.5</th><th>結果</th><th>出場</th><th>R</th><th>標籤</th></tr>'
+             + (trs or '<tr><td colspan="9" class="muted">沒有交易</td></tr>') + '</table>')
+    focus_i = -1
+    if focus:
+        f0 = str(focus)[:16]
+        for r in rows:
+            if (r['t_in'] or '')[:16] == f0 or (r['t_in'] or '')[:10] == f0[:10]:
+                focus_i = r['i']; break
+    others_js = [{'t': _sb_chart_time(c['created'], tf)} for c in res['others'] if wy and c.get('created')]
+    legend = ('<div class="sbleg">圖上標記：<b style="color:#42a5f5">▲ 進</b> 進場 ・ <b style="color:#4cc28e">● +1.5R</b> 達標 ・ '
+              '<b style="color:#ee7373">▼ −1R</b> 止損 ・ <b style="color:#aaa">■ 到期</b>'
+              + (' ・ <b style="color:#4cc28e">G</b> 🟢 出現的日子（灰色 G＝沒成交）' if wy else '') +
+              '。<b>點下面表格的任何一列</b>，圖會跳到那一筆，並畫出進場（藍）、SL（紅）、1:1.5（綠）' + ('、天花板（黃）' if wy else '、BO（黃）') + '的線。</div>')
+    payload = json.dumps({'candles': res['candles'], 'trades': js, 'others': others_js, 'focus': focus_i, 'wy': wy, 'intraday': tf != '1D'})
+    script = """
+<script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+<script>
+var D = """ + payload + """;
+var lines = [], chart = null, series = null;
+function pick(i){
+  document.querySelectorAll('tr.tr').forEach(function(r){ r.classList.toggle('sel', +r.dataset.i === i); });
+  if(!series) return;
+  lines.forEach(function(l){ series.removePriceLine(l); }); lines = [];
+  var t = D.trades[i]; if(!t) return;
+  function pl(p, c, title){ if(p){ lines.push(series.createPriceLine({price:p, color:c, lineWidth:1, lineStyle:2, axisLabelVisible:true, title:title})); } }
+  pl(t.entry, '#42a5f5', '進場'); pl(t.sl, '#ee7373', 'SL'); pl(t.tp, '#4cc28e', '1:1.5');
+  pl(t.wy ? null : t.bo, '#ffb300', 'BO'); pl(t.ceil, '#ffb300', '天花板');
+  var idx = D.candles.findIndex(function(c){ return c.time === t.in; });
+  var j = D.candles.findIndex(function(c){ return c.time === (t.out || t.in); });
+  if(idx >= 0){ chart.timeScale().setVisibleLogicalRange({from: Math.max(0, idx - 45), to: Math.min(D.candles.length + 5, (j >= 0 ? j : idx) + 20)}); }
+  var row = document.querySelector('tr.tr[data-i="' + i + '"]'); if(row && D.focus === i){ row.scrollIntoView({block:'center'}); }
+}
+(function(){
+  var el = document.getElementById('sbchart');
+  if(!window.LightweightCharts){ el.innerHTML = '<div style="padding:20px;color:#aab">圖表載入失敗（網路擋住了圖表程式），下面的交易表照樣可以用。</div>'; return; }
+  chart = LightweightCharts.createChart(el, {layout:{background:{color:'#1a1a2e'}, textColor:'#ccc'},
+    grid:{vertLines:{color:'#26264a'}, horzLines:{color:'#26264a'}}, rightPriceScale:{borderColor:'#3a3a55'},
+    timeScale:{borderColor:'#3a3a55', timeVisible: D.intraday, secondsVisible:false}, crosshair:{mode:0}});
+  series = chart.addCandlestickSeries({upColor:'#26a69a', downColor:'#ef5350', borderVisible:false, wickUpColor:'#26a69a', wickDownColor:'#ef5350'});
+  series.setData(D.candles);
+  var mk = [];
+  D.others.forEach(function(o){ mk.push({time:o.t, position:'belowBar', color:'#777', shape:'circle', text:'G'}); });
+  D.trades.forEach(function(t){
+    if(t.created){ mk.push({time:t.created, position:'belowBar', color:'#4cc28e', shape:'circle', text:'G'}); }
+    if(t.in){ mk.push({time:t.in, position:'belowBar', color:'#42a5f5', shape:'arrowUp', text:'進' + (t.i + 1)}); }
+    if(t.out){
+      var r = t.res === 'TP1' ? {position:'aboveBar', color:'#4cc28e', shape:'circle', text:'+1.5R'}
+            : t.res === 'SL' ? {position:'aboveBar', color:'#ee7373', shape:'arrowDown', text:'-1R'}
+            : {position:'aboveBar', color:'#aaa', shape:'square', text:(t.r >= 0 ? '+' : '') + (t.r || 0).toFixed(2) + 'R'};
+      r.time = t.out; mk.push(r);
+    }
+  });
+  mk.sort(function(a, b){ return a.time < b.time ? -1 : (a.time > b.time ? 1 : 0); });
+  series.setMarkers(mk);
+  D.trades.forEach(function(t){ t.wy = D.wy; });
+  window.addEventListener('resize', function(){ chart.applyOptions({width: el.clientWidth}); });
+  if(D.focus >= 0){ pick(D.focus); } else { chart.timeScale().fitContent(); }
+})();
+</script>"""
+    return (head + summ + '<div id="sbchart"></div>' + legend + table +
+            '<div class="foot">只供自己研究：照規則自動計算，不是投資建議；一檔股票的幾筆交易樣本太少，不要拿來改規則。</div>'
+            + script + '</body></html>')
+
+@app.route('/stock_bt')
+def stock_bt_page():
+    try:
+        return Response(build_stock_bt_html(request.args.get('symbol', '').strip(), request.args.get('strategy', 'wy'),
+                                            request.args.get('tf', '1D').upper(), request.args.get('focus', '')),
+                        mimetype='text/html')
+    except Exception as e:
+        log.error(f"🔍 stock_bt error: {e}")
+        return f"<html><body style='background:#1a1a2e;color:#eee;font-family:monospace;padding:40px'>🔍 單股回測錯誤：{_h(e)}</body></html>", 200
 
 @app.route('/debug_missing')
 def debug_missing():
