@@ -3497,11 +3497,12 @@ def _setup_from_analysis(df, res, tf='1D'):
         'last_checked': _iso(df.index[max(lb, n - 3)]),
     }
 
-def _open_case(key, meta, tf, p, dfc, i, backfill, st):
-    entry = float(dfc['close'].values[i])
+def _open_case(key, meta, tf, p, dfc, i, backfill, st, entry=None):
+    # entry=None → 收盤確認（正式卡片）：用收盤價；掛單模式（只有⚖️進場比較回測用）會傳入成交價
+    entry = float(dfc['close'].values[i]) if entry is None else float(entry)
     sl = p['sl']
     r = entry - sl
-    if r <= 0: return
+    if r <= 0: return None
     tp1, tp2 = calc_targets(entry, sl)
     atr = _atr14(dfc, i)                                   # 只記錄參考，不再用來判斷「不追」
     chase = entry > p['bo'] * (1 + CHASE_MAX_PCT / 100)
@@ -3515,19 +3516,31 @@ def _open_case(key, meta, tf, p, dfc, i, backfill, st):
         'confirm_time': _iso(dfc.index[i]), 'last_checked': _iso(dfc.index[i]),
         'bars_held': 0, 'last_close': entry, 'vol_x': _vol_ratio(dfc, i),
         'atr': atr, 'chase': bool(chase), 'backfill': bool(backfill),
+        'close_ok': bool(float(dfc['close'].values[i]) >= p['bo']),   # 進場那根收盤有沒有站上BO
     })
     st['active'][cid] = case
     st['used'][cid] = case['confirm_time']
     if not backfill:
         st.get('events', card_events).append(('open', case))
+    return case
 
 def _check_pending(key, meta, tf, dfc, backfill, st):
     p = st['pending'].get(key)
     if not p: return
     pos = _positions_after(dfc, p['last_checked'])
     closes = dfc['close'].values; lows = dfc['low'].values
+    touch = st.get('entry_mode') == 'touch'   # 'touch' = 盤中碰到BO就成交（只有⚖️進場比較回測用）；正式卡片沒有這個key → 收盤確認
+    if touch:
+        opens = dfc['open'].values; highs = dfc['high'].values
     for i in pos:
-        if closes[i] >= p['bo']:
+        if touch and highs[i] >= p['bo']:
+            st['pending'].pop(key, None)
+            fill = max(float(opens[i]), p['bo'])          # 跳空高開在BO上面 → 用開盤價成交
+            case = _open_case(key, meta, tf, p, dfc, i, backfill, st, entry=fill)
+            if case is not None and lows[i] <= p['sl']:   # 同一根又跌到SL（先後不明）→ 保守算止損
+                _finish(case, 'SL', -1.0, dfc.index[i], backfill, st)
+            return
+        if not touch and closes[i] >= p['bo']:
             st['pending'].pop(key, None)
             _open_case(key, meta, tf, p, dfc, i, backfill, st)
             return
@@ -3715,7 +3728,7 @@ def _bt_agg(cases):
 
 def run_c1_backtest(tf='1D', bars=None, limit=None):
     with bt_state['lock']:
-        if bt_state['status'] == 'running' or ex_state['status'] == 'running':   # 一次只跑一個回測
+        if bt_state['status'] == 'running' or ex_state['status'] == 'running' or en_state['status'] == 'running':   # 一次只跑一個回測
             return
         bt_state.update({'status': 'running', 'tf': tf, 'done': 0, 'error': None, 'results': None,
                          'started': datetime.now(MY_TZ).strftime('%Y-%m-%d %H:%M'), 'finished': None})
@@ -3972,7 +3985,7 @@ def compute_entry_factors(ent_rows, results, has_bench):
 
 def run_exit_backtest(tf='1D', c1=10, bars=None, limit=None):
     with ex_state['lock']:
-        if ex_state['status'] == 'running' or bt_state['status'] == 'running':
+        if ex_state['status'] == 'running' or bt_state['status'] == 'running' or en_state['status'] == 'running':
             return
         ex_state.update({'status': 'running', 'tf': tf, 'c1': c1, 'done': 0, 'error': None, 'finished': None,
                          'started': datetime.now(MY_TZ).strftime('%Y-%m-%d %H:%M')})
@@ -4074,6 +4087,173 @@ def load_ex_result(tf, c1):
             return json.load(f)
     except Exception:
         return None
+
+# ============================================================
+# ⚖️ 進場方式比較回測（MH 2026-10-30）：同一批C系列形態，比較兩種進場
+#   A 盤中掛單：盤中最高價碰到BO就成交（成交價=BO；跳空高開用開盤價）← 老師SOP／老師SCV網站的算法
+#   B 收盤確認：收盤站上BO才進場（進場價=當天收盤）← 我們突破卡片現在的算法
+# SL、1:1.5目標、20根到期，全部跟突破卡片一樣；只換進場方式。正式掃描完全不受影響。
+# 拆解：A − B ＝（同一個形態兩邊都進場：掛單價格比較好多賺的）＋（只有A進場的假突破：盤中衝過、收盤沒站上）
+# ============================================================
+EN_CASE_KEYS = ('id', 'symbol', 'name', 'confirm_time', 'end_time', 'entry', 'bo', 'sl', 'result', 'r_mult',
+                'stage', 'chase', 'close_ok', 'bars_held')
+en_state = {'status': 'idle', 'tf': None, 'done': 0, 'total': 0, 'started': None, 'finished': None,
+            'error': None, 'lock': threading.Lock()}
+EN_RISK_MONEY = float(menv('EN_RISK_MONEY', '100'))   # 結論卡「每筆冒多少錢」的示範金額
+
+def _en_file(tf):
+    return os.path.join(DATA_DIR, f'entry_bt_{tf}.json')
+
+def _en_agg(cases):
+    n = len(cases)
+    if not n:
+        return {'n': 0, 'win': 0, 'loss': 0, 'timeout': 0, 'winrate': None, 'avg_r': None, 'total_r': 0.0}
+    w = sum(1 for d in cases if d['result'] == 'TP1')
+    l = sum(1 for d in cases if d['result'] == 'SL')
+    tot = sum(d['r_mult'] for d in cases)
+    return {'n': n, 'win': w, 'loss': l, 'timeout': n - w - l,
+            'winrate': round(w / n * 100, 1), 'avg_r': round(tot / n, 3), 'total_r': round(tot, 1)}
+
+def _en_block(a_cases, b_cases, b_open_ids):
+    """一組（全部／只看S2）的完整比較數字"""
+    b_by = {c['id']: c for c in b_cases}
+    paired_a = [c for c in a_cases if c['id'] in b_by]
+    paired_b = [b_by[c['id']] for c in paired_a]
+    a_only = [c for c in a_cases if c['id'] not in b_by and c['id'] not in b_open_ids]
+    a_ids = {c['id'] for c in a_cases}
+    b_only = [c for c in b_cases if c['id'] not in a_ids]
+    return {
+        'A': _en_agg(a_cases), 'B': _en_agg(b_cases),
+        'A_closeok': _en_agg([c for c in a_cases if c.get('close_ok')]),
+        'A_fake': _en_agg([c for c in a_cases if not c.get('close_ok')]),
+        'paired_A': _en_agg(paired_a), 'paired_B': _en_agg(paired_b),
+        'A_only': _en_agg(a_only), 'B_only': _en_agg(b_only),
+    }
+
+def run_entry_backtest(tf='1D', bars=None, limit=None):
+    with en_state['lock']:
+        if en_state['status'] == 'running' or bt_state['status'] == 'running' or ex_state['status'] == 'running':
+            return
+        en_state.update({'status': 'running', 'tf': tf, 'done': 0, 'error': None, 'finished': None,
+                         'started': datetime.now(MY_TZ).strftime('%Y-%m-%d %H:%M')})
+    bars = bars or BT_DEFAULT_BARS.get(tf, 500)
+    seen = set()
+    syms = [s for s in SYMBOLS if s not in seen and not seen.add(s)]
+    if limit: syms = syms[:limit]
+    en_state['total'] = len(syms)
+    all_a, all_b, open_a, open_b = [], [], 0, 0
+    b_open_ids = set()
+    first_date = last_date = None
+    try:
+        for si, sym in enumerate(syms):
+            meta = {'symbol': sym, 'name': NAMES.get(sym, sym_code(sym)),
+                    'sector': SECTORS.get(sym, '其他'), 'tv_symbol': tv_sym(sym)}
+            try:
+                daily = fetch_ohlcv(sym, '1D')
+                df = daily if tf == '1D' else fetch_ohlcv(sym, tf)
+                if df.empty or len(df) < 300 or daily.empty:
+                    continue
+                df = closed_bars(df, tf); daily = closed_bars(daily, '1D')   # 只用已收盤的K線
+                daily_dates = [pd.Timestamp(x).date() for x in daily.index]
+                n = len(df)
+                start = max(260, n - bars)
+                d0 = str(df.index[start])[:10]; d1 = str(df.index[-1])[:10]
+                first_date = d0 if first_date is None or d0 < first_date else first_date
+                last_date = d1 if last_date is None or d1 > last_date else last_date
+                stA = {'pending': {}, 'active': {}, 'done': [], 'used': {}, 'events': [], 'entry_mode': 'touch'}
+                stB = {'pending': {}, 'active': {}, 'done': [], 'used': {}, 'events': []}
+                for t in list(range(start, n, BT_STEP)) + [n]:
+                    d = df.iloc[:t]
+                    dd = d if tf == '1D' else daily.iloc[:bisect_right(daily_dates, pd.Timestamp(d.index[-1]).date())]
+                    res = analyze(d, dd)        # 同一次分析給A、B用 → 兩邊看到的形態完全一樣
+                    _card_step(meta, tf, d, d, res, backfill=True, st=stA)
+                    _card_step(meta, tf, d, d, res, backfill=True, st=stB)
+                all_a.extend({k: c.get(k) for k in EN_CASE_KEYS} for c in stA['done'])
+                all_b.extend({k: c.get(k) for k in EN_CASE_KEYS} for c in stB['done'])
+                open_a += len(stA['active']); open_b += len(stB['active'])
+                b_open_ids.update(stB['active'].keys())
+            except Exception as ex:
+                log.warning(f"⚖️ entry backtest {sym}: {ex}")
+            en_state['done'] = si + 1
+            time.sleep(0.2)
+
+        results = {'tf': tf, 'bars': bars, 'symbols': len(syms), 'c1': MIN_DROP_PCT,
+                   'period': [first_date, last_date], 'open_a': open_a, 'open_b': open_b,
+                   'finished': datetime.now(MY_TZ).strftime('%Y-%m-%d %H:%M'),
+                   'all': _en_block(all_a, all_b, b_open_ids),
+                   's2': _en_block([c for c in all_a if c.get('stage') == 2],
+                                   [c for c in all_b if c.get('stage') == 2], b_open_ids),
+                   'fake_cases': sorted([c for c in all_a if not c.get('close_ok')],
+                                        key=lambda c: c.get('confirm_time') or '', reverse=True)[:20],
+                   'cases_a': sorted(all_a, key=lambda c: c.get('confirm_time') or '', reverse=True)[:20],
+                   'cases_b': sorted(all_b, key=lambda c: c.get('confirm_time') or '', reverse=True)[:20]}
+        with open(_en_file(tf), 'w', encoding='utf-8') as f:
+            json.dump(results, f, ensure_ascii=False, default=str)
+        with en_state['lock']:
+            en_state.update({'status': 'done', 'finished': results['finished']})
+        log.info(f"⚖️ 進場比較回測完成 {tf}：A {len(all_a)}筆 / B {len(all_b)}筆")
+    except Exception as ex:
+        log.error(f"⚖️ entry backtest error: {ex}")
+        with en_state['lock']:
+            en_state.update({'status': 'error', 'error': str(ex)})
+
+def load_en_result(tf):
+    try:
+        with open(_en_file(tf), 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def _en_r(v):
+    return f'{v:+.2f}R' if v is not None else '-'
+
+def entry_summary_html(res, blk_key='all'):
+    """📋 一眼看懂：A掛單 vs B收盤確認"""
+    b = res[blk_key]
+    A, B = b['A'], b['B']
+    if not A['n'] or not B['n']:
+        return '<div class="exs"><div class="exs-title">📋 一眼看懂</div><div class="exs-v">筆數不夠，沒辦法比較。</div></div>'
+    pa, pb, fk, ao = b['paired_A'], b['paired_B'], b['A_fake'], b['A_only']
+    money = lambda r: f'RM{r * EN_RISK_MONEY:+,.0f}'
+    win_total = 'A 盤中掛單' if A['total_r'] > B['total_r'] else ('B 收盤確認' if B['total_r'] > A['total_r'] else '打平')
+    win_avg = 'A' if (A['avg_r'] or 0) > (B['avg_r'] or 0) else 'B'
+    nmin = min(A['n'], B['n'])
+    trust = '🔴 低（不到30筆，先當參考）' if nmin < 30 else ('🟡 中（30～100筆）' if nmin < 100 else '🟢 高（100筆以上）')
+    diff = round(A['total_r'] - B['total_r'], 1)
+    price_gain = round(pa['total_r'] - pb['total_r'], 1) if pa['n'] else 0.0
+    fake_cost = ao['total_r'] if ao['n'] else 0.0
+    fake_pct = round(fk['n'] / A['n'] * 100) if A['n'] else 0
+
+    if A['total_r'] > B['total_r'] and (A['avg_r'] or 0) >= (B['avg_r'] or 0):
+        tip = ('<b>掛單（A）比較好</b>：價格優勢大過假突破的損失。照老師SOP在BO掛單就對了；'
+               '卡片的「收盤確認」只當作「突破有沒有站穩」的參考，不用等收盤才買。')
+    elif B['total_r'] > A['total_r'] and (B['avg_r'] or 0) >= (A['avg_r'] or 0):
+        tip = ('<b>收盤確認（B）比較好</b>：假突破虧的錢大過掛單的價格優勢。可以考慮改成：'
+               '收盤前（16:30～17:00）確認站上BO才買，不在盤中掛單。')
+    elif A['total_r'] > B['total_r']:
+        tip = ('<b>A 總賺比較多、但每筆平均比較差</b>：A 是靠交易次數多（多了假突破那些單）。'
+               '如果你在意每一筆的品質，或資金有限一次只能做幾筆，B 比較穩。')
+    else:
+        tip = ('<b>B 總賺比較多、但每筆平均比較差</b>：兩種差不多，選你比較能執行的那一種。'
+               '上班沒辦法盯盤 → 掛單（A）；收盤前可以看一眼 → 收盤確認（B）。')
+    if nmin < 30:
+        tip += ' 不過筆數還少，結論可能會變。'
+
+    return f'''<div class="exs"><div class="exs-title">📋 一眼看懂：A 盤中掛單 vs B 收盤確認</div>
+<div class="exs-row"><div class="exs-k">總評</div><div class="exs-v">總賺比較多：<b>{win_total}</b>（差 {abs(diff):.1f}R）・每筆平均比較好：<b>{win_avg}</b>
+<div class="exs-sub">假設每筆冒 RM{EN_RISK_MONEY:,.0f} 風險：A 共 {money(A["total_r"])}（{A["n"]}筆），B 共 {money(B["total_r"])}（{B["n"]}筆）</div></div></div>
+<div class="exs-row"><div class="exs-k">A 盤中掛單</div><div class="exs-v">{A["n"]}筆・達1:1.5 {A["win"]}・止損 {A["loss"]}・到期 {A["timeout"]}・達標率 {A["winrate"]:.0f}%・平均 <b>{_en_r(A["avg_r"])}</b>・總 <b>{A["total_r"]:+.1f}R</b></div></div>
+<div class="exs-row"><div class="exs-k">B 收盤確認</div><div class="exs-v">{B["n"]}筆・達1:1.5 {B["win"]}・止損 {B["loss"]}・到期 {B["timeout"]}・達標率 {B["winrate"]:.0f}%・平均 <b>{_en_r(B["avg_r"])}</b>・總 <b>{B["total_r"]:+.1f}R</b></div></div>
+<div class="exs-row"><div class="exs-k">差在哪裡</div><div class="exs-v">
+<ul class="exs-ul">
+<li>同一個形態兩邊都進場（{pa["n"]}筆）：A 平均 {_en_r(pa["avg_r"])}，B 平均 {_en_r(pb["avg_r"])} → 掛單價格比較好，A 多賺 <b>{price_gain:+.1f}R</b></li>
+<li>只有 A 進場（盤中衝過BO、之後一直沒收盤站上，B 沒買）{ao["n"]}筆：平均 {_en_r(ao["avg_r"])} → 這些單 A 共 <b>{fake_cost:+.1f}R</b></li>
+<li>A − B ≈ {price_gain:+.1f} ＋ ({fake_cost:+.1f}) ＝ <b>{diff:+.1f}R</b></li>
+</ul></div></div>
+<div class="exs-row"><div class="exs-k">假突破</div><div class="exs-v">A 的 {A["n"]} 筆裡，<b>{fk["n"]}筆（{fake_pct}%）</b>進場當天收盤沒站上BO：平均 {_en_r(fk["avg_r"])}・達標率 {f'{fk["winrate"]:.0f}%' if fk["winrate"] is not None else '-'}
+<div class="exs-sub">對照：當天收盤有站上BO的 {b["A_closeok"]["n"]} 筆，平均 {_en_r(b["A_closeok"]["avg_r"])}</div></div></div>
+<div class="exs-row"><div class="exs-k">可信度</div><div class="exs-v">{trust}</div></div>
+<div class="exs-tip">💡 {tip}</div></div>'''
 
 # ============================================================
 # 📋 出場回測「一眼看懂」結論卡（MH 2026-10-28）：程式自動評分＋寫建議，詳細表格摺疊在下面
@@ -5398,7 +5578,7 @@ HTML = """<!DOCTYPE html>
 </style></head><body>
 <h2>&#x1F1F2;&#x1F1FE; 大馬莊家思維掃描器</h2>
 <div class="subtitle">KLSE股票 · 操盤跟莊（邏輯已對齊 莊家思維 Contraction V53）</div>
-<div class="nav"><a class="nav-on" href="/">📊 C系列總表</a><a href="/cards">🃏 突破卡片</a><a href="/wyckoff">🧱 威科夫突破</a><a href="/backtest">🧪 C1門檻回測</a><a href="/exit_backtest">🚪 出場回測</a><a href="/stock_bt">🔍 單股回測</a></div>
+<div class="nav"><a class="nav-on" href="/">📊 C系列總表</a><a href="/cards">🃏 突破卡片</a><a href="/wyckoff">🧱 威科夫突破</a><a href="/backtest">🧪 C1門檻回測</a><a href="/exit_backtest">🚪 出場回測</a><a href="/entry_backtest">⚖️ 進場比較</a><a href="/stock_bt">🔍 單股回測</a></div>
 SCANNING_BANNER
 <div class="ctrl-bar">
   <button class="btn btn-blue" onclick="startRefresh()" id="refreshBtn">&#x1F504; 重新掃描</button>
@@ -5774,7 +5954,7 @@ def build_cards_html(tf):
 <title>🃏 大馬突破卡片</title><style>{CARDS_CSS}</style></head><body>
 <h2>&#x1F1F2;&#x1F1FE; 大馬莊家思維 ・ 突破卡片</h2>
 <div class="subtitle">BO = 最後一個C高點+緩衝（收盤確認）・ SL = 最後一個C低點−緩衝（天圖1%、時圖0.5%）・ 目標 1:1.5 / 1:2 ・ 至少C2、只看多頭</div>
-<div class="nav"><a href="/">📊 C系列總表</a><a class="nav-on" href="/cards?tf={tf}">🃏 突破卡片</a><a href="/wyckoff">🧱 威科夫突破</a><a href="/backtest">🧪 C1門檻回測</a><a href="/exit_backtest">🚪 出場回測</a><a href="/stock_bt">🔍 單股回測</a></div>
+<div class="nav"><a href="/">📊 C系列總表</a><a class="nav-on" href="/cards?tf={tf}">🃏 突破卡片</a><a href="/wyckoff">🧱 威科夫突破</a><a href="/backtest">🧪 C1門檻回測</a><a href="/exit_backtest">🚪 出場回測</a><a href="/entry_backtest">⚖️ 進場比較</a><a href="/stock_bt">🔍 單股回測</a></div>
 {warn}{banner}
 <div class="tfbar">{tfbar}</div>
 <div class="ctrl"><select id="sec" onchange="f()"><option value="">全部板塊</option>{sector_opts}</select>
@@ -5931,7 +6111,7 @@ details{{background:#22223a;border:1px solid #3a3a55;border-radius:6px;padding:8
 summary{{cursor:pointer;color:#ffb74d}} .lst{{font-size:12px;line-height:1.8;margin-top:6px}}</style></head><body>
 <h2>&#x1F1F2;&#x1F1FE; 大馬莊家思維 ・ C1跌幅門檻回測</h2>
 <div class="subtitle">用歷史K線重播突破卡片的完整規則（BO/SL/1:1.5/20根到期），只改C1跌幅門檻，比較哪一種比較好。正式掃描完全不受影響。</div>
-<div class="nav"><a href="/">📊 C系列總表</a><a href="/cards">🃏 突破卡片</a><a href="/wyckoff">🧱 威科夫突破</a><a class="nav-on" href="/backtest">🧪 C1門檻回測</a><a href="/exit_backtest">🚪 出場回測</a><a href="/stock_bt">🔍 單股回測</a></div>
+<div class="nav"><a href="/">📊 C系列總表</a><a href="/cards">🃏 突破卡片</a><a href="/wyckoff">🧱 威科夫突破</a><a class="nav-on" href="/backtest">🧪 C1門檻回測</a><a href="/exit_backtest">🚪 出場回測</a><a href="/entry_backtest">⚖️ 進場比較</a><a href="/stock_bt">🔍 單股回測</a></div>
 {status_html}
 <div class="tfbar">{runbar}</div>
 <div class="tfbar">{tfbar}</div>
@@ -6072,7 +6252,7 @@ def generate_wyckoff_html():
             f'<title>🧱 大馬威科夫</title><style>{CARDS_CSS}{css}{WY_CARD_CSS}</style></head><body>'
             '<h2>&#x1F1F2;&#x1F1FE; 大馬莊家思維 ・ 威科夫：洗盤 → 真突破（日線）</h2>'
             '<div class="nav"><a href="/">📊 C系列總表</a><a href="/cards">🃏 突破卡片</a><a class="nav-on" href="/wyckoff">🧱 威科夫突破</a>'
-            '<a href="/backtest">🧪 C1門檻回測</a><a href="/exit_backtest">🚪 出場回測</a><a href="/stock_bt">🔍 單股回測</a></div>'
+            '<a href="/backtest">🧪 C1門檻回測</a><a href="/exit_backtest">🚪 出場回測</a><a href="/entry_backtest">⚖️ 進場比較</a><a href="/stock_bt">🔍 單股回測</a></div>'
             f'{banner}'
             f'<p class=note>最後更新 {st["last_update"] or "—"}｜跟著C系列掃描一起跑：開市時間每小時一次＋17:40收盤後一次。'
             '階段只用「已收盤」的日K判斷（收盤後才會變）；重點名單／🟠／🟢 在開市時間每小時盯盤，有事推 Telegram。</p>'
@@ -6304,7 +6484,7 @@ details.exs-detail summary{{color:#7ab3ff}}
 @media (max-width:600px){{.exs-row{{flex-direction:column;gap:2px}} .exs-k{{min-width:0}}}}</style></head><body>
 <h2>&#x1F1F2;&#x1F1FE; 大馬莊家思維 ・ 出場規則回測</h2>
 <div class="subtitle">同一批進場（突破卡片規則：收盤站上BO進場、SL在最後一個C低點下方），只換出場方式，看哪一種總R最好。正式掃描完全不受影響。</div>
-<div class="nav"><a href="/">📊 C系列總表</a><a href="/cards">🃏 突破卡片</a><a href="/wyckoff">🧱 威科夫突破</a><a href="/backtest">🧪 C1門檻回測</a><a class="nav-on" href="/exit_backtest">🚪 出場回測</a><a href="/stock_bt">🔍 單股回測</a></div>
+<div class="nav"><a href="/">📊 C系列總表</a><a href="/cards">🃏 突破卡片</a><a href="/wyckoff">🧱 威科夫突破</a><a href="/backtest">🧪 C1門檻回測</a><a class="nav-on" href="/exit_backtest">🚪 出場回測</a><a href="/entry_backtest">⚖️ 進場比較</a><a href="/stock_bt">🔍 單股回測</a></div>
 {status_html}
 <div class="tfbar">{runbar}</div>
 <div class="tfbar">{viewbar}</div>
@@ -6312,6 +6492,109 @@ details.exs-detail summary{{color:#7ab3ff}}
 <div class="foot">「賺錢比例」= R > 0 的筆數 ÷ 全部（保本出場算打平，不算賺也不算虧）。「總R」= 每筆冒1R風險時累積的結果，最能看出整體賺不賺。<br>
 「保本」= 漲到1R後把SL移到進場價。「跌破MA20走」= 保本啟動後，收盤跌破20根均線就用收盤價出場。<br>
 跳空低開到SL下方用開盤價計算；同一根同時碰SL和目標保守算SL；沒算手續費和滑價；「未走完」= 資料到今天還沒出場的筆數，不計入統計。</div>
+</body></html>'''
+
+@app.route('/entry_backtest')
+def entry_backtest_page():
+    """⚖️ 進場方式比較回測。?run=1D 開始（背景執行），可加 &limit=50 先試"""
+    run_tf = request.args.get('run', '').upper()
+    if run_tf in TF_LABELS:
+        limit = request.args.get('limit')
+        limit = int(limit) if limit and limit.isdigit() else None
+        threading.Thread(target=run_entry_backtest, args=(run_tf, None, limit), daemon=True).start()
+        time.sleep(0.5)
+        return redirect(f'{BASE}/entry_backtest?tf={run_tf}')
+    view_tf = request.args.get('tf', en_state.get('tf') or '1D').upper()
+    if view_tf not in TF_LABELS: view_tf = '1D'
+    blk = 's2' if request.args.get('s2') == '1' else 'all'
+
+    with en_state['lock']:
+        st = {k: v for k, v in en_state.items() if k != 'lock'}
+    other_busy = bt_state['status'] == 'running' or ex_state['status'] == 'running'
+    res = load_en_result(view_tf)
+
+    if st['status'] == 'running':
+        pct = st['done'] / st['total'] * 100 if st['total'] else 0
+        status_html = (f'<div class="scanning-banner">⏳ 進場比較回測中（{st["tf"]}）：{st["done"]}/{st["total"]} 檔（{pct:.0f}%）・'
+                       f'開始於 {st["started"]}・頁面每30秒自動更新</div>'
+                       '<script>setTimeout(function(){location.reload()},30000)</script>')
+    elif st['status'] == 'error':
+        status_html = f'<div class="warnbox">❌ 回測出錯：{_h(st["error"])}</div>'
+    elif other_busy:
+        status_html = '<div class="warnbox">🧪 另一個回測正在跑，等它跑完才能開始進場比較回測。</div>'
+    else:
+        status_html = ''
+
+    runbar = ''.join(
+        f'<a class="runbtn" href="/entry_backtest?run={t}" onclick="return confirm(\'開始跑 {t} 進場比較回測？（大約要幾分鐘到十幾分鐘）\')">▶ 跑 {t} 進場比較回測</a>'
+        for t in ('1D', '4H', '1H') if t in TF_LABELS)
+    viewbar = ''.join(
+        f'<a class="{"on" if (t == view_tf and b_ == blk) else ""}" href="/entry_backtest?tf={t}{"&s2=1" if b_ == "s2" else ""}">{t}・{lab}</a>'
+        for t in ('1D', '4H', '1H') if t in TF_LABELS for b_, lab in (('all', '全部'), ('s2', '只看日線S2')))
+
+    if res:
+        b = res[blk]
+        def cells(s):
+            wr = f'{s["winrate"]:.0f}%' if s['winrate'] is not None else '-'
+            return (f'<td>{s["n"]}</td><td>{s["win"]}</td><td>{s["loss"]}</td><td>{s["timeout"]}</td>'
+                    f'<td>{wr}</td><td>{_en_r(s["avg_r"])}</td><td><b>{s["total_r"]:+.1f}R</b></td>')
+        trows = [('A 盤中掛單（全部）', b['A']), ('B 收盤確認（全部）', b['B']),
+                 ('A 裡：當天收盤站上BO', b['A_closeok']), ('A 裡：當天收盤沒站上（假突破）', b['A_fake']),
+                 ('同一形態兩邊都進場 → A', b['paired_A']), ('同一形態兩邊都進場 → B', b['paired_B']),
+                 ('只有A進場（B沒買）', b['A_only']), ('只有B進場', b['B_only'])]
+        rows = ''.join(f'<tr><td class="g"><b>{_h(lab)}</b></td>{cells(s)}</tr>' for lab, s in trows)
+
+        def li(cs):
+            return ''.join(
+                f'<div>{_fmt_time(x["confirm_time"], res["tf"])} <b>{_h(x["symbol"].replace(".KL", ""))}</b> {_h(x.get("name") or "")} '
+                f'進場{fmt_px(x["entry"])}（BO {fmt_px(x["bo"])}） SL{fmt_px(x["sl"])} → {x["result"]} 第{x["bars_held"]}根 '
+                f'<span class="{"pos" if x["r_mult"] > 0 else "neg"}">{x["r_mult"]:+.2f}R</span></div>'
+                for x in cs) or '沒有案例'
+        try:
+            summary = entry_summary_html(res, blk)
+        except Exception as e:
+            log.warning(f"⚖️ 結論卡錯誤：{e}")
+            summary = ''
+        body = f'''
+<div class="desc">期間 {res["period"][0]} ～ {res["period"][1]}・{res["symbols"]}檔・C1門檻 {res["c1"]:g}%・範圍：{"只看日線S2" if blk == "s2" else "全部"}・完成於 {res["finished"]}・
+還沒走完（不計入）：A {res["open_a"]}筆、B {res["open_b"]}筆</div>
+{summary}
+<details class="exs-detail"><summary>📊 詳細數據 — 點這裡展開</summary>
+<div style="overflow-x:auto"><table class="st"><tr><th>組別</th><th>筆數</th><th>🎯達1:1.5</th><th>❌SL</th><th>⏱到期</th><th>達標率</th><th>平均R</th><th>總R</th></tr>{rows}</table></div>
+</details>
+<div class="sec"><h3>🔍 抽查案例（用 TradingView 對圖）</h3>
+<details><summary>假突破：A 有進場、當天收盤沒站上BO（最近20筆）</summary><div class="lst">{li(res.get("fake_cases", []))}</div></details>
+<details><summary>A 盤中掛單：最近20筆</summary><div class="lst">{li(res.get("cases_a", []))}</div></details>
+<details><summary>B 收盤確認：最近20筆</summary><div class="lst">{li(res.get("cases_b", []))}</div></details>
+</div>'''
+    else:
+        body = f'<div class="empty">{view_tf}：還沒有進場比較回測結果。按上面的「▶ 跑」開始。</div>'
+
+    return f'''<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>⚖️ 進場方式比較</title><style>{CARDS_CSS}
+details{{background:#22223a;border:1px solid #3a3a55;border-radius:6px;padding:8px 12px;margin-bottom:6px;max-width:1150px}}
+summary{{cursor:pointer;color:#ffb74d}} .lst{{font-size:12px;line-height:1.8;margin-top:6px}}
+.exs{{background:#1f2440;border:1px solid #3d4780;border-radius:10px;padding:14px 18px;margin:10px 0 14px;max-width:820px}}
+.exs-title{{font-size:17px;font-weight:bold;color:#fff;margin-bottom:10px}}
+.exs-row{{display:flex;gap:12px;padding:9px 0;border-top:1px solid #333a66;font-size:14px}}
+.exs-k{{min-width:120px;color:#9fb3e8;font-weight:bold}} .exs-v{{flex:1;color:#eee;line-height:1.6}}
+.exs-sub{{color:#9aa0b8;font-size:12px;margin-top:2px}}
+.exs-ul{{margin:4px 0 0;padding-left:20px;line-height:1.7}}
+.exs-tip{{background:#2a2410;border:1px solid #6b5a1e;border-radius:8px;padding:10px 14px;margin-top:10px;font-size:14px;color:#f3e3b0;line-height:1.6}}
+.exs-tip b{{color:#ffd54f}}
+details.exs-detail summary{{color:#7ab3ff}}
+.tfbar a.runbtn{{background:#ffb300;color:#1a1a1a;font-weight:bold;border-color:#ffb300}}
+@media (max-width:600px){{.exs-row{{flex-direction:column;gap:2px}} .exs-k{{min-width:0}}}}</style></head><body>
+<h2>&#x1F1F2;&#x1F1FE; 大馬莊家思維 ・ ⚖️ 進場方式比較</h2>
+<div class="subtitle">同一批C系列形態、同樣的SL／1:1.5／20根到期，只換進場方式：<b>A 盤中掛單</b>（盤中碰到BO就成交，老師SOP）vs <b>B 收盤確認</b>（收盤站上BO才進場，突破卡片現在的算法）。正式掃描完全不受影響。</div>
+<div class="nav"><a href="/">📊 C系列總表</a><a href="/cards">🃏 突破卡片</a><a href="/wyckoff">🧱 威科夫突破</a><a href="/backtest">🧪 C1門檻回測</a><a href="/exit_backtest">🚪 出場回測</a><a class="nav-on" href="/entry_backtest">⚖️ 進場比較</a><a href="/stock_bt">🔍 單股回測</a></div>
+{status_html}
+<div class="tfbar">{runbar}</div>
+<div class="tfbar">{viewbar}</div>
+{body}
+<div class="foot">A 成交價 = BO；如果當天開盤已經跳空高過BO，用開盤價成交。A 進場那一根如果又跌到SL（先後不明）保守算止損。<br>
+B 進場價 = 收盤站上BO那天的收盤價。兩邊的R都用「進場價 − SL」計算，所以同一個形態，A 的1R比較小、目標也比較近。<br>
+「總R」= 每筆冒一樣的錢（1R）累積的結果，最能看出哪一種整體賺比較多。沒算手續費和滑價；「還沒走完」= 資料到今天還沒出場，不計入統計。</div>
 </body></html>'''
 
 @app.route('/backtest_json')
@@ -6664,7 +6947,7 @@ def build_stock_bt_html(sym_raw, strategy, tf, focus):
     opts = ''.join(f'<option value="{_h(sym_code(x))}">{_h(NAMES.get(x, ""))}</option>' for x in dict.fromkeys(SYMBOLS))
     tf_opts = ''.join(f'<option value="{t}"{" selected" if t == tf else ""}>{t}</option>' for t in tfs)
     nav = ('<div class="nav"><a href="/">📊 C系列總表</a><a href="/cards">🃏 突破卡片</a><a href="/wyckoff">🧱 威科夫突破</a>'
-           '<a href="/backtest">🧪 C1門檻回測</a><a href="/exit_backtest">🚪 出場回測</a><a class="nav-on" href="/stock_bt">🔍 單股回測</a></div>')
+           '<a href="/backtest">🧪 C1門檻回測</a><a href="/exit_backtest">🚪 出場回測</a><a href="/entry_backtest">⚖️ 進場比較</a><a class="nav-on" href="/stock_bt">🔍 單股回測</a></div>')
     form = (f'<form class="sbform" method="get" action="/stock_bt">'
             f'<input name="symbol" list="sbsyms" placeholder="股票代碼，例：{_h(sym_code(M["default_sym"]))}" value="{_h(sym_raw)}" autocomplete="off">'
             f'<datalist id="sbsyms">{opts}</datalist>'
