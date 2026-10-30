@@ -5603,7 +5603,7 @@ HTML = """<!DOCTYPE html>
 </style></head><body>
 <h2>&#x1F1F2;&#x1F1FE; 大馬莊家思維掃描器</h2>
 <div class="subtitle">KLSE股票 · 操盤跟莊（邏輯已對齊 莊家思維 Contraction V53）</div>
-<div class="nav"><a class="nav-on" href="/">📊 C系列總表</a><a href="/cards">🃏 突破卡片</a><a href="/wyckoff">🧱 威科夫突破</a><a href="/backtest">🧪 C1門檻回測</a><a href="/exit_backtest">🚪 出場回測</a><a href="/entry_backtest">⚖️ 進場比較</a><a href="/stock_bt">🔍 單股回測</a></div>
+<div class="nav"><a class="nav-on" href="/">📊 C系列總表</a><a href="/cards">🃏 突破卡片</a><a href="/wyckoff">🧱 威科夫突破</a><a href="/backtest">🧪 C1門檻回測</a><a href="/exit_backtest">🚪 出場回測</a><a href="/entry_backtest">⚖️ 進場比較</a><a href="/stock_card">🔎 單股卡片</a><a href="/stock_bt">🔍 單股回測</a></div>
 SCANNING_BANNER
 <div class="ctrl-bar">
   <button class="btn btn-blue" onclick="startRefresh()" id="refreshBtn">&#x1F504; 重新掃描</button>
@@ -6012,7 +6012,7 @@ def build_cards_html(tf):
 <title>🃏 大馬突破卡片</title><style>{CARDS_CSS}</style></head><body>
 <h2>&#x1F1F2;&#x1F1FE; 大馬莊家思維 ・ 突破卡片</h2>
 <div class="subtitle">BO = 最後一個C高點+緩衝（{"盤中碰到就算成交，收盤後記錄" if CARD_ENTRY_MODE == "touch" else "收盤確認"}）・ SL = 最後一個C低點−緩衝（天圖1%、時圖0.5%）・ 目標 1:1.5 / 1:2 ・ 至少C2、只看多頭</div>
-<div class="nav"><a href="/">📊 C系列總表</a><a class="nav-on" href="/cards?tf={tf}">🃏 突破卡片</a><a href="/wyckoff">🧱 威科夫突破</a><a href="/backtest">🧪 C1門檻回測</a><a href="/exit_backtest">🚪 出場回測</a><a href="/entry_backtest">⚖️ 進場比較</a><a href="/stock_bt">🔍 單股回測</a></div>
+<div class="nav"><a href="/">📊 C系列總表</a><a class="nav-on" href="/cards?tf={tf}">🃏 突破卡片</a><a href="/wyckoff">🧱 威科夫突破</a><a href="/backtest">🧪 C1門檻回測</a><a href="/exit_backtest">🚪 出場回測</a><a href="/entry_backtest">⚖️ 進場比較</a><a href="/stock_card">🔎 單股卡片</a><a href="/stock_bt">🔍 單股回測</a></div>
 {warn}{banner}
 <div class="tfbar">{tfbar}</div>
 <div class="ctrl"><select id="sec" onchange="f()"><option value="">全部板塊</option>{sector_opts}</select>
@@ -6172,7 +6172,7 @@ details{{background:#22223a;border:1px solid #3a3a55;border-radius:6px;padding:8
 summary{{cursor:pointer;color:#ffb74d}} .lst{{font-size:12px;line-height:1.8;margin-top:6px}}</style></head><body>
 <h2>&#x1F1F2;&#x1F1FE; 大馬莊家思維 ・ C1跌幅門檻回測</h2>
 <div class="subtitle">用歷史K線重播突破卡片的完整規則（BO/SL/1:1.5/20根到期），只改C1跌幅門檻，比較哪一種比較好。正式掃描完全不受影響。</div>
-<div class="nav"><a href="/">📊 C系列總表</a><a href="/cards">🃏 突破卡片</a><a href="/wyckoff">🧱 威科夫突破</a><a class="nav-on" href="/backtest">🧪 C1門檻回測</a><a href="/exit_backtest">🚪 出場回測</a><a href="/entry_backtest">⚖️ 進場比較</a><a href="/stock_bt">🔍 單股回測</a></div>
+<div class="nav"><a href="/">📊 C系列總表</a><a href="/cards">🃏 突破卡片</a><a href="/wyckoff">🧱 威科夫突破</a><a class="nav-on" href="/backtest">🧪 C1門檻回測</a><a href="/exit_backtest">🚪 出場回測</a><a href="/entry_backtest">⚖️ 進場比較</a><a href="/stock_card">🔎 單股卡片</a><a href="/stock_bt">🔍 單股回測</a></div>
 {status_html}
 <div class="tfbar">{runbar}</div>
 <div class="tfbar">{tfbar}</div>
@@ -6189,7 +6189,7 @@ ATR% = 14根平均真實波幅 ÷ 收盤價；「3×ATR%」= C1跌幅要超過�
 WY_CARD_CSS = ('.card.wyg{border-left-color:#4cc28e}.card.wyo{border-left-color:#ff8a3d}'
                '.story{font-size:11px;color:#aab;line-height:1.7;margin:4px 0 2px}.story b{color:#ddd}'
                '.wynote{font-size:11px;color:#8b949e;margin-top:7px;line-height:1.5}'
-               '.tag.track{border-color:#4cc28e;color:#a5d6a7}')
+               '.tag.track{border-color:#4cc28e;color:#a5d6a7}.hd a.sclk{font-size:12px;margin-left:6px;text-decoration:none}')
 
 def _wy_fp(v):
     return '—' if v is None else fmt_px(v)
@@ -6225,7 +6225,7 @@ def _wy_story(r):
 def _wy_head(r, badge):
     tv = f"{tv_chart_base()}?symbol={r.get('tv_symbol') or tv_sym(r['symbol'])}&interval=D"
     return (f'<div class="hd"><a href="{tv}" target="_blank">{sym_code(r["symbol"])}</a>'
-            f'<span class="nm">{_nm(r)}</span>{badge}</div>')
+            f'<span class="nm">{_nm(r)}</span><a class="sclk" href="/stock_card?symbol={sym_code(r["symbol"])}" title="單股卡片＋分析">🔎</a>{badge}</div>')
 
 def _wy_track_tag(sym):
     with wy_cases_lock:
@@ -6313,7 +6313,7 @@ def generate_wyckoff_html():
             f'<title>🧱 大馬威科夫</title><style>{CARDS_CSS}{css}{WY_CARD_CSS}</style></head><body>'
             '<h2>&#x1F1F2;&#x1F1FE; 大馬莊家思維 ・ 威科夫：洗盤 → 真突破（日線）</h2>'
             '<div class="nav"><a href="/">📊 C系列總表</a><a href="/cards">🃏 突破卡片</a><a class="nav-on" href="/wyckoff">🧱 威科夫突破</a>'
-            '<a href="/backtest">🧪 C1門檻回測</a><a href="/exit_backtest">🚪 出場回測</a><a href="/entry_backtest">⚖️ 進場比較</a><a href="/stock_bt">🔍 單股回測</a></div>'
+            '<a href="/backtest">🧪 C1門檻回測</a><a href="/exit_backtest">🚪 出場回測</a><a href="/entry_backtest">⚖️ 進場比較</a><a href="/stock_card">🔎 單股卡片</a><a href="/stock_bt">🔍 單股回測</a></div>'
             f'{banner}'
             f'<p class=note>最後更新 {st["last_update"] or "—"}｜跟著C系列掃描一起跑：開市時間每小時一次＋17:40收盤後一次。'
             '階段只用「已收盤」的日K判斷（收盤後才會變）；重點名單／🟠／🟢 在開市時間每小時盯盤，有事推 Telegram。</p>'
@@ -6445,6 +6445,350 @@ def debug_wyckoff():
         out = {'error': f'{type(e).__name__}: {e}'}
     return Response(json.dumps(out, ensure_ascii=False, indent=2, default=str), mimetype='application/json')
 
+# ============================================================
+# 🔎 單股卡片（MH 2026-10-30）：選一檔，看它現在的威科夫卡片＋VCP卡片＋「一眼看懂」分析
+# 用跟正式掃描同一套函式（wy_analyze／analyze／_setup_from_analysis），只是即時只算這一檔
+# ============================================================
+SC_CACHE = {}
+SC_CACHE_SEC = 300   # 同一檔5分鐘內重看不重新抓資料
+
+WY_STAGE_PLAIN = {
+    'green':  ('三個條件都過了：洗盤 → 安靜 → 大聲突破 → 回踩站穩。', '看上方空間和SL距離，合格就在 Entry 掛觸價單。'),
+    'orange': ('已經放量突破天花板，還在等回踩確認。', '不追。等價格回到回踩區、守住天花板，變成 🟢 再說。'),
+    'yellow': ('區間裡已經洗過盤，還沒突破。', '等放量收盤突破天花板（變 🟠）；離天花板近、量在縮的最值得盯。'),
+    'weak':   ('突破了，但條件不全（量、回踩或位置有問題）。', '容易是假突破，只觀察，不動手。'),
+    'fail':   ('突破後收盤跌回區間：假突破。', '不做。等它重新整理出新的區間。'),
+    'nodata': ('成交量資料不足，量比會失真。', '系統不判斷，自己看圖。'),
+}
+
+def wy_card_generic(r):
+    """🟡／⚪／❌／⛔ 也用卡片格式顯示（威科夫頁本來是表格）"""
+    stage = r['stage']
+    label, color = WY_STAGE_META.get(stage, ('', '#555'))
+    price, ceil = r.get('price') or 0, r.get('ceiling')
+    to_ceil = _pct(price, ceil) if (price and ceil) else None
+    badge = f'<span class="dist" style="background:{color};color:#fff">{label.split(" ")[0]}</span>'
+    rows = f'<div><span>天花板</span><span>{_wy_fp(ceil)}{f"（現價 {to_ceil:+.1f}%）" if to_ceil is not None else ""}</span></div>'
+    rows += f'<div><span>地板</span><span>{_wy_fp(r.get("floor"))}</span></div>'
+    if r.get('bo_date'):
+        rows += f'<div><span>突破那天</span><span>{r["bo_date"]}・量 {r.get("loud_mult") or 0:.1f}x・收盤位置 {r.get("loud_close_pos") or 0:.2f}</span></div>'
+    elif r.get('quiet_ratio') is not None:
+        rows += f'<div><span>最近量能</span><span>{r["quiet_ratio"]:.2f}x 50日均量（{"在縮 ✓" if r.get("quiet_ok") else "還沒縮"}）</span></div>'
+    return f'''<div class="card" style="border-left-color:{color}">
+{_wy_head(r, badge)}
+{_wy_card_tags(r)}
+{_wy_story(r) if r.get("spring_date") else ""}
+<div class="pxrow"><div><div class="lbl">現價</div><div class="big">{_wy_fp(price)}</div></div>
+<div class="r"><div class="lbl">{"天花板（突破點）" if stage == "yellow" else "天花板"}</div><div class="big">{_wy_fp(ceil)}</div></div></div>
+<div class="lv">{rows}</div>
+<div class="wynote">{r.get("note", "")}</div>
+</div>'''
+
+def stock_card_data(sym):
+    hit = SC_CACHE.get(sym)
+    if hit and time.time() - hit[0] < SC_CACHE_SEC:
+        return hit[1]
+    meta = {'symbol': sym, 'name': NAMES.get(sym, sym_code(sym)), 'sector': SECTORS.get(sym, '其他'), 'tv_symbol': tv_sym(sym)}
+    out = {'meta': meta, 'error': None, 'wy': None, 'vcp': None}
+    df = fetch_ohlcv(sym, '1D')
+    if df.empty or len(df) < 130:
+        out['error'] = f'日線資料不夠（只有 {len(df)} 根）。'
+        return out
+    closed = closed_bars(df, '1D')
+    tail = closed.tail(20)
+    meta['turnover'] = float((tail['close'] * tail['volume']).mean()) if len(tail) else None
+    meta['price'] = float(df['close'].values[-1])
+    meta['price_time'] = str(df.index[-1])[:10]
+    liquid = meta['turnover'] is not None and meta['turnover'] >= TG_MIN_TURNOVER_MYR
+    try:
+        meta['day_stage'] = STAGE_LABEL_MAP.get(get_stage(closed)[0], '--')
+    except Exception:
+        meta['day_stage'] = '--'
+    # 🧱 威科夫（跟 wy_process_symbol 同一套）
+    if len(closed) >= 121:
+        ddf = closed.tail(500)
+        r = wy_analyze(sym, ddf)
+        if r:
+            r['day_stage'] = meta['day_stage']
+            r['redist'] = (meta['day_stage'] == 'S4' and r['position'] == '中途整理')
+            if r['redist']:
+                r['note'] = '⚠️ 日線S4、下跌途中的橫盤，小心是再派發（中途再出一次貨，之後繼續跌）。' + r.get('note', '')
+            r.update({'name': meta['name'], 'sector': meta['sector'], 'tv_symbol': meta['tv_symbol'],
+                      'turnover': meta['turnover'], 'liquid': liquid, 'price': meta['price']})
+            out['wy'] = r
+    # 🃏 VCP：先看正式卡片有沒有這一檔，沒有就即時算一次
+    key = f'{sym}|1D'
+    with cards_lock:
+        act = next((dict(c) for c in cards_state['active'].values() if c.get('key') == key), None)
+        pend = dict(cards_state['pending'][key]) if key in cards_state['pending'] else None
+    wy_stage = out['wy']['stage'] if out['wy'] else None
+    if act:
+        act.update({'price': meta['price'], 'wy': wy_stage})
+        out['vcp'] = {'kind': 'active', 'card': act}
+    else:
+        res = analyze(df, df)
+        setup = pend or _setup_from_analysis(df, res, '1D')
+        if setup:
+            setup = dict(setup)
+            setup.update({'symbol': sym, 'name': meta['name'], 'sector': meta['sector'], 'tv_symbol': meta['tv_symbol'],
+                          'price': meta['price'], 'turnover': meta['turnover'], 'wy': wy_stage, 'tf': '1D'})
+            used = f"{key}|{setup['h_time']}" in cards_state['used']
+            out['vcp'] = {'kind': 'used' if used else 'pending', 'card': setup}
+        else:
+            out['vcp'] = {'kind': 'none', 'c_count': res.get('c_count', 0), 'has_c': res.get('has_c'),
+                          'is_bear': res.get('is_bear'), 'stage': res.get('stage', 0)}
+    SC_CACHE[sym] = (time.time(), out)
+    return out
+
+def wy_story_plain(r):
+    """🧱 把威科夫的每一步翻成白話故事（只用已經算出來的數字，不另外判斷）"""
+    if not r:
+        return ['這一檔最近沒有出現「先洗盤、再整理」的橫盤區間，所以威科夫沒有故事可以講。']
+    fp = _wy_fp
+    miss = set(r.get('miss') or [])
+    out = []
+    pos = r.get('position') or ''
+    out.append(f'從 {r.get("range_from")} 開始，股價在 {fp(r.get("floor"))}～{fp(r.get("ceiling"))} 之間橫盤了大約 {r.get("range_days")} 天'
+               + (f'（{pos}）' if pos else '') + '。上面的天花板是賣壓，下面的地板是買盤。')
+    if r.get('spring_date'):
+        sv = r.get('spring_vol')
+        vtxt = '' if sv is None else ('，當時量不大，代表真正想賣的人不多' if sv < 1.2 else f'，當時量放到 {sv:.1f} 倍，有人恐慌賣出')
+        out.append(f'{r["spring_date"]} 股價跌破地板 {r.get("spring_depth") or 0:.1f}%，但很快又收回來{vtxt}。'
+                   '這就是「洗盤」：故意製造跌破，把怕跌的人洗出去，籌碼落到有耐心的人手上。')
+    qr = r.get('quiet_ratio')
+    if qr is not None:
+        if r.get('quiet_ok'):
+            out.append(f'之後成交量縮到平常的 {qr:.1f} 倍，市場變得很安靜：想賣的人差不多賣完了，籌碼越來越穩。')
+        else:
+            out.append(f'不過成交量只縮到平常的 {qr:.1f} 倍，還不夠安靜：市場上還有人在賣，籌碼還沒完全沉澱。')
+    if r.get('bo_date'):
+        lm, cp = r.get('loud_mult') or 0, r.get('loud_close_pos') or 0
+        if 'loud_high' in miss or r.get('loud_big'):
+            out.append(f'{r["bo_date"]} 爆量 {lm:.0f} 倍衝過天花板。量太誇張，比較像消息或拉盤，不像有計劃的吸籌後突破。')
+        elif 'loud_low' in miss:
+            out.append(f'{r["bo_date"]} 收盤站上天花板，但量只有 {lm:.1f} 倍，買盤不夠積極，突破的力道偏弱。')
+        elif 'close_pos' in miss:
+            out.append(f'{r["bo_date"]} 突破天花板，量 {lm:.1f} 倍，但收在K線下半部（上影線長）：衝上去後馬上有人在高位賣。')
+        else:
+            out.append(f'{r["bo_date"]} 放量 {lm:.1f} 倍收盤站上天花板，而且收在K線上半部：買盤主動進場，把賣壓一口氣吃掉。')
+    st = r['stage']
+    if st == 'fail':
+        out.append('可惜之後收盤又跌回天花板下面：突破是假的，追進去的人被套。這種情況先放一邊，等它重新整理。')
+    elif st == 'orange' and r.get('retest_date'):
+        out.append(f'{r["retest_date"]} 已經回踩到天花板附近，但還沒確認守住（或回踩時量太大）。要等回踩結束、價格重新站穩，才知道舊天花板是不是變成新地板。')
+    elif st == 'orange':
+        out.append(f'突破到現在 {r.get("bo_days_ago", 0)} 天，還沒回頭測試天花板。舊天花板能不能變成新地板還不知道，現在追就是買在高位。')
+    elif st == 'green' and r.get('retest_date'):
+        out.append(f'{r["retest_date"]} 價格回踩到天花板附近，低點 {fp(r.get("retest_low"))} 守住了，回踩時量也小：'
+                   '舊的天花板變成新的地板，賣壓沒有回來。這是「回頭站得穩」。')
+    elif st == 'weak':
+        if 'retest_deep' in miss or 'retest_late' in miss:
+            out.append('之後回落太深（或拖太久）才回來，比較像追高的人在獲利了結，不是健康的回踩確認。')
+        elif 'no_retest' in miss:
+            out.append(f'突破已經 {r.get("bo_days_ago", 0)} 天都沒回踩，這次突破的回踩窗口已經過了。')
+    elif st == 'yellow':
+        out.append(f'現在價格離天花板 {r.get("dist_pct") or 0:.1f}%，還在區間裡。'
+                   + ('量在縮，像是在等待突破的那一天。' if r.get('quiet_ok') else '量還沒縮，還要再等等。'))
+    if 'high_pos' in miss or pos.startswith('漲後'):
+        out.append('⚠️ 要小心：這個區間出現在一大段上漲之後，同樣的走勢也可能是莊家在高位出貨，不一定是吸籌。')
+    if r.get('redist'):
+        out.append('⚠️ 日線是 S4（下跌趨勢），下跌途中的橫盤可能是「再派發」：中途再出一次貨，之後繼續跌。')
+    ending = {
+        'green': '整個故事：橫盤吸籌 → 洗盤 → 安靜 → 大聲突破 → 回頭站穩，四步都齊了。',
+        'orange': '故事走到「大聲突破」，還差最後一步「回頭站穩」。',
+        'yellow': '故事走到「洗盤、整理」，還在等突破。',
+        'weak': '故事有破綻，所以系統只放在觀察。',
+        'fail': '故事在突破這一步失敗了。',
+        'nodata': '成交量資料不夠，量的部分可能不準，故事要自己看圖確認。',
+    }.get(st)
+    if ending:
+        out.append(ending)
+    return out
+
+def vcp_story_plain(v, m):
+    """🃏 VCP（C系列收縮）的白話故事"""
+    kind = v['kind'] if v else 'none'
+    stage_txt = '日線 S2 上升趨勢裡' if m.get('day_stage') == 'S2' else f'日線 {m.get("day_stage", "--")}（不是上升趨勢）'
+    if kind == 'none':
+        if v and v.get('is_bear'):
+            return ['最近的收縮是空頭方向（越跌越收斂），不是做多的形態。']
+        if v and v.get('has_c'):
+            return [f'{stage_txt}，目前只看到 {v.get("c_count", 0)} 段收縮，還要再收縮一次（至少 C2）才算成形。']
+        return ['目前沒有看到一段一段越來越小的收縮，VCP 還沒開始。']
+    c = v['card']
+    out = []
+    pct = c.get('pct')
+    out.append(f'{stage_txt}，股價拉回整理，出現 {c.get("c_count")} 段收縮'
+               + (f'，最後一段只有 {pct:.1f}%' if isinstance(pct, (int, float)) else '')
+               + '。每一次拉回都比上一次小，代表賣壓一次比一次輕，籌碼越來越集中。')
+    if c.get('provisional'):
+        out.append('⏳ 不過最後一段的低點才剛出現、還沒被確認，可能還會再低一點。')
+    out.append(f'最後一段收縮的高點是 {fmt_px(c.get("c_hv"))}，突破 BO {fmt_px(c.get("bo"))} 就代表價格脫離收縮、重新轉強；'
+               f'跌破 SL {fmt_px(c.get("sl"))} 就代表形態失敗。')
+    if kind == 'active':
+        ok = c.get('close_ok')
+        out.append(f'{_fmt_time(c.get("confirm_time"), "1D")} 已經碰到 BO 成交'
+                   + ('，當天收盤也站穩在 BO 上面 ✅，突破比較可信。' if ok is True else
+                      ('，但當天收盤跌回 BO 下面 ⚠️，要小心假突破。' if ok is False else '。')))
+    elif kind == 'used':
+        out.append('這個形態已經突破過、結束了，要等新的收縮出現。')
+    else:
+        px = m.get('price')
+        if px and c.get('bo'):
+            d = _pct(c['bo'], px)
+            out.append('現在價格已經碰到 BO，收盤後系統會記錄。' if d <= 0 else f'現在價格離 BO 還有 {d:.1f}%。')
+    return out
+
+def stock_card_summary(d):
+    """📋 一眼看懂：現在在哪一步、檢查清單、結論"""
+    m, r, v = d['meta'], d['wy'], d['vcp']
+    ok = lambda b: '✅' if b else '❌'
+    s2 = m.get('day_stage') == 'S2'
+    liquid = m.get('turnover') is not None and m['turnover'] >= TG_MIN_TURNOVER_MYR
+    checks = [f'{ok(s2)} 日線 {m.get("day_stage", "--")}（只做 S2）',
+              f'{ok(liquid)} 平均每日成交額 {_fmt_turnover(m.get("turnover"))}（門檻 {_fmt_turnover(TG_MIN_TURNOVER_MYR)}）']
+    ready, watch = [], []
+
+    # 威科夫
+    if r:
+        label = WY_STAGE_META.get(r['stage'], ('',))[0]
+        now_txt, next_txt = WY_STAGE_PLAIN.get(r['stage'], ('', ''))
+        wy_html = f'<b>{label}</b><div class="exs-sub">{now_txt} 下一步：{next_txt}</div>'
+        if r['stage'] == 'green':
+            wall_ok = r.get('wall') is None or (r.get('wall_r') or 0) >= HEADROOM_MIN_R
+            atr_ok = not (r.get('risk_atr') and r['risk_atr'] > WY_RISK_MAX_ATR)
+            px_ok = not (m.get('price') and m['price'] > r['entry'])
+            wtxt = '藍天' if r.get('wall') is None else f'{r.get("wall_r") or 0:.2f}R'
+            checks += [f'{ok(wall_ok)} 威科夫上方空間 {wtxt}（要 ≥ {HEADROOM_MIN_R:g}R）',
+                       f'{ok(atr_ok)} SL 距離 {r.get("risk_atr") or 0:.1f} 倍日線ATR（要 ≤ {WY_RISK_MAX_ATR:g}）',
+                       f'{ok(px_ok)} 現價還沒過 Entry {_wy_fp(r["entry"])}']
+            if wall_ok and atr_ok and px_ok:
+                ready.append(f'威科夫 🟢：在 Entry <b>{_wy_fp(r["entry"])}</b> 掛觸價單，SL {_wy_fp(r["sl"])}')
+            elif not atr_ok:
+                watch.append('威科夫 🟢 但 SL 太寬：改看 4H／1H 找 C 進場')
+            else:
+                watch.append('威科夫 🟢 但' + ('上方空間不夠' if not wall_ok else '現價已過 Entry，等下一次回踩'))
+        elif r['stage'] == 'orange':
+            watch.append(f'威科夫 🟠：等回踩到 {_wy_fp(r["ceiling"])}～{_wy_fp(r["ceiling"] * (1 + WY_RETEST_NEAR_PCT / 100))} 守住')
+        elif r['stage'] == 'yellow':
+            watch.append(f'威科夫 🟡：等放量收盤突破 {_wy_fp(r["ceiling"])}（離 {r.get("dist_pct") or 0:.1f}%）')
+    else:
+        wy_html = '<b>沒有看到區間</b><div class="exs-sub">威科夫找不到「有洗盤的橫盤區間」（或區間太久以前），這一檔目前沒有威科夫故事。</div>'
+
+    # VCP
+    kind = v['kind'] if v else 'none'
+    if kind == 'active':
+        c = v['card']
+        cur_r = (m['price'] - c['entry']) / (c['entry'] - c['sl']) if c['entry'] > c['sl'] else 0
+        vcp_html = (f'<b>已突破、進行中</b>（{_fmt_time(c["confirm_time"], "1D")} 進場 {fmt_px(c["entry"])}，現在 {cur_r:+.2f}R）'
+                    f'<div class="exs-sub">已經成交的單：照 SL／1:1.5／20根規則管理。</div>')
+        watch.append('VCP 已突破：按計劃管理持倉')
+    elif kind == 'pending':
+        c = v['card']
+        dist = _pct(c['bo'], m['price']) if m.get('price') else None
+        dtxt = '盤中已碰 BO，收盤後記錄' if dist is not None and dist <= 0 else f'現價離 BO {dist:.1f}%'
+        vcp_html = (f'<b>{c.get("c_count")}C 形態成形，還沒突破</b>（BO {fmt_px(c["bo"])}・SL {fmt_px(c["sl"])}・{dtxt}）'
+                    f'<div class="exs-sub">{"⏳ 最後一個C的低點還沒確認。" if c.get("provisional") else ""}在 BO 掛觸價單，碰到就成交。</div>')
+        if dist is not None and 0 < dist <= QUICK_BO_PCT:
+            ready.append(f'VCP：在 BO <b>{fmt_px(c["bo"])}</b> 掛觸價單，SL {fmt_px(c["sl"])}（離 {dist:.1f}%，在快突破範圍）')
+        elif dist is not None and dist > QUICK_BO_PCT:
+            watch.append(f'VCP：離 BO 還有 {dist:.1f}%，等靠近到 {QUICK_BO_PCT:g}% 以內再掛')
+    elif kind == 'used':
+        vcp_html = '<b>這個形態已經突破過</b><div class="exs-sub">最後一個C已經用過了（突破後結束），等新的C形成。</div>'
+    else:
+        cc = v.get('c_count', 0) if v else 0
+        why = ('最近的C系列是空頭方向' if v and v.get('is_bear') else
+               (f'只有 {cc}C，至少要 C2' if v and v.get('has_c') else '目前沒有C系列收縮'))
+        vcp_html = f'<b>沒有可交易的形態</b><div class="exs-sub">{why}。</div>'
+
+    # 結論
+    bad = []
+    if not s2: bad.append('日線不是 S2')
+    if not liquid: bad.append('成交額不夠，買賣容易滑價')
+    if bad and ready:
+        verdict, vcls = '🟡 有訊號，但要小心：' + '、'.join(bad), '#6b5a1e'
+    elif bad:
+        verdict, vcls = '🔴 不做：' + '、'.join(bad), '#7f1d1d'
+    elif ready:
+        verdict, vcls = '🟢 可以準備掛單', '#1b5e20'
+    elif watch:
+        verdict, vcls = '🟡 觀察，還不能動手', '#6b5a1e'
+    else:
+        verdict, vcls = '⚪ 目前沒有訊號', '#37474f'
+    todo = ''.join(f'<li>{x}</li>' for x in ready + watch) or '<li>暫時不用管這一檔。</li>'
+    both = r and r['stage'] in ('green', 'orange', 'yellow') and kind in ('pending', 'active')
+    extra = ('<div class="exs-sub" style="margin-top:6px">🧱＋🃏 威科夫和 VCP 同時有故事：兩個系統都看到，比較少見，值得特別留意'
+             '（是不是真的比較好，等卡片的「進場時威科夫」戰績累積再驗證）。</div>') if both else ''
+    return f'''<div class="exs"><div class="exs-title">📋 一眼看懂：{_h(sym_code(m["symbol"]))} {_h(m["name"] if m["name"] != sym_code(m["symbol"]) else "")}</div>
+<div class="exs-row"><div class="exs-k">結論</div><div class="exs-v"><span style="background:{vcls};padding:2px 8px;border-radius:4px;color:#fff"><b>{verdict}</b></span>
+<ul class="exs-ul">{todo}</ul>{extra}</div></div>
+<div class="exs-row"><div class="exs-k">📖 故事</div><div class="exs-v">
+<div class="sty"><b>🧱 威科夫</b>{"".join(f"<p>{x}</p>" for x in wy_story_plain(r))}</div>
+<div class="sty"><b>🃏 VCP</b>{"".join(f"<p>{x}</p>" for x in vcp_story_plain(v, m))}</div></div></div>
+<div class="exs-row"><div class="exs-k">🧱 威科夫</div><div class="exs-v">{wy_html}</div></div>
+<div class="exs-row"><div class="exs-k">🃏 VCP（1D）</div><div class="exs-v">{vcp_html}</div></div>
+<div class="exs-row"><div class="exs-k">檢查清單</div><div class="exs-v"><ul class="exs-ul" style="list-style:none;padding-left:0">{"".join(f"<li>{x}</li>" for x in checks)}</ul></div></div>
+<div class="exs-tip">💡 這是系統照規則算出來的，不是買賣建議。動手前還是要打開圖，自己看故事和上方的牆。</div></div>'''
+
+@app.route('/stock_card')
+def stock_card_page():
+    sym_raw = (request.args.get('symbol') or '').strip()
+    opts = ''.join(f'<option value="{_h(sym_code(x))}">{_h(NAMES.get(x, ""))}</option>' for x in dict.fromkeys(SYMBOLS))
+    nav = ('<div class="nav"><a href="/">📊 C系列總表</a><a href="/cards">🃏 突破卡片</a><a href="/wyckoff">🧱 威科夫突破</a>'
+           '<a href="/backtest">🧪 C1門檻回測</a><a href="/exit_backtest">🚪 出場回測</a><a href="/entry_backtest">⚖️ 進場比較</a>'
+           '<a class="nav-on" href="/stock_card">🔎 單股卡片</a><a href="/stock_bt">🔍 單股回測</a></div>')
+    form = (f'<form class="sbform" method="get" action="/stock_card">'
+            f'<input name="symbol" list="scsyms" placeholder="股票代碼，例：{_h(sym_code(M["default_sym"]))}" value="{_h(sym_raw)}" autocomplete="off">'
+            f'<datalist id="scsyms">{opts}</datalist><button type="submit">🔎 看卡片</button></form>')
+    head = (f'<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+            f'<title>🔎 單股卡片</title><style>{CARDS_CSS}{SB_CSS}{WY_CARD_CSS}'
+            '.exs{background:#1f2440;border:1px solid #3d4780;border-radius:10px;padding:14px 18px;margin:10px 0 14px;max-width:820px}'
+            '.exs-title{font-size:17px;font-weight:bold;color:#fff;margin-bottom:10px}'
+            '.exs-row{display:flex;gap:12px;padding:9px 0;border-top:1px solid #333a66;font-size:14px}'
+            '.exs-k{min-width:110px;color:#9fb3e8;font-weight:bold}.exs-v{flex:1;color:#eee;line-height:1.6}'
+            '.exs-sub{color:#9aa0b8;font-size:12px;margin-top:2px}.exs-ul{margin:6px 0 0;padding-left:20px;line-height:1.8}'
+            '.exs-tip{background:#2a2410;border:1px solid #6b5a1e;border-radius:8px;padding:10px 14px;margin-top:10px;font-size:13px;color:#f3e3b0}'
+            '.sty{margin-bottom:8px}.sty b{color:#ffd54f}.sty p{margin:3px 0;line-height:1.7;font-size:13.5px}'
+            '.scsec{margin-top:14px}.scsec h3{font-size:15px;margin:10px 0 6px}.sclinks a{color:#7ab3ff;margin-right:14px;font-size:13px}'
+            '@media (max-width:600px){.exs-row{flex-direction:column;gap:2px}.exs-k{min-width:0}}</style></head><body>'
+            f'<h2>&#x1F1F2;&#x1F1FE; 大馬莊家思維 ・ 🔎 單股卡片</h2>'
+            f'<div class="subtitle">選一檔股票，看它現在的 🧱 威科夫卡片和 🃏 VCP 卡片（日線），加上一眼看懂的分析。用的是跟正式掃描同一套規則。</div>'
+            f'{nav}{form}')
+    if not sym_raw:
+        return head + ('<div class="sbsum">輸入股票代碼，按 <b>🔎 看卡片</b>。<br>'
+                       '<span class="muted">每一種威科夫燈號（🟢🟠🟡⚪❌）都會用卡片顯示；沒有燈號的股票也會告訴你為什麼。'
+                       '同一檔 5 分鐘內重看會用暫存結果。</span></div></body></html>')
+    sym = norm_sym(sym_raw)
+    try:
+        d = stock_card_data(sym)
+    except Exception as e:
+        log.warning(f"🔎 單股卡片 {sym}: {e}")
+        return head + f'<div class="sbsum neg">出錯：{_h(e)}</div></body></html>'
+    if d.get('error'):
+        return head + f'<div class="sbsum">{_h(sym_code(sym))}：{_h(d["error"])}<br><span class="muted">代碼對嗎？可以用搜尋框的下拉選單挑。</span></div></body></html>'
+    m, r, v = d['meta'], d['wy'], d['vcp']
+    code = sym_code(sym)
+    links = (f'<div class="sclinks"><a href="{tv_chart_base()}?symbol={m["tv_symbol"]}&interval=D" target="_blank">📈 TradingView 日線</a>'
+             f'<a href="/stock_bt?symbol={_h(code)}&strategy=wy">🔍 威科夫單股回測</a>'
+             f'<a href="/stock_bt?symbol={_h(code)}&strategy=vcp&tf=1D">🔍 VCP 單股回測</a>'
+             f'<span class="muted" style="font-size:12px">現價 {fmt_px(m["price"])}（{m["price_time"]}）</span></div>')
+    if r:
+        wy_card = wy_card_green(r) if r['stage'] == 'green' else (wy_card_orange(r) if r['stage'] == 'orange' else wy_card_generic(r))
+    else:
+        wy_card = '<div class="empty">威科夫：沒有看到有洗盤的橫盤區間，這一檔目前沒有威科夫卡片。</div>'
+    kind = v['kind']
+    if kind == 'active':
+        vcp_card = _render_active(v['card'], '1D')
+    elif kind in ('pending', 'used'):
+        vcp_card = _render_pending(v['card'], '1D')
+    else:
+        vcp_card = '<div class="empty">VCP：目前沒有至少 C2 的多頭形態，沒有突破卡片。</div>'
+    return head + (f'{links}{stock_card_summary(d)}'
+                   f'<div class="scsec"><h3>🧱 威科夫卡片</h3><div class="grid">{wy_card}</div></div>'
+                   f'<div class="scsec"><h3>🃏 VCP 突破卡片（1D）</h3><div class="grid">{vcp_card}</div></div>'
+                   '<div class="foot">威科夫用已收盤的日K判斷（收盤後才會變）；現價是最新價格。VCP 卡片如果已經在「🃏 突破卡片」頁，'
+                   '這裡顯示的就是同一張；不在的話是即時算出來的（只顯示，不會記錄）。只供自己研究，不是投資建議。</div></body></html>')
+
 @app.route('/exit_backtest')
 def exit_backtest_page():
     """🚪 出場規則回測。?run=1D&c1=10 開始（背景執行），可加 &limit=50 先試"""
@@ -6545,7 +6889,7 @@ details.exs-detail summary{{color:#7ab3ff}}
 @media (max-width:600px){{.exs-row{{flex-direction:column;gap:2px}} .exs-k{{min-width:0}}}}</style></head><body>
 <h2>&#x1F1F2;&#x1F1FE; 大馬莊家思維 ・ 出場規則回測</h2>
 <div class="subtitle">同一批進場（跟突破卡片同一套規則：{"盤中碰到BO就成交、進場價=BO" if CARD_ENTRY_MODE == "touch" else "收盤站上BO進場"}、SL在最後一個C低點下方），只換出場方式，看哪一種總R最好。正式掃描完全不受影響。</div>
-<div class="nav"><a href="/">📊 C系列總表</a><a href="/cards">🃏 突破卡片</a><a href="/wyckoff">🧱 威科夫突破</a><a href="/backtest">🧪 C1門檻回測</a><a class="nav-on" href="/exit_backtest">🚪 出場回測</a><a href="/entry_backtest">⚖️ 進場比較</a><a href="/stock_bt">🔍 單股回測</a></div>
+<div class="nav"><a href="/">📊 C系列總表</a><a href="/cards">🃏 突破卡片</a><a href="/wyckoff">🧱 威科夫突破</a><a href="/backtest">🧪 C1門檻回測</a><a class="nav-on" href="/exit_backtest">🚪 出場回測</a><a href="/entry_backtest">⚖️ 進場比較</a><a href="/stock_card">🔎 單股卡片</a><a href="/stock_bt">🔍 單股回測</a></div>
 {status_html}
 <div class="tfbar">{runbar}</div>
 <div class="tfbar">{viewbar}</div>
@@ -6648,7 +6992,7 @@ details.exs-detail summary{{color:#7ab3ff}}
 @media (max-width:600px){{.exs-row{{flex-direction:column;gap:2px}} .exs-k{{min-width:0}}}}</style></head><body>
 <h2>&#x1F1F2;&#x1F1FE; 大馬莊家思維 ・ ⚖️ 進場方式比較</h2>
 <div class="subtitle">同一批C系列形態、同樣的SL／1:1.5／20根到期，只換進場方式：<b>A 盤中掛單</b>（盤中碰到BO就成交，老師SOP）vs <b>B 收盤確認</b>（收盤站上BO才進場，突破卡片的舊算法）。正式掃描完全不受影響。</div>
-<div class="nav"><a href="/">📊 C系列總表</a><a href="/cards">🃏 突破卡片</a><a href="/wyckoff">🧱 威科夫突破</a><a href="/backtest">🧪 C1門檻回測</a><a href="/exit_backtest">🚪 出場回測</a><a class="nav-on" href="/entry_backtest">⚖️ 進場比較</a><a href="/stock_bt">🔍 單股回測</a></div>
+<div class="nav"><a href="/">📊 C系列總表</a><a href="/cards">🃏 突破卡片</a><a href="/wyckoff">🧱 威科夫突破</a><a href="/backtest">🧪 C1門檻回測</a><a href="/exit_backtest">🚪 出場回測</a><a class="nav-on" href="/entry_backtest">⚖️ 進場比較</a><a href="/stock_card">🔎 單股卡片</a><a href="/stock_bt">🔍 單股回測</a></div>
 {status_html}
 <div class="tfbar">{runbar}</div>
 <div class="tfbar">{viewbar}</div>
@@ -7009,7 +7353,7 @@ def build_stock_bt_html(sym_raw, strategy, tf, focus):
     opts = ''.join(f'<option value="{_h(sym_code(x))}">{_h(NAMES.get(x, ""))}</option>' for x in dict.fromkeys(SYMBOLS))
     tf_opts = ''.join(f'<option value="{t}"{" selected" if t == tf else ""}>{t}</option>' for t in tfs)
     nav = ('<div class="nav"><a href="/">📊 C系列總表</a><a href="/cards">🃏 突破卡片</a><a href="/wyckoff">🧱 威科夫突破</a>'
-           '<a href="/backtest">🧪 C1門檻回測</a><a href="/exit_backtest">🚪 出場回測</a><a href="/entry_backtest">⚖️ 進場比較</a><a class="nav-on" href="/stock_bt">🔍 單股回測</a></div>')
+           '<a href="/backtest">🧪 C1門檻回測</a><a href="/exit_backtest">🚪 出場回測</a><a href="/entry_backtest">⚖️ 進場比較</a><a href="/stock_card">🔎 單股卡片</a><a class="nav-on" href="/stock_bt">🔍 單股回測</a></div>')
     form = (f'<form class="sbform" method="get" action="/stock_bt">'
             f'<input name="symbol" list="sbsyms" placeholder="股票代碼，例：{_h(sym_code(M["default_sym"]))}" value="{_h(sym_raw)}" autocomplete="off">'
             f'<datalist id="sbsyms">{opts}</datalist>'
