@@ -3337,7 +3337,12 @@ MIN_C_FOR_CARD    = 2       # 至少要有C2
 TP1_R             = 1.5
 TP2_R             = 2.0
 MAX_HOLD_BARS     = 20      # 突破後20根K線內沒碰SL也沒到1:1.5 → 記為到期
-CHASE_MAX_PCT     = 3.0     # 確認價高於BO超過3% → 標「⚠️不追」
+CHASE_MAX_PCT     = 3.0     # 進場價高於BO超過3%（掛單模式＝開盤跳空太高）→ 標「⚠️不追」
+# 進場方式（MH 2026-10-30，⚖️進場比較回測證實掛單比較好）：
+#   'touch' = 盤中最高價碰到BO就算成交（進場價=BO，跳空高開用開盤價）← 預設，跟老師SOP在BO掛單一樣
+#   'close' = 收盤站上BO才算突破（進場價=收盤價）← 舊算法；設環境變數 CARD_ENTRY_MODE=close 可切回
+# 不管哪一種，都只用「已收盤」的K線判斷（收盤後才記錄），不會用到盤中還沒收完的K線。
+CARD_ENTRY_MODE   = 'close' if menv('CARD_ENTRY_MODE', 'touch').lower() == 'close' else 'touch'
 VOL_SURGE_X       = 1.5     # 突破量 ≥ 1.5倍20根均量 → 標「🔥放量」
 PROVISIONAL_BARS  = 2       # 最後一個C低點之後確認K線少於2根 → 標⏳（跟crypto版同一個定義）
 BACKFILL_BARS     = int(os.environ.get('CARD_BACKFILL_BARS', '20'))  # 第一次看到某檔時，回放最近20根K線補抓已突破案例
@@ -3498,7 +3503,8 @@ def _setup_from_analysis(df, res, tf='1D'):
     }
 
 def _open_case(key, meta, tf, p, dfc, i, backfill, st, entry=None):
-    # entry=None → 收盤確認（正式卡片）：用收盤價；掛單模式（只有⚖️進場比較回測用）會傳入成交價
+    # entry=None → 收盤確認：用收盤價；掛單模式（touch）會傳入成交價（BO或跳空開盤價）
+    entry_given = entry is not None
     entry = float(dfc['close'].values[i]) if entry is None else float(entry)
     sl = p['sl']
     r = entry - sl
@@ -3517,6 +3523,9 @@ def _open_case(key, meta, tf, p, dfc, i, backfill, st, entry=None):
         'bars_held': 0, 'last_close': entry, 'vol_x': _vol_ratio(dfc, i),
         'atr': atr, 'chase': bool(chase), 'backfill': bool(backfill),
         'close_ok': bool(float(dfc['close'].values[i]) >= p['bo']),   # 進場那根收盤有沒有站上BO
+        'close_px': float(dfc['close'].values[i]),
+        'entry_mode': 'touch' if entry_given else 'close',
+        'wy_entry': meta.get('wy_stage'),                              # 🧱 進場當下威科夫燈號（統計用）
     })
     st['active'][cid] = case
     st['used'][cid] = case['confirm_time']
@@ -3529,7 +3538,7 @@ def _check_pending(key, meta, tf, dfc, backfill, st):
     if not p: return
     pos = _positions_after(dfc, p['last_checked'])
     closes = dfc['close'].values; lows = dfc['low'].values
-    touch = st.get('entry_mode') == 'touch'   # 'touch' = 盤中碰到BO就成交（只有⚖️進場比較回測用）；正式卡片沒有這個key → 收盤確認
+    touch = st.get('entry_mode', CARD_ENTRY_MODE) == 'touch'   # 沒指定就跟正式卡片一樣（CARD_ENTRY_MODE）；⚖️進場比較回測會明確指定
     if touch:
         opens = dfc['open'].values; highs = dfc['high'].values
     for i in pos:
@@ -3601,11 +3610,13 @@ def _card_step(meta, tf, df_all, dfc, res, backfill=False, st=None):
         p['price'] = float(df_all['close'].values[-1])
         p['price_time'] = _iso(df_all.index[-1])
         p['turnover'] = meta.get('turnover')
+        p['wy'] = meta.get('wy_stage')
     _check_active(key, dfc, backfill, st)
     for case in st['active'].values():
         if case.get('key') == key and not df_all.empty:
             case['price'] = float(df_all['close'].values[-1])
             case['turnover'] = meta.get('turnover')
+            case['wy'] = meta.get('wy_stage')
 
 def card_process_tf(meta, tf, df, df_daily, res):
     """scan_symbol()每個時間框架分析完後呼叫"""
@@ -3646,6 +3657,11 @@ def compute_card_stats(tf=None):
                     (f'<{VOL_SURGE_X}x', lambda d: (d.get('vol_x') or 0) < VOL_SURGE_X)]),
         ('⏳', [('無⏳', lambda d: not d.get('provisional')), ('有⏳', lambda d: d.get('provisional'))]),
         ('Base', [('第1個base', lambda d: d.get('base', 0) == 0), ('第2個base以上', lambda d: d.get('base', 0) > 0)]),
+        ('收盤站穩', [('✅ 進場當天收盤站上BO', lambda d: d.get('entry_mode') == 'touch' and d.get('close_ok') is True),
+                     ('⚠️ 進場當天收盤沒站上', lambda d: d.get('entry_mode') == 'touch' and d.get('close_ok') is False)]),
+        ('進場時威科夫', [('🧱🟢🟠🟡 有吸籌背景', lambda d: d.get('wy_entry') in ('green', 'orange', 'yellow')),
+                         ('⚪❌ 條件不全／跌回', lambda d: d.get('wy_entry') in ('weak', 'fail')),
+                         ('沒有威科夫燈號', lambda d: d.get('entry_mode') == 'touch' and d.get('wy_entry') not in WY_CARD_TAG)]),
     ]
     out = []
     for gname, items in groups:
@@ -3670,8 +3686,14 @@ def send_card_telegram():
             if c.get('vol_x') is not None: tags.append(f"量{c['vol_x']}x" + ('🔥' if c['vol_x'] >= VOL_SURGE_X else ''))
             if c.get('provisional'): tags.append('⏳')
             if c.get('chase'): tags.append('⚠️不追')
-            lines.append(f"🚀 突破 {head}\n  確認價{fmt_px(c['entry'])} BO{fmt_px(c['bo'])} SL{fmt_px(c['sl'])} "
-                         f"1:1.5={fmt_px(c['tp1'])} 1:2={fmt_px(c['tp2'])}\n  {' '.join(tags)}")
+            if c.get('wy_entry') in WY_CARD_TAG: tags.append(WY_CARD_TAG[c['wy_entry']][0])
+            if c.get('entry_mode') == 'touch':
+                tags.insert(0, '✅收盤站穩' if c.get('close_ok') else '⚠️收盤沒站穩')
+                lines.append(f"🚀 觸價成交 {head}\n  進場{fmt_px(c['entry'])}（BO{fmt_px(c['bo'])}）收盤{fmt_px(c.get('close_px'))} SL{fmt_px(c['sl'])} "
+                             f"1:1.5={fmt_px(c['tp1'])} 1:2={fmt_px(c['tp2'])}\n  {' '.join(tags)}")
+            else:
+                lines.append(f"🚀 突破 {head}\n  確認價{fmt_px(c['entry'])} BO{fmt_px(c['bo'])} SL{fmt_px(c['sl'])} "
+                             f"1:1.5={fmt_px(c['tp1'])} 1:2={fmt_px(c['tp2'])}\n  {' '.join(tags)}")
         else:
             icon = {'TP1': '✅ 達1:1.5', 'SL': '❌ 止損', 'TIMEOUT': '⏱ 20根到期'}.get(c['result'], c['result'])
             lines.append(f"{icon} {head} R={c['r_mult']:+.2f}")
@@ -3805,7 +3827,7 @@ def load_bt_result(tf):
 
 # ============================================================
 # 🚪 出場規則回測：同一批進場（突破卡片規則），只換出場方式比較
-# 進場 = 收盤站上BO那根的收盤價；初始SL = 最後一個C低點−緩衝（跟卡片一樣）
+# 進場 = 跟突破卡片一樣（預設盤中碰到BO成交、進場價=BO；CARD_ENTRY_MODE=close時是收盤價）；初始SL = 最後一個C低點−緩衝
 # 跳空低開到SL下方 → 用開盤價出場（比較接近實際）；同一根同時碰SL和目標 → 保守算SL
 # ============================================================
 EXIT_RULES = [
@@ -4028,8 +4050,9 @@ def run_exit_backtest(tf='1D', c1=10, bars=None, limit=None):
                     if e_idx is None: continue
                     entries_n += 1
                     ent = None
+                    same_bar_sl = e.get('result') == 'SL' and e.get('end_time') == e['confirm_time']   # 掛單成交那根就跌到SL
                     for rule in EXIT_RULES:
-                        out = _simulate_exit(df, e_idx, e['entry'], e['sl'], rule, ma20)
+                        out = (-1.0, 'SL', 0, 0.0) if same_bar_sl else _simulate_exit(df, e_idx, e['entry'], e['sl'], rule, ma20)
                         if out is None:
                             open_n[rule[0]] += 1; continue
                         rm, why, k, mfe = out
@@ -4091,7 +4114,7 @@ def load_ex_result(tf, c1):
 # ============================================================
 # ⚖️ 進場方式比較回測（MH 2026-10-30）：同一批C系列形態，比較兩種進場
 #   A 盤中掛單：盤中最高價碰到BO就成交（成交價=BO；跳空高開用開盤價）← 老師SOP／老師SCV網站的算法
-#   B 收盤確認：收盤站上BO才進場（進場價=當天收盤）← 我們突破卡片現在的算法
+#   B 收盤確認：收盤站上BO才進場（進場價=當天收盤）← 突破卡片的舊算法（2026-10-30前）
 # SL、1:1.5目標、20根到期，全部跟突破卡片一樣；只換進場方式。正式掃描完全不受影響。
 # 拆解：A − B ＝（同一個形態兩邊都進場：掛單價格比較好多賺的）＋（只有A進場的假突破：盤中衝過、收盤沒站上）
 # ============================================================
@@ -4161,7 +4184,7 @@ def run_entry_backtest(tf='1D', bars=None, limit=None):
                 first_date = d0 if first_date is None or d0 < first_date else first_date
                 last_date = d1 if last_date is None or d1 > last_date else last_date
                 stA = {'pending': {}, 'active': {}, 'done': [], 'used': {}, 'events': [], 'entry_mode': 'touch'}
-                stB = {'pending': {}, 'active': {}, 'done': [], 'used': {}, 'events': []}
+                stB = {'pending': {}, 'active': {}, 'done': [], 'used': {}, 'events': [], 'entry_mode': 'close'}
                 for t in list(range(start, n, BT_STEP)) + [n]:
                     d = df.iloc[:t]
                     dd = d if tf == '1D' else daily.iloc[:bisect_right(daily_dates, pd.Timestamp(d.index[-1]).date())]
@@ -4462,7 +4485,7 @@ def exit_summary_html(res):
         tips.append(f'加上「{_h(fx_best["group"])}：{_h(fx_best["label"])}」這個條件，幾乎沒漲可以從 '
                     f'{fx["all"]["none_pct"]:.0f}% 降到 {fx_best["none_pct"]:.0f}%，值得先紙上觀察。')
     if i_nc == '🟢':
-        tips.append('「排除⚠️不追」有效：實際交易時，確認價高於 BO 太多的就不要追。')
+        tips.append('「排除⚠️不追」有效：實際交易時，進場價高於 BO 太多的就不要追。')
     if i_s2 == '❌' and s2_share < 90:
         tips.append('「只看日線S2」沒有幫助，不用特別靠它過濾。')
     if c_icon != '🟢':
@@ -5017,6 +5040,7 @@ def wy_scan_begin():
 def wy_process_symbol(meta, df_daily):
     """scan_symbol()抓到日線後呼叫：1)用已收盤日K判斷階段 2)今天K線還沒收完時，順便盯盤（每小時一次）"""
     sym = meta['symbol']
+    meta['wy_stage'] = None
     try:
         closed = closed_bars(df_daily, '1D')
         if len(closed) < 121:
@@ -5042,6 +5066,7 @@ def wy_process_symbol(meta, df_daily):
         r.update({'name': meta.get('name'), 'sector': meta.get('sector'), 'tv_symbol': meta.get('tv_symbol'),
                   'turnover': meta.get('turnover'), 'liquid': wy_liquid(meta.get('turnover'))})
         wy_rows_pending.append(r)
+        meta['wy_stage'] = r['stage']            # 🧱 給突破卡片顯示燈號
         try:
             wy_track_live(meta, ddf, r)            # 📊 🟢 結果追蹤
         except Exception as e:
@@ -5796,6 +5821,7 @@ select,.search-box{background:#2a2a3e;color:#fff;border:1px solid #444;padding:8
 .tag{border:1px solid #444;color:#bbb;font-size:11px;padding:1px 6px;border-radius:4px}
 .tag.s2{border-color:#1565c0;color:#7ab3ff} .tag.sx{border-color:#c62828;color:#ff8a8a}
 .tag.warn{border-color:#e65100;color:#ffb74d} .tag.hot{border-color:#2e7d32;color:#a5d6a7}
+a.tag{text-decoration:none}
 .line{font-size:12px;color:#ddd;display:flex;justify-content:space-between;margin-bottom:6px}
 .line .muted{color:#8b949e}
 .pxrow{display:flex;justify-content:space-between;border-top:1px solid #333;padding-top:7px;margin-top:4px}
@@ -5831,6 +5857,15 @@ def _fmt_time(iso, tf):
     except Exception:
         return str(iso)[:10]
 
+# 🧱 卡片上的威科夫燈號（同一檔在威科夫突破頁目前的狀態；⛔資料不足不顯示）
+WY_CARD_TAG = {
+    'green':  ('🧱🟢 威科夫真突破', 'hot'),
+    'orange': ('🧱🟠 威科夫等回踩', ''),
+    'yellow': ('🧱🟡 威科夫洗盤完成', ''),
+    'weak':   ('🧱⚪ 威科夫條件不全', ''),
+    'fail':   ('🧱❌ 威科夫跌回區間', 'warn'),
+}
+
 def _card_tags(c, tf, extra=None):
     tags = [f'<span class="tag">{_h(c.get("sector") or "其他")}</span>', f'<span class="tag">{tf}</span>']
     s = c.get('stage', 0)
@@ -5841,6 +5876,12 @@ def _card_tags(c, tf, extra=None):
         hot = c['vol_x'] >= VOL_SURGE_X
         tags.append(f'<span class="tag {"hot" if hot else ""}">{"🔥" if hot else ""}量{c["vol_x"]}x</span>')
     if c.get('chase'): tags.append('<span class="tag warn">⚠️不追</span>')
+    if c.get('close_ok') is True:  tags.append('<span class="tag hot">✅ 收盤站穩</span>')
+    if c.get('close_ok') is False: tags.append('<span class="tag warn">⚠️ 收盤沒站穩</span>')
+    wy = c.get('wy')
+    if wy in WY_CARD_TAG:
+        txt, cls = WY_CARD_TAG[wy]
+        tags.append(f'<a class="tag {cls}" href="/wyckoff" title="同一檔在威科夫突破頁的燈號">{txt}</a>')
     _to = c.get('turnover')
     if _to is not None:
         tags.append(f'<span class="tag{"" if _to >= TG_MIN_TURNOVER_MYR else " warn"}">成交額{_fmt_turnover(_to)}'
@@ -5867,14 +5908,15 @@ def _render_pending(c, tf):
     tp1, tp2 = calc_targets(bo, sl)
     dist = _pct(bo, price) if price else None
     if dist is None:      dist_html = ''
-    elif dist <= 0:       dist_html = '<span class="dist over">盤中已過BO・等收盤</span>'
+    elif dist <= 0:       dist_html = ('<span class="dist over">盤中已碰BO・收盤後記錄</span>' if CARD_ENTRY_MODE == 'touch'
+                                       else '<span class="dist over">盤中已過BO・等收盤</span>')
     else:                 dist_html = f'<span class="dist">差 {dist:.1f}%</span>'
     return f'''<div class="card pend" {_search_attr(c)}>
 <div class="hd"><a href="{_tv_url(c, tf)}" target="_blank">{code}</a><span class="nm">{_nm(c)}</span>{dist_html}</div>
 {_card_tags(c, tf)}
 <div class="line"><span>第 {c.get("base", 0) + 1} 個 base ・ 收縮 {c.get("c_count")} 段</span><span class="muted">還沒突破</span></div>
 <div class="pxrow"><div><div class="lbl">現價</div><div class="big">{fmt_px(price)}</div></div>
-<div class="r"><div class="lbl">BO</div><div class="big">{fmt_px(bo)}</div><div class="lbl">C高點 {fmt_px(c["c_hv"])}・收盤站上才算突破</div></div></div>
+<div class="r"><div class="lbl">BO</div><div class="big">{fmt_px(bo)}</div><div class="lbl">C高點 {fmt_px(c["c_hv"])}・{"在BO掛觸價單" if CARD_ENTRY_MODE == "touch" else "收盤站上才算突破"}</div></div></div>
 <div class="lv"><div><span>SL</span><span>{fmt_px(sl)} <span class="neg">({_pct(sl, bo):.1f}%)</span></span></div>
 <div><span>1:1.5</span><span>{fmt_px(tp1)} <span class="pos">(+{_pct(tp1, bo):.1f}%)</span></span></div>
 <div><span>1:2</span><span>{fmt_px(tp2)} <span class="pos">(+{_pct(tp2, bo):.1f}%)</span></span></div></div>
@@ -5888,11 +5930,18 @@ def _render_active(c, tf):
     cur_r = (price - entry) / r if r else 0
     extra = [f'<span class="tag">已過 {c.get("bars_held", 0)}/{MAX_HOLD_BARS} 根</span>']
     if c.get('backfill'): extra.append('<span class="tag">回補</span>')
+    if c.get('entry_mode') == 'touch':
+        how = '觸價成交'
+        elbl = '進場價（BO成交）' if abs(entry - c['bo']) < 1e-9 else '進場價（跳空開盤成交）'
+        sub = f'當天收盤 {fmt_px(c.get("close_px"))}・現價 {fmt_px(price)}（{cur_r:+.2f}R）'
+    else:
+        how, elbl = '收盤確認', '確認價（進場）'
+        sub = f'現價 {fmt_px(price)}（{cur_r:+.2f}R）'
     return f'''<div class="card" {_search_attr(c)}>
 <div class="hd"><a href="{_tv_url(c, tf)}" target="_blank">{code}</a><span class="nm">{_nm(c)}</span><span class="dt">{_fmt_time(c["confirm_time"], tf)}</span></div>
 {_card_tags(c, tf, extra)}
-<div class="line"><span>第 {c.get("base", 0) + 1} 個 base ・ 收縮 {c.get("c_count")} 段</span><span class="muted">{_fmt_time(c["confirm_time"], tf)} 收盤確認</span></div>
-<div class="pxrow"><div><div class="lbl">確認價（進場）</div><div class="big">{fmt_px(entry)}</div><div class="lbl">現價 {fmt_px(price)}（{cur_r:+.2f}R）</div></div>
+<div class="line"><span>第 {c.get("base", 0) + 1} 個 base ・ 收縮 {c.get("c_count")} 段</span><span class="muted">{_fmt_time(c["confirm_time"], tf)} {how}</span></div>
+<div class="pxrow"><div><div class="lbl">{elbl}</div><div class="big">{fmt_px(entry)}</div><div class="lbl">{sub}</div></div>
 <div class="r"><div class="lbl">BO</div><div class="big">{fmt_px(c["bo"])}</div><div class="lbl">C高點 {fmt_px(c["c_hv"])}</div></div></div>
 <div class="lv"><div><span>SL</span><span>{fmt_px(sl)} <span class="neg">({_pct(sl, entry):.1f}%)</span></span></div>
 <div><span>1:1.5</span><span>{fmt_px(c["tp1"])} <span class="pos">(+{_pct(c["tp1"], entry):.1f}%)</span></span></div>
@@ -5908,6 +5957,15 @@ def _render_done(c, tf):
 {_card_tags(c, tf)}
 <div class="line"><span>{_fmt_time(c["confirm_time"], tf)} 進場 {fmt_px(c["entry"])} → {_fmt_time(c.get("end_time"), tf)}</span><span class="{cls}">{c["r_mult"]:+.2f}R</span></div>
 </div>'''
+
+CARD_HELP_TOUCH = f"""・<b>條件</b>：某一根已收盤K線的「最高價」≥ BO，等於你在BO掛的觸價單成交了；收盤後才記錄（不用盤中還沒收完的K線）。<br>
+・<b>進場價</b>= BO；如果當天開盤就跳空高過BO，觸價單會用開盤價成交，進場價＝開盤價。1:1.5 / 1:2 用進場價計算。<br>
+・<b>為什麼這樣算</b>：⚖️進場比較回測證實，在BO掛單比等收盤確認才買總R比較好（價格優勢大過假突破的損失），而且跟你實際下單一樣，戰績才對得上交易日誌。<br>
+・<b>✅ 收盤站穩</b>＝成交當天收盤也站上BO；<b>⚠️ 收盤沒站穩</b>＝盤中衝過、收盤跌回BO下面（假突破風險比較高，回測平均明顯比較差）。<br>
+・<b>當天收盤</b>＝成交那天的收盤價；<b>現價（±R）</b>＝現在賺／虧幾R（R = 進場價 − SL）。<br>
+・<b>已過 x/{MAX_HOLD_BARS} 根</b>= 成交後過了幾根K線。<b>⚠️不追</b>= 開盤跳空高過BO超過{CHASE_MAX_PCT:.0f}%（成交價離SL太遠）。<b>回補</b>= 第一次部署時回放最近{BACKFILL_BARS}根K線補抓的案例。<br>
+・<b>🧱 威科夫燈號</b>：同一檔在威科夫頁目前的狀態，可以幫你決定成交後要不要繼續拿（特別是 ⚠️ 收盤沒站穩的單）。<br>
+"""
 
 def build_cards_html(tf):
     with cards_lock:
@@ -5953,7 +6011,7 @@ def build_cards_html(tf):
     return f'''<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>🃏 大馬突破卡片</title><style>{CARDS_CSS}</style></head><body>
 <h2>&#x1F1F2;&#x1F1FE; 大馬莊家思維 ・ 突破卡片</h2>
-<div class="subtitle">BO = 最後一個C高點+緩衝（收盤確認）・ SL = 最後一個C低點−緩衝（天圖1%、時圖0.5%）・ 目標 1:1.5 / 1:2 ・ 至少C2、只看多頭</div>
+<div class="subtitle">BO = 最後一個C高點+緩衝（{"盤中碰到就算成交，收盤後記錄" if CARD_ENTRY_MODE == "touch" else "收盤確認"}）・ SL = 最後一個C低點−緩衝（天圖1%、時圖0.5%）・ 目標 1:1.5 / 1:2 ・ 至少C2、只看多頭</div>
 <div class="nav"><a href="/">📊 C系列總表</a><a class="nav-on" href="/cards?tf={tf}">🃏 突破卡片</a><a href="/wyckoff">🧱 威科夫突破</a><a href="/backtest">🧪 C1門檻回測</a><a href="/exit_backtest">🚪 出場回測</a><a href="/entry_backtest">⚖️ 進場比較</a><a href="/stock_bt">🔍 單股回測</a></div>
 {warn}{banner}
 <div class="tfbar">{tfbar}</div>
@@ -5961,23 +6019,25 @@ def build_cards_html(tf):
 <input class="search-box" id="q" placeholder="搜尋代碼或名稱..." oninput="f()"></div>
 <div style="color:#8b949e;font-size:12px">更新：{last}</div>
 
-<div class="flow">流程：C系列形態成形 → <b>① 快突破</b>（等它突破）→ 某天收盤站上BO → <b>② 已突破、進行中</b>（追蹤結果）→ 碰SL／達1:1.5／過{MAX_HOLD_BARS}根 → <b>③ 最近結束</b>（記錄成績）</div>
+<div class="flow">流程：C系列形態成形 → <b>① 快突破</b>（等它突破）→ 某天{"盤中碰到BO（觸價成交）" if CARD_ENTRY_MODE == "touch" else "收盤站上BO"} → <b>② 已突破、進行中</b>（追蹤結果）→ 碰SL／達1:1.5／過{MAX_HOLD_BARS}根 → <b>③ 最近結束</b>（記錄成績）</div>
 
 <div class="sec"><h3>📈 ① 快突破（{len(quick)}）</h3>
-<div class="desc">快要突破了，先放進觀察名單：形態已成形，但還沒收盤站上BO，現價離BO {QUICK_BO_PCT:.0f}% 以內。</div>
+<div class="desc">快要突破了，先放進觀察名單：形態已成形，但還沒{"碰到" if CARD_ENTRY_MODE == "touch" else "收盤站上"}BO，現價離BO {QUICK_BO_PCT:.0f}% 以內。{"可以在BO預先掛觸價單。" if CARD_ENTRY_MODE == "touch" else ""}</div>
 <details class="help"><summary>📖 詳細說明</summary><div>
-・<b>條件</b>：C系列至少到C2、MA多頭排列；還沒有任何一根K線「收盤」站上BO；現價離BO ≤ {QUICK_BO_PCT:.0f}%。<br>
+・<b>條件</b>：C系列至少到C2、MA多頭排列；還沒有任何一根K線{"的最高價碰到" if CARD_ENTRY_MODE == "touch" else "「收盤」站上"}BO；現價離BO ≤ {QUICK_BO_PCT:.0f}%。<br>
+・<b>🧱 威科夫燈號</b>：同一檔在「🧱 威科夫突破」頁目前的狀態（🟢真突破／🟠等回踩／🟡洗盤完成／⚪條件不全／❌跌回區間）。有吸籌背景的BO比較有故事，可以當掛單前的參考；沒有燈號＝威科夫沒看到區間。<br>
 ・<b>用途</b>：提前準備——先看圖、決定要不要做，可以在券商預先設好觸價單。<br>
 ・<b>BO（Trigger／進場點）</b>= 最後一個C的高點 + 緩衝（天圖1%、時圖0.5%）。<br>
 ・<b>SL</b> = 最後一個C的低點 − 緩衝（天圖1%、時圖0.5%）。<br>
 ・<b>1:1.5 / 1:2</b>：假設在BO價格進場來計算；括號裡的%是相對BO的距離。「差 x%」= 現價還要漲多少才到BO。<br>
-・<b>接下來</b>：哪天收盤 ≥ BO → 移到 ②；還沒突破就先跌破SL → 形態失敗，直接從名單消失（不會進 ③）。
+・<b>接下來</b>：哪天{"最高價 ≥ BO（收盤後判斷）" if CARD_ENTRY_MODE == "touch" else "收盤 ≥ BO"} → 移到 ②；還沒突破就先跌破SL → 形態失敗，直接從名單消失（不會進 ③）。
 </div></details>
 {grid([p for _, p in quick], _render_pending, f"{tf}：目前沒有快突破的。")}</div>
 
 <div class="sec"><h3>🚀 ② 已突破、進行中（{len(act)}）</h3>
-<div class="desc">已經收盤站上BO，正在追蹤結果：還沒碰到SL、也還沒到1:1.5，最多追蹤{MAX_HOLD_BARS}根K線。</div>
+<div class="desc">{"已經碰到BO（掛單已成交）" if CARD_ENTRY_MODE == "touch" else "已經收盤站上BO"}，正在追蹤結果：還沒碰到SL、也還沒到1:1.5，最多追蹤{MAX_HOLD_BARS}根K線。</div>
 <details class="help"><summary>📖 詳細說明</summary><div>
+{CARD_HELP_TOUCH if CARD_ENTRY_MODE == "touch" else ""}<div{" style='display:none'" if CARD_ENTRY_MODE == "touch" else ""}>
 ・<b>條件</b>：某一根K線「收盤價」≥ BO，系統就把那根的收盤價當成進場價，開始追蹤。<br>
 ・<b>為什麼要收盤才算</b>：盤中衝過BO、收盤又跌回來是常見的假突破，等收盤確認可以過濾一部分。<br>
 ・<b>確認價（進場）</b>= 突破那根K線的收盤價；1:1.5 / 1:2 改用確認價重新計算（括號%是相對確認價）。<br>
@@ -5985,7 +6045,8 @@ def build_cards_html(tf):
 ・<b>已過 x/{MAX_HOLD_BARS} 根</b>= 突破後過了幾根K線。<br>
 ・<b>⚠️不追</b>= 確認價比BO高超過{CHASE_MAX_PCT:.0f}%（突破那天漲太多，追進去SL會很遠）。<b>回補</b>= 第一次部署時回放最近{BACKFILL_BARS}根K線補抓的案例。<br>
 ・<b>注意</b>：如果你實際在BO掛觸價買單，盤中一突破就成交，進場價會比確認價低、R會比卡片算的好。<br>
-・<b>接下來</b>：碰到SL、或達1:1.5、或過了{MAX_HOLD_BARS}根 → 移到 ③。
+</div>・<b>接下來</b>：碰到SL、或達1:1.5、或過了{MAX_HOLD_BARS}根 → 移到 ③。<br>
+・2026-10-30 前開始的卡片是舊算法（收盤確認，顯示「確認價」），會照舊走完。
 </div></details>
 {grid(act, _render_active, f"{tf}：目前沒有進行中的突破。")}</div>
 
@@ -6004,7 +6065,7 @@ def build_cards_html(tf):
 <table class="st"><tr><th>分組</th><th>條件</th><th>筆數</th><th>✅</th><th>❌</th><th>⏱</th><th>勝率</th><th>平均R</th></tr>{stats_rows}</table></div>
 
 <div class="foot">只供自己研究：數字照規則自動計算，不是投資建議；過去戰績不代表未來。「回補」= 第一次部署時回放最近{BACKFILL_BARS}根K線補抓的案例。<br>
-⏳ = 最後一個C的低點之後確認K線不到{PROVISIONAL_BARS}根 ・ 🔥 = 突破量 ≥ 20根均量{VOL_SURGE_X}倍 ・ ⚠️不追 = 確認價高於BO超過{CHASE_MAX_PCT:.0f}% ・ 緩衝：天圖±1%、時圖±0.5%</div>
+⏳ = 最後一個C的低點之後確認K線不到{PROVISIONAL_BARS}根 ・ 🔥 = 突破量 ≥ 20根均量{VOL_SURGE_X}倍 ・ ⚠️不追 = 進場價高於BO超過{CHASE_MAX_PCT:.0f}% ・ ✅／⚠️ = 進場當天收盤有沒有站上BO ・ 🧱 = 威科夫燈號 ・ 緩衝：天圖±1%、時圖±0.5%</div>
 <script>
 function f(){{var s=document.getElementById('sec').value,q=document.getElementById('q').value.toUpperCase();
 document.querySelectorAll('.card').forEach(function(c){{var ok=(!s||c.getAttribute('data-sector')===s)&&(c.getAttribute('data-q')||'').indexOf(q)>-1;
@@ -6483,7 +6544,7 @@ summary{{cursor:pointer;color:#ffb74d}} .lst{{font-size:12px;line-height:1.8;mar
 details.exs-detail summary{{color:#7ab3ff}}
 @media (max-width:600px){{.exs-row{{flex-direction:column;gap:2px}} .exs-k{{min-width:0}}}}</style></head><body>
 <h2>&#x1F1F2;&#x1F1FE; 大馬莊家思維 ・ 出場規則回測</h2>
-<div class="subtitle">同一批進場（突破卡片規則：收盤站上BO進場、SL在最後一個C低點下方），只換出場方式，看哪一種總R最好。正式掃描完全不受影響。</div>
+<div class="subtitle">同一批進場（跟突破卡片同一套規則：{"盤中碰到BO就成交、進場價=BO" if CARD_ENTRY_MODE == "touch" else "收盤站上BO進場"}、SL在最後一個C低點下方），只換出場方式，看哪一種總R最好。正式掃描完全不受影響。</div>
 <div class="nav"><a href="/">📊 C系列總表</a><a href="/cards">🃏 突破卡片</a><a href="/wyckoff">🧱 威科夫突破</a><a href="/backtest">🧪 C1門檻回測</a><a class="nav-on" href="/exit_backtest">🚪 出場回測</a><a href="/entry_backtest">⚖️ 進場比較</a><a href="/stock_bt">🔍 單股回測</a></div>
 {status_html}
 <div class="tfbar">{runbar}</div>
@@ -6586,7 +6647,7 @@ details.exs-detail summary{{color:#7ab3ff}}
 .tfbar a.runbtn{{background:#ffb300;color:#1a1a1a;font-weight:bold;border-color:#ffb300}}
 @media (max-width:600px){{.exs-row{{flex-direction:column;gap:2px}} .exs-k{{min-width:0}}}}</style></head><body>
 <h2>&#x1F1F2;&#x1F1FE; 大馬莊家思維 ・ ⚖️ 進場方式比較</h2>
-<div class="subtitle">同一批C系列形態、同樣的SL／1:1.5／20根到期，只換進場方式：<b>A 盤中掛單</b>（盤中碰到BO就成交，老師SOP）vs <b>B 收盤確認</b>（收盤站上BO才進場，突破卡片現在的算法）。正式掃描完全不受影響。</div>
+<div class="subtitle">同一批C系列形態、同樣的SL／1:1.5／20根到期，只換進場方式：<b>A 盤中掛單</b>（盤中碰到BO就成交，老師SOP）vs <b>B 收盤確認</b>（收盤站上BO才進場，突破卡片的舊算法）。正式掃描完全不受影響。</div>
 <div class="nav"><a href="/">📊 C系列總表</a><a href="/cards">🃏 突破卡片</a><a href="/wyckoff">🧱 威科夫突破</a><a href="/backtest">🧪 C1門檻回測</a><a href="/exit_backtest">🚪 出場回測</a><a class="nav-on" href="/entry_backtest">⚖️ 進場比較</a><a href="/stock_bt">🔍 單股回測</a></div>
 {status_html}
 <div class="tfbar">{runbar}</div>
@@ -6911,6 +6972,7 @@ def _sb_trade_rows(res):
             if c.get('chase'): tags.append('⚠️不追')
             if c.get('provisional'): tags.append('⏳低點未確認')
             if c.get('vol_x') is not None: tags.append(f'量{c["vol_x"]}x')
+            if c.get('entry_mode') == 'touch': tags.append('✅收盤站穩' if c.get('close_ok') else '⚠️收盤沒站穩')
         else:
             if c.get('wall_r') is not None: tags.append(f'上方空間 {c["wall_r"]:.2f}R')
             else: tags.append('上方藍天')
@@ -6995,8 +7057,10 @@ def build_stock_bt_html(sym_raw, strategy, tf, focus):
                  f'先到 1:{WY_TP_R:g} ＝ +{WY_TP_R:g}R、{WY_HOLD_DAYS} 天都沒碰到 ＝ 到期。')
     else:
         extra = (f'<br><span class="muted">回測結束時還在等突破的形態：{len(res["others"])} 個。</span>' if res['others'] else '')
-        rules = (f'規則：最後一個 C 的高點＋緩衝＝BO，K 線<b>收盤</b>站上 BO 才進場（用收盤價）；SL＝最後一個 C 低點−緩衝；'
-                 f'先碰 SL ＝ −1R、先到 1:1.5 ＝ +1.5R、{MAX_HOLD_BARS} 根都沒碰到 ＝ 到期。確認價高於 BO 超過 {CHASE_MAX_PCT:.0f}% 標 ⚠️不追。')
+        how = ('K 線<b>最高價</b>碰到 BO 就成交（進場價＝BO，跳空高開用開盤價；跟在 BO 掛觸價單一樣）' if CARD_ENTRY_MODE == 'touch'
+               else 'K 線<b>收盤</b>站上 BO 才進場（用收盤價）')
+        rules = (f'規則：最後一個 C 的高點＋緩衝＝BO，{how}；SL＝最後一個 C 低點−緩衝；'
+                 f'先碰 SL ＝ −1R、先到 1:1.5 ＝ +1.5R、{MAX_HOLD_BARS} 根都沒碰到 ＝ 到期。進場價高於 BO 超過 {CHASE_MAX_PCT:.0f}% 標 ⚠️不追。')
     summ = (f'<div class="sbsum"><b style="font-size:17px"><a href="{tv}" target="_blank" style="color:#fff">{_h(code)}</a></b>{nm}'
             f'　<span class="muted">{_h(meta.get("sector") or "")}・{strat_name}・{tf}・{res["period"][0]} ～ {res["period"][1]}（最近 {res["bars_used"]} 根）</span><br>'
             f'{verdict}{extra}<br><span class="muted">{rules}</span></div>')
